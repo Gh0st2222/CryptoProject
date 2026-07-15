@@ -163,9 +163,12 @@ class Orchestrator:
                 log.info("position mode: %s (often already set)", e)
         else:
             portfolio = Portfolio(self.cfg.paper.starting_balance, mode="paper")
-            taker = self.specs[self.cfg.symbols[0]].taker_fee if self.specs else self.cfg.exchange.taker_fee
+            spec0 = self.specs[self.cfg.symbols[0]] if self.specs else None
+            taker = spec0.taker_fee if spec0 else self.cfg.exchange.taker_fee
+            maker = spec0.maker_fee if spec0 else self.cfg.exchange.maker_fee
             broker = PaperBroker(portfolio, feed.states, self.specs,
-                                 taker_fee=taker, slippage_bps=self.cfg.paper.slippage_bps)
+                                 taker_fee=taker, slippage_bps=self.cfg.paper.slippage_bps,
+                                 maker_fee=maker, entry_mode=self.cfg.strategy.entry_mode)
         risk = RiskManager(self.cfg.risk)
 
         async def on_update(kind: str) -> None:

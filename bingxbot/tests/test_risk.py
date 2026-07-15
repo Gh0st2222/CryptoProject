@@ -1,6 +1,7 @@
 from bingxbot.config import RiskConfig
-from bingxbot.exchange.models import LONG, SHORT, ContractSpec, TradeRecord
+from bingxbot.exchange.models import LONG, SHORT, ContractSpec, Position, TradeRecord
 from bingxbot.risk.manager import RiskManager
+from bingxbot.strategy.exits import AdaptiveExitManager
 
 
 def _spec():
@@ -8,30 +9,30 @@ def _spec():
 
 
 def test_sizing_respects_risk_budget():
-    cfg = RiskConfig(risk_per_trade=0.01, atr_sl_mult=2.0, max_leverage=20,
-                     max_position_notional_pct=1.0)
+    cfg = RiskConfig(risk_per_trade=0.01, max_leverage=20, max_position_notional_pct=1.0)
     rm = RiskManager(cfg)
-    equity, price, atr = 10_000.0, 60_000.0, 150.0
-    sized = rm.size_entry(equity, price, atr, LONG, _spec(), "RANGE")
+    equity, price, stop_dist = 10_000.0, 60_000.0, 300.0
+    sized = rm.size_entry(equity, price, stop_dist, LONG, _spec())
     assert sized is not None
-    # loss if stop hits ~= equity * risk_per_trade (regime RANGE shrinks sl by 0.9)
-    loss_at_stop = sized.qty * abs(price - sized.stop_price)
-    assert abs(loss_at_stop - 100.0) / 100.0 < 0.08
-    assert sized.stop_price < price < sized.take_profit
+    # loss if the initial stop hits == equity * risk_per_trade
+    loss_at_stop = sized.qty * stop_dist
+    assert abs(loss_at_stop - 100.0) / 100.0 < 0.05
     assert 1 <= sized.leverage <= 20
 
 
-def test_sizing_short_geometry():
-    rm = RiskManager(RiskConfig())
-    sized = rm.size_entry(10_000, 60_000, 150, SHORT, _spec(), "TREND_DOWN")
-    assert sized is not None
-    assert sized.take_profit < 60_000 < sized.stop_price
+def test_bracket_geometry_long_and_short():
+    ex = AdaptiveExitManager(RiskConfig())
+    row = {"dc_lo": 59_700.0, "dc_hi": 60_300.0}
+    lb = ex.initial_bracket(60_000.0, LONG, 150.0, row, "TREND_UP")
+    assert lb is not None and lb.stop < 60_000 and lb.init_risk > 0
+    sb = ex.initial_bracket(60_000.0, SHORT, 150.0, row, "TREND_DOWN")
+    assert sb is not None and sb.stop > 60_000
 
 
 def test_sizing_rejects_dust():
     rm = RiskManager(RiskConfig(risk_per_trade=0.0001))
     spec = ContractSpec("BTC-USDT", qty_precision=4, min_qty=0.01, min_notional_usdt=100)
-    assert rm.size_entry(100.0, 60_000.0, 150.0, LONG, spec, "RANGE") is None
+    assert rm.size_entry(100.0, 60_000.0, 150.0, LONG, spec) is None
 
 
 def _trade(pnl: float) -> TradeRecord:
@@ -66,16 +67,28 @@ def test_loss_streak_cooldown_and_day_roll():
     assert rm.state.day_realized == 0.0
 
 
-def test_trailing_stop_advances_only_forward():
-    from bingxbot.exchange.models import Position
-    rm = RiskManager(RiskConfig(breakeven_rr=0.5, trail_atr_mult=1.0))
-    pos = Position(symbol="X", side=LONG, qty=1, entry_price=100.0, opened_ts=0,
-                   stop_price=98.0, take_profit=110.0)
-    assert rm.update_trailing(pos, 101.5, 1.0, "TREND_UP")   # breakeven move
+def test_adaptive_trail_advances_only_forward():
+    ex = AdaptiveExitManager(RiskConfig(be_rr=0.5))
+    pos = Position(symbol="X", side=LONG, qty=1, entry_price=100.0, opened_ts=0, stop_price=98.0)
+    pos.init_risk = 2.0
+    pos.peak_price = 100.0
+    row = {"eff_ratio": 0.5}
+    # push into profit: breakeven then chandelier trail must ratchet up, never down
+    ex.manage(pos, 103.0, 103.0, 102.0, 1.0, row, 0.4, 0.3, "TREND_UP", 5)
     assert pos.stop_price >= 100.0
     s1 = pos.stop_price
-    rm.update_trailing(pos, 105.0, 1.0, "TREND_UP")
+    ex.manage(pos, 108.0, 108.0, 107.0, 1.0, row, 0.4, 0.3, "TREND_UP", 8)
     assert pos.stop_price >= s1
     s2 = pos.stop_price
-    rm.update_trailing(pos, 103.0, 1.0, "TREND_UP")          # pullback: no retreat
+    ex.manage(pos, 105.0, 105.0, 104.0, 1.0, row, 0.4, 0.3, "TREND_UP", 9)  # pullback
     assert pos.stop_price == s2
+
+
+def test_adaptive_exit_on_edge_reversal():
+    ex = AdaptiveExitManager(RiskConfig(hold_edge_frac=0.7))
+    pos = Position(symbol="X", side=LONG, qty=1, entry_price=100.0, opened_ts=0, stop_price=98.0)
+    pos.init_risk = 2.0
+    pos.peak_price = 101.0
+    _, reason = ex.manage(pos, 100.5, 101.0, 100.0, 1.0, {"eff_ratio": 0.4},
+                          edge=-0.5, threshold=0.3, regime="TREND_UP", bars_held=3)
+    assert reason and "reversed" in reason

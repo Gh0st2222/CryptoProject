@@ -25,7 +25,7 @@ async def test_paper_broker_roundtrip_accounting():
     pf = Portfolio(10_000.0, mode="paper")
     states = {"BTC-USDT": _FakeState(bid=100.0, ask=100.1)}
     broker = PaperBroker(pf, states, {"BTC-USDT": ContractSpec("BTC-USDT")},
-                         taker_fee=0.0005, slippage_bps=0.0)
+                         taker_fee=0.0005, slippage_bps=0.0, entry_mode="taker")
     sized = SizedOrder(qty=2.0, notional=200.2, leverage=1,
                        stop_price=99.0, take_profit=102.0, risk_amount=2.2)
     res = await broker.open_position("BTC-USDT", LONG, sized, "test", bar_ts=0)
@@ -47,7 +47,7 @@ async def test_paper_broker_short_side():
     pf = Portfolio(10_000.0, mode="paper")
     states = {"ETH-USDT": _FakeState(bid=2000.0, ask=2000.2)}
     broker = PaperBroker(pf, states, {"ETH-USDT": ContractSpec("ETH-USDT")},
-                         taker_fee=0.0, slippage_bps=0.0)
+                         taker_fee=0.0, slippage_bps=0.0, entry_mode="taker")
     sized = SizedOrder(qty=1.0, notional=2000, leverage=1,
                        stop_price=2020.0, take_profit=1980.0, risk_amount=20)
     await broker.open_position("ETH-USDT", SHORT, sized, "t", 0)

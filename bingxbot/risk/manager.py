@@ -151,81 +151,33 @@ class RiskManager:
 
     # ------------------------------------------------------------- sizing
 
-    def size_entry(self, equity: float, price: float, atr_val: float, side: str,
-                   spec: ContractSpec, regime: str,
-                   roundtrip_cost_pct: float = 0.0,
-                   size_mult: float = 1.0) -> SizedOrder | None:
-        """`size_mult` folds in the brain's fractional-Kelly conviction and the
-        health governor's auto-correction scalar. It scales the risk budget,
-        never the stop distance, so a losing trade still costs a bounded,
-        known fraction of equity."""
-        if price <= 0 or atr_val <= 0 or equity <= 0:
+    def size_entry(self, equity: float, price: float, stop_dist: float, side: str,
+                   spec: ContractSpec, size_mult: float = 1.0) -> SizedOrder | None:
+        """Size a position so hitting the initial stop (a `stop_dist` price move)
+        loses `risk_per_trade` of equity. `size_mult` folds in fractional-Kelly
+        conviction and the health governor's scalar — it scales the risk budget,
+        never the stop, so a loss is always a bounded, known fraction of equity.
+        The stop/target prices themselves are owned by the AdaptiveExitManager."""
+        if price <= 0 or stop_dist <= 0 or equity <= 0:
             return None
-        ex = REGIME_EXIT_MULT.get(regime, {"sl": 1.0, "tp": 1.0, "trail": 1.0})
-        sl_dist = self.cfg.atr_sl_mult * ex["sl"] * atr_val
-        tp_dist = self.cfg.atr_tp_mult * ex["tp"] * atr_val
-        if sl_dist <= 0:
-            return None
-        # Economic floor: a target that can't pay several times the round-trip
-        # cost is not worth taking. Stretch the whole geometry, keep the R:R.
-        tp_floor = self.cfg.cost_floor_mult * roundtrip_cost_pct * price
-        if 0 < tp_dist < tp_floor:
-            scale = tp_floor / tp_dist
-            tp_dist *= scale
-            sl_dist *= scale
-
         eff_mult = clamp(size_mult, 0.1, 2.0)
-        risk_amount = equity * self.cfg.risk_per_trade * eff_mult
-        risk_amount = min(risk_amount, equity * self.cfg.risk_per_trade * 2.0)  # hard cap
-        qty = risk_amount / sl_dist
+        risk_amount = min(equity * self.cfg.risk_per_trade * eff_mult,
+                          equity * self.cfg.risk_per_trade * 2.0)
+        qty = risk_amount / stop_dist
         max_notional = equity * self.cfg.max_leverage * self.cfg.max_position_notional_pct
         qty = min(qty, max_notional / price)
         qty = round_step(qty, spec.qty_precision)
         if qty < spec.min_qty or qty * price < spec.min_notional_usdt:
             return None
-
         notional = qty * price
         leverage = max(1, min(self.cfg.max_leverage, math.ceil(notional / max(equity * 0.9, 1e-9))))
-        d = 1 if side == LONG else -1
-        stop = round_step(price - d * sl_dist, spec.price_precision)
-        take = round_step(price + d * tp_dist, spec.price_precision)
         return SizedOrder(qty=qty, notional=notional, leverage=leverage,
-                          stop_price=stop, take_profit=take, risk_amount=qty * sl_dist,
+                          stop_price=0.0, take_profit=0.0, risk_amount=qty * stop_dist,
                           size_mult=eff_mult)
 
-    def payoff_ratio(self, regime: str) -> float:
-        ex = REGIME_EXIT_MULT.get(regime, {"sl": 1.0, "tp": 1.0})
-        sl = self.cfg.atr_sl_mult * ex["sl"]
-        tp = self.cfg.atr_tp_mult * ex["tp"]
-        return tp / sl if sl > 0 else 1.0
-
-    # ------------------------------------------------------------- exits
-
-    def update_trailing(self, pos: Position, price: float, atr_val: float, regime: str) -> bool:
-        """Advance breakeven/trailing stop. Returns True if the stop moved."""
-        if atr_val <= 0 or pos.stop_price <= 0:
-            return False
-        ex = REGIME_EXIT_MULT.get(regime, {"trail": 1.0})
-        d = pos.direction()
-        moved = False
-        risk = abs(pos.entry_price - pos.stop_price)
-        gain = (price - pos.entry_price) * d
-
-        if not pos.breakeven_moved and risk > 0 and gain >= self.cfg.breakeven_rr * risk:
-            be = pos.entry_price + d * 0.1 * atr_val   # entry + a hair, covers fees
-            if (be - pos.stop_price) * d > 0:
-                pos.stop_price = be
-                pos.breakeven_moved = True
-                moved = True
-
-        watermark = pos.trail_price if pos.trail_price > 0 else pos.entry_price
-        if (price - watermark) * d > 0:
-            pos.trail_price = price
-            trail_stop = price - d * self.cfg.trail_atr_mult * ex["trail"] * atr_val
-            if pos.breakeven_moved and (trail_stop - pos.stop_price) * d > 0:
-                pos.stop_price = trail_stop
-                moved = True
-        return moved
+    def payoff_ratio(self) -> float:
+        """Assumed winner:loser ratio for Kelly, given the let-winners-run exit."""
+        return self.cfg.expected_rr
 
     def time_stop_hit(self, bars_held: int) -> bool:
         return bars_held >= self.cfg.time_stop_bars

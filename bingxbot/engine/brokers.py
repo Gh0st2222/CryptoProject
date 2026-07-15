@@ -36,29 +36,39 @@ class Broker:
 
 class PaperBroker(Broker):
     def __init__(self, portfolio: Portfolio, feed_states: dict, specs: dict[str, ContractSpec],
-                 taker_fee: float, slippage_bps: float):
+                 taker_fee: float, slippage_bps: float,
+                 maker_fee: float = 0.0002, entry_mode: str = "maker"):
         self.portfolio = portfolio
         self.states = feed_states
         self.specs = specs
         self.taker_fee = taker_fee
+        self.maker_fee = maker_fee
+        self.entry_mode = entry_mode
         self.slip = slippage_bps / 10_000.0
 
-    def _fill_price(self, symbol: str, is_buy: bool) -> float:
+    def _fill_price(self, symbol: str, is_buy: bool, maker: bool = False) -> float:
         st = self.states.get(symbol)
         if st is None:
             return 0.0
         if st.book is not None:
-            px = st.book.ask if is_buy else st.book.bid
+            # taker crosses the spread; a resting maker fills at the near touch
+            if maker:
+                px = st.book.bid if is_buy else st.book.ask
+            else:
+                px = st.book.ask if is_buy else st.book.bid
         else:
             px = st.last_price or st.candles.last_close
+        if maker:
+            return px
         return px * (1 + self.slip) if is_buy else px * (1 - self.slip)
 
     async def open_position(self, symbol: str, side: str, sized: SizedOrder,
                             reason: str, bar_ts: int) -> OrderResult:
-        px = self._fill_price(symbol, is_buy=(side == LONG))
+        maker = self.entry_mode == "maker"
+        px = self._fill_price(symbol, is_buy=(side == LONG), maker=maker)
         if px <= 0:
             return OrderResult(ok=False, error="no market price")
-        fee = sized.qty * px * self.taker_fee
+        fee = sized.qty * px * (self.maker_fee if maker else self.taker_fee)
         pos = Position(
             symbol=symbol, side=side, qty=sized.qty, entry_price=px,
             opened_ts=now_ms(), leverage=sized.leverage,

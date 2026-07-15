@@ -111,16 +111,15 @@ class HistoryStore:
 
 def synthetic_candles(symbol: str, interval: str, bars: int, seed: int | None = None,
                       start_price: float | None = None) -> list[Candle]:
-    """Regime-switching price process with real crypto microstructure:
+    """Near-efficient regime-switching price process, calibrated to be *hard*.
 
-    - TREND segments: drift + positively autocorrelated returns (momentum)
-    - RANGE segments: Ornstein-Uhlenbeck pull toward an anchor (mean reversion)
-    - CHOP segments: high vol, negative autocorrelation
-    - volatility clustering across all segments
-
-    This is what intraday crypto actually looks like statistically, so the
-    adaptive ensemble has genuine, regime-dependent edges to discover in the
-    demo and in tests. Deterministic per seed.
+    Real intraday crypto is close to a random walk: any exploitable structure —
+    momentum persistence in trends, mean reversion at range extremes — is weak
+    and buried in noise. This generator deliberately keeps those edges small
+    (autocorrelation ~0.06, gentle OU pull) on top of realistic volatility with
+    clustering, so a strategy only comes out ahead here if it genuinely catches
+    trends and cuts losers faster than fees bleed it. If it can't beat this, it
+    won't beat the real market. Deterministic per seed.
     """
     rng = random.Random(seed if seed is not None else hash(symbol) & 0xFFFF)
     base = {"BTC-USDT": 65_000.0, "ETH-USDT": 3_400.0}
@@ -129,25 +128,25 @@ def synthetic_candles(symbol: str, interval: str, bars: int, seed: int | None = 
     t0 = (now_ms() // step) * step - bars * step
 
     out: list[Candle] = []
-    drift, vol, phi, kappa, left = 0.0, 0.0009, 0.0, 0.0, 0
+    drift, vol, phi, kappa, left = 0.0, 0.0011, 0.0, 0.0, 0
     anchor = px
     vol_mult = 1.0
     prev_ret = 0.0
     for i in range(bars):
         if left <= 0:
             r = rng.random()
-            if r < 0.30:      # trend up: drift + momentum persistence
-                drift, vol, phi, kappa = 0.00015, 0.0009, 0.25, 0.0
-            elif r < 0.60:    # trend down
-                drift, vol, phi, kappa = -0.00015, 0.0009, 0.25, 0.0
-            elif r < 0.90:    # range: OU mean reversion around anchor
-                drift, vol, phi, kappa = 0.0, 0.0006, -0.08, 0.08
+            if r < 0.28:      # up-trend: realistic drift + momentum persistence
+                drift, vol, phi, kappa = 0.00012, 0.0011, 0.13, 0.0
+            elif r < 0.56:    # down-trend
+                drift, vol, phi, kappa = -0.00012, 0.0011, 0.13, 0.0
+            elif r < 0.86:    # range: gentle mean reversion around anchor
+                drift, vol, phi, kappa = 0.0, 0.0009, -0.04, 0.035
                 anchor = px
-            else:             # chop: loud and spiteful
-                drift, vol, phi, kappa = 0.0, 0.0022, -0.12, 0.0
-            left = rng.randint(60, 240)
+            else:             # chop: loud, mildly anti-persistent, no edge
+                drift, vol, phi, kappa = 0.0, 0.0024, -0.06, 0.0
+            left = rng.randint(60, 220)
         left -= 1
-        vol_mult = max(0.5, min(2.0, vol_mult + rng.gauss(0, 0.03)))  # clustering
+        vol_mult = max(0.5, min(2.2, vol_mult + rng.gauss(0, 0.04)))  # vol clustering
 
         o = px
         hi = lo = px
@@ -162,6 +161,6 @@ def synthetic_candles(symbol: str, interval: str, bars: int, seed: int | None = 
             hi, lo = max(hi, px), min(lo, px)
         prev_ret = bar_ret_accum
         body = abs(px - o) / max(o, 1e-9)
-        volume = (40.0 + 4000.0 * body + abs(rng.gauss(0, 12))) * (1.5 if vol > 0.001 else 1.0)
+        volume = (40.0 + 4000.0 * body + abs(rng.gauss(0, 12))) * (1.5 if vol > 0.0018 else 1.0)
         out.append(Candle(ts=t0 + i * step, open=o, high=hi, low=lo, close=px, volume=volume))
     return out
