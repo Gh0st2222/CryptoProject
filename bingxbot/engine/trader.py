@@ -344,7 +344,9 @@ class TraderEngine:
         }
 
     def hot_swap_params(self, strat) -> None:
-        """Live-apply tuned strategy params to every symbol's brain (auto-tuner)."""
+        """Live-apply tuned strategy params to every symbol's brain (auto-tuner).
+        Risk/exit params are read live from the shared cfg by reference, so only
+        the brain's cached scalars need pushing here."""
         for c in self.ctx.values():
             b = c.brain
             b.base_threshold = strat.base_threshold
@@ -353,3 +355,5 @@ class TraderEngine:
             b.horizon = max(1, strat.horizon_bars)
             b.kelly_fraction = strat.kelly_fraction
             b.min_p_win = strat.min_p_win
+            b.target_rate = max(0.1, strat.target_trades_per_hour)
+            b.threshold_adapt = strat.threshold_adapt

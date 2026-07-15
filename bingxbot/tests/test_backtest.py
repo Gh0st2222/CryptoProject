@@ -29,14 +29,15 @@ def test_backtest_deterministic():
 
 
 def test_backtest_stops_bound_losses():
-    """No single trade should lose wildly more than the configured risk."""
+    """With leverage, a single trade's loss is bounded by the hard risk cap
+    (plus a gap-through allowance), not by risk_per_trade."""
     candles = synthetic_candles("BTC-USDT", "1m", 8000, seed=13)
-    risk = RiskConfig(risk_per_trade=0.005)
+    risk = RiskConfig(risk_per_trade=0.005, max_risk_hard_pct=0.035)
     res = run_backtest(candles, "BTC-USDT", "1m", StrategyConfig(), risk,
                        starting_balance=10_000.0)
     worst = min((t["pnl"] for t in res["trades"]), default=0.0)
-    # allow 3x for gap-through-stop plus fees; anything worse means broken stops
-    assert worst > -3 * 0.005 * 10_000.0
+    # hard cap 3.5% + a 1.6x gap/slippage allowance; worse means broken stops
+    assert worst > -0.035 * 1.6 * 10_000.0
 
 
 def test_optimizer_small_run():

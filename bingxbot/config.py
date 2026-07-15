@@ -68,8 +68,10 @@ class StrategyConfig:
 
 @dataclass
 class RiskConfig:
-    risk_per_trade: float = 0.005       # equity fraction lost if the initial stop is hit
-    max_leverage: int = 10
+    risk_per_trade: float = 0.008       # target equity fraction at risk if the stop hits
+    min_leverage: int = 2               # operating leverage band (auto-adapted within)
+    max_leverage: int = 7
+    max_risk_hard_pct: float = 0.035    # hard cap on any single trade's loss-at-stop
     margin_mode: str = "ISOLATED"
     # --- adaptive exit geometry (let winners run, cut losers) ---
     sl_atr_min: float = 1.2             # initial stop: no tighter than this x ATR
@@ -105,8 +107,20 @@ class ServerConfig:
     port: int = field(default_factory=lambda: int(os.getenv("BOT_PORT", "8420")))
 
 
+# Bump when the auto-managed parameter defaults change in a way that should
+# override values persisted by an older build. On load, a config written by an
+# older version keeps only the user-owned settings; the tuner-owned params are
+# reset to current defaults (then the auto-tuner evolves from there).
+CONFIG_VERSION = 2
+
+# Top-level settings the user owns — everything else is auto-managed by the
+# tuner and reset to code defaults when migrating an older config.
+USER_OWNED_TOP = {"symbols", "mode", "feed", "allow_live", "data_dir", "log_level"}
+
+
 @dataclass
 class BotConfig:
+    version: int = CONFIG_VERSION
     symbols: list[str] = field(default_factory=lambda: ["BTC-USDT", "ETH-USDT"])
     mode: str = MODE_PAPER              # idle | paper | live
     feed: str = FEED_BINGX              # bingx | synthetic (offline demo)
@@ -156,13 +170,43 @@ def _merge_into(dc: Any, data: dict) -> None:
             setattr(dc, f.name, str(val))
 
 
+_NESTED_USER_OWNED = {
+    "exchange": {"base_url", "ws_url", "recv_window_ms", "taker_fee", "maker_fee"},
+    "server": {"host", "port"},
+    "paper": {"starting_balance", "slippage_bps"},
+    "strategy": {"interval", "warmup_bars"},
+    # leverage band intentionally omitted so migrating an old config resets it
+    # to the current 2-7x default; it stays UI-editable afterwards.
+    "risk": {"max_open_positions", "max_daily_loss_pct", "margin_mode",
+             "max_spread_bps", "max_consecutive_losses", "cooldown_minutes"},
+}
+
+
+def _filter_user_owned(data: dict) -> dict:
+    """Keep only user-owned keys from a raw config dict (drop stale tuner params)."""
+    out = {k: v for k, v in data.items() if k in USER_OWNED_TOP}
+    for group, allowed in _NESTED_USER_OWNED.items():
+        if isinstance(data.get(group), dict):
+            sub = {k: v for k, v in data[group].items() if k in allowed}
+            if sub:
+                out[group] = sub
+    return out
+
+
 def load_config(path: Path = CONFIG_PATH) -> BotConfig:
     cfg = BotConfig()
     if path.exists():
         try:
-            _merge_into(cfg, json.loads(path.read_text()))
+            raw = json.loads(path.read_text())
         except (json.JSONDecodeError, OSError):
-            pass  # fall back to defaults rather than refuse to boot
+            return cfg  # fall back to defaults rather than refuse to boot
+        if raw.get("version") == CONFIG_VERSION:
+            _merge_into(cfg, raw)
+        else:
+            # migrate: keep the user's settings, reset tuner-owned params to
+            # current defaults, and persist the upgraded file.
+            _merge_into(cfg, _filter_user_owned(raw))
+            save_config(cfg, path)
     return cfg
 
 

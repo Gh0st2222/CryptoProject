@@ -108,24 +108,30 @@ class LiveBroker(Broker):
         self.specs = specs
         self.cfg = cfg
         self._prepared: set[str] = set()
+        self._lev_set: dict[tuple[str, str], int] = {}
 
     async def prepare_symbol(self, symbol: str) -> None:
-        """Margin mode + leverage, once per symbol. Never fatal."""
+        """Set isolated/cross margin mode once per symbol. Never fatal."""
         if symbol in self._prepared:
             return
-        lev = self.cfg.risk.max_leverage
-        for call in (
-            self.rest.set_margin_type(symbol, self.cfg.risk.margin_mode),
-            self.rest.set_leverage(symbol, LONG, lev),
-            self.rest.set_leverage(symbol, SHORT, lev),
-        ):
-            try:
-                await call
-            except BingXAPIError as e:
-                log.info("prepare %s: %s (usually already set)", symbol, e.msg)
-            except BingXError as e:
-                log.warning("prepare %s failed: %s", symbol, e)
+        try:
+            await self.rest.set_margin_type(symbol, self.cfg.risk.margin_mode)
+        except BingXAPIError as e:
+            log.info("prepare %s: %s (usually already set)", symbol, e.msg)
+        except BingXError as e:
+            log.warning("prepare %s failed: %s", symbol, e)
         self._prepared.add(symbol)
+
+    async def _ensure_leverage(self, symbol: str, side: str, lev: int) -> None:
+        """Set the per-trade leverage the sizer chose, only when it changed."""
+        lev = max(1, int(lev))
+        if self._lev_set.get((symbol, side)) == lev:
+            return
+        try:
+            await self.rest.set_leverage(symbol, side, lev)
+            self._lev_set[(symbol, side)] = lev
+        except BingXError as e:
+            log.info("set leverage %s %s %dx: %s", symbol, side, lev, e)
 
     async def _await_fill(self, symbol: str, order_id: str, fallback: float) -> tuple[float, float]:
         """Poll a market order briefly for its average fill price."""
@@ -150,6 +156,7 @@ class LiveBroker(Broker):
         if not self.cfg.allow_live:
             return OrderResult(ok=False, error="allow_live is false")
         await self.prepare_symbol(symbol)
+        await self._ensure_leverage(symbol, side, sized.leverage)
         spec = self.specs.get(symbol, ContractSpec(symbol))
         wt = "MARK_PRICE"
         try:

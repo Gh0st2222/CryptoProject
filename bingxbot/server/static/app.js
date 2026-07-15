@@ -222,31 +222,48 @@ function renderTrades(){
     <td style="color:var(--muted)">${esc(t.reason_open)}</td><td style="color:var(--muted)">${esc(t.reason_close)}</td></tr>`).join("");
 }
 function renderAutotuner(){
-  const at=S.autotuner; const row=$("at-row"), last=$("at-last");
-  if(!at){ row.innerHTML=`<div class="empty">Auto-tuner idle (engine not running)</div>`; last.textContent="—"; return; }
+  const at=S.autotuner; const row=$("at-row"), hist=$("at-history");
+  if(!at){ row.innerHTML=`<div class="empty">Auto-tuner idle (engine not running)</div>`; return; }
   const next=at.next_run_ts?fmt.time(at.next_run_ts):"—";
+  const lc=at.last_cycle;
   row.innerHTML=[
-    ["Status",at.enabled?(at.running?"RESEARCHING · ON":"ON"):"OFF"],
-    ["Next pass",next],
-    ["Last decision",at.last_tune?at.last_tune.decision:"—"],
-  ].map(([k,v])=>`<div class="at-badge"><div class="k">${k}</div><div class="v">${esc(v)}</div></div>`).join("");
-  if(at.last_tune){ const t=at.last_tune;
-    last.innerHTML=`<b>${fmt.dt(t.ts)}</b> · ${esc(t.symbol)} · baseline fitness ${t.baseline_fitness} vs best ${t.best_fitness??"—"} → <b>${esc(t.decision)}</b>`
-      +(t.params?`<br><span class="mono" style="color:var(--muted)">${esc(Object.entries(t.params).map(([k,v])=>`${k}=${v}`).join("  "))}</span>`:"");
-  } else last.textContent="No research pass has completed yet — first pass runs a couple of minutes after start.";
+    ["Status",at.enabled?(at.running?"● RESEARCHING":"ON"):"OFF"],
+    ["Cycles run",at.cycles],
+    ["Improvements",at.improvements],
+    ["Champion fitness",at.champion_fitness??"—"],
+    ["Last challenger",lc?`${lc.best_fitness} (${lc.promoted?"adopted":"kept"})`:"—"],
+    ["Next cycle",next],
+  ].map(([k,v])=>`<div class="at-badge"><div class="k">${k}</div><div class="v">${esc(String(v))}</div></div>`).join("");
+  const H=at.history||[];
+  hist.innerHTML=H.length?H.map(h=>{
+    const params=Object.entries(h.params||{}).map(([k,v])=>`${k}=${v}`).join("  ");
+    return `<tr><td>${fmt.dt(h.ts)}</td><td class="r pnl-pos">${h.from_fitness} → ${h.to_fitness}</td>
+      <td class="r">${fmt.pct(h.valid_wr,0)}</td><td class="r">${(h.valid_pf||0).toFixed(2)}</td>
+      <td style="color:var(--muted)">${esc(params)}</td></tr>`;
+  }).join(""):`<tr><td colspan="5" class="empty">No promotions yet — it only swaps genuine improvements</td></tr>`;
 }
 let settingsDirty=false;
+const AUTO_PARAMS=[
+  ["base_threshold","edge threshold","s"],["target_trades_per_hour","target trades/hr","s"],
+  ["cost_multiple","cost multiple","s"],["min_p_win","min P(win)","s"],["kelly_fraction","Kelly fraction","s"],
+  ["min_efficiency","min trend efficiency","s"],["hedge_eta","hedge learn rate","s"],["horizon_bars","grade horizon","s"],
+  ["risk_per_trade","risk per trade","r"],["sl_atr_min","stop min ×ATR","r"],["sl_atr_max","stop max ×ATR","r"],
+  ["trail_atr_min","trail min ×ATR","r"],["trail_atr_max","trail max ×ATR","r"],["trail_tighten","trail tighten","r"],
+  ["be_rr","breakeven R","r"],["giveback_rr","giveback R","r"],["hold_edge_frac","edge-flip exit","r"],["time_stop_bars","time stop bars","r"],
+];
 function renderSettings(){
   if(settingsDirty||!S) return; const c=S.config;
   $("cfg-symbols").value=c.symbols.join(", "); $("cfg-feed").value=c.feed; $("cfg-interval").value=c.strategy.interval;
-  $("cfg-threshold").value=c.strategy.base_threshold; $("cfg-costmult").value=c.strategy.cost_multiple;
-  $("cfg-minp").value=c.strategy.min_p_win; $("cfg-kelly").value=c.strategy.kelly_fraction;
-  $("cfg-adapt").checked=c.strategy.threshold_adapt; $("cfg-usekelly").checked=c.strategy.use_kelly;
-  $("cfg-micro").checked=c.strategy.micro_confirm; $("cfg-autotune").checked=c.strategy.auto_tune;
-  $("cfg-risk").value=c.risk.risk_per_trade; $("cfg-lev").value=c.risk.max_leverage;
-  $("cfg-dayloss").value=c.risk.max_daily_loss_pct; $("cfg-maxpos").value=c.risk.max_open_positions;
-  $("cfg-balance").value=c.paper.starting_balance; $("cfg-allowlive").checked=c.allow_live;
+  $("cfg-balance").value=c.paper.starting_balance; $("cfg-maxpos").value=c.risk.max_open_positions;
+  $("cfg-levmin").value=c.risk.min_leverage; $("cfg-levmax").value=c.risk.max_leverage;
+  $("cfg-dayloss").value=c.risk.max_daily_loss_pct; $("cfg-hardrisk").value=c.risk.max_risk_hard_pct;
+  $("cfg-autotune").checked=c.strategy.auto_tune; $("cfg-allowlive").checked=c.allow_live;
   $("cfg-keys").textContent=c.has_keys?"configured ✓":"not set (paper/backtest only)"; $("cfg-keys").style.color=c.has_keys?"var(--good)":"";
+  $("auto-params").innerHTML=AUTO_PARAMS.map(([k,lab,grp])=>{
+    const v=(grp==="s"?c.strategy:c.risk)[k];
+    const val=typeof v==="number"?(Math.abs(v)<1?v.toFixed(3):v.toFixed(2)):v;
+    return `<div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">${lab}</span><span style="color:var(--ink)">${val}</span></div>`;
+  }).join("");
 }
 function renderAll(){
   if(!S) return;
@@ -288,11 +305,10 @@ document.querySelectorAll('[data-page="settings"] input, [data-page="settings"] 
 $("cfg-save").onclick=async()=>{
   const patch={ symbols:$("cfg-symbols").value.split(",").map(s=>s.trim().toUpperCase()).filter(Boolean),
     feed:$("cfg-feed").value, allow_live:$("cfg-allowlive").checked,
-    strategy:{ interval:$("cfg-interval").value, base_threshold:parseFloat($("cfg-threshold").value), cost_multiple:parseFloat($("cfg-costmult").value),
-      min_p_win:parseFloat($("cfg-minp").value), kelly_fraction:parseFloat($("cfg-kelly").value),
-      threshold_adapt:$("cfg-adapt").checked, use_kelly:$("cfg-usekelly").checked, micro_confirm:$("cfg-micro").checked, auto_tune:$("cfg-autotune").checked },
-    risk:{ risk_per_trade:parseFloat($("cfg-risk").value), max_leverage:parseInt($("cfg-lev").value,10),
-      max_daily_loss_pct:parseFloat($("cfg-dayloss").value), max_open_positions:parseInt($("cfg-maxpos").value,10) },
+    strategy:{ interval:$("cfg-interval").value, auto_tune:$("cfg-autotune").checked },
+    risk:{ min_leverage:parseInt($("cfg-levmin").value,10), max_leverage:parseInt($("cfg-levmax").value,10),
+      max_daily_loss_pct:parseFloat($("cfg-dayloss").value), max_risk_hard_pct:parseFloat($("cfg-hardrisk").value),
+      max_open_positions:parseInt($("cfg-maxpos").value,10) },
     paper:{ starting_balance:parseFloat($("cfg-balance").value) } };
   try{ const r=await api("/api/config",{patch}); settingsDirty=false;
     toast(r.needs_restart?"Saved — switch to Idle and back to apply":"Settings saved","good"); }catch(e){ toast(e.message,"bad"); }
