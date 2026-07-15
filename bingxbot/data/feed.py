@@ -43,8 +43,44 @@ class MarketState:
         self.cvd_slope = Ewma(0.08)        # signed-volume EWMA per tick batch
         self.ticks_per_s = Ewma(0.1)
         self._last_tick_mono = 0.0
+        # derivatives context (funding / open interest / mark), live only
+        self.funding_rate: float | None = None
+        self.mark: float | None = None
+        self.open_interest: float | None = None
+        self._funding_hist: deque[float] = deque(maxlen=200)
+        self._oi_hist: deque[float] = deque(maxlen=200)
 
     # -- mutation ----------------------------------------------------------
+
+    def on_context(self, funding: float | None, mark: float | None, oi: float | None) -> None:
+        if funding is not None and math.isfinite(funding):
+            self.funding_rate = funding
+            self._funding_hist.append(funding)
+        if mark is not None and mark > 0:
+            self.mark = mark
+        if oi is not None and oi > 0:
+            self.open_interest = oi
+            self._oi_hist.append(oi)
+
+    def context_snapshot(self) -> dict:
+        """Derivatives context for the carry desk. All None/0 offline so those
+        alphas stay dormant rather than firing on absent data."""
+        fz = None
+        if len(self._funding_hist) >= 20:
+            arr = list(self._funding_hist)
+            m = sum(arr) / len(arr)
+            var = sum((x - m) ** 2 for x in arr) / len(arr)
+            sd = math.sqrt(var) if var > 0 else 0.0
+            fz = (self.funding_rate - m) / sd if sd > 1e-12 and self.funding_rate is not None else None
+        oi_chg = None
+        if len(self._oi_hist) >= 2 and self._oi_hist[-2] > 0:
+            oi_chg = (self._oi_hist[-1] - self._oi_hist[-2]) / self._oi_hist[-2]
+        return {
+            "funding_rate": self.funding_rate,
+            "funding_z": fz,
+            "oi_change_pct": oi_chg,
+            "mark": self.mark,
+        }
 
     def on_tick(self, t: Tick) -> None:
         self.last_price = t.price
@@ -143,6 +179,7 @@ class LiveFeed(BaseFeed):
         )
         for s in symbols:
             self.ws.subscribe_symbol(s, interval)
+        self._ctx_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         for s in self.symbols:
@@ -152,11 +189,32 @@ class LiveFeed(BaseFeed):
             n = self.states[s].candles.seed(candles)
             log.info("%s seeded %d bars (%s)", s, n, self.interval)
         await self.ws.start()
+        self._ctx_task = asyncio.create_task(self._poll_context(), name="ctx-poller")
         self.started = True
 
     async def stop(self) -> None:
+        if self._ctx_task:
+            self._ctx_task.cancel()
+            try:
+                await self._ctx_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._ctx_task = None
         await self.ws.stop()
         self.started = False
+
+    async def _poll_context(self) -> None:
+        """Periodically pull funding rate, mark price and open interest so the
+        carry desk has data. Best-effort; failures never disturb trading."""
+        while True:
+            for s in self.symbols:
+                try:
+                    prem = await self.rest.premium_index(s)
+                    oi = await self.rest.open_interest(s)
+                    self.states[s].on_context(prem.get("funding_rate"), prem.get("mark"), oi)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("context poll %s: %s", s, e)
+            await asyncio.sleep(45)
 
     def healthy(self) -> bool:
         return self.started and self.ws.connected

@@ -3,251 +3,240 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>BingX Adaptive Futures Bot</title>
+<title>PULSE — BingX Adaptive Futures Terminal</title>
 <link rel="stylesheet" href="/static/style.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 </head>
 <body>
 
 <header class="topbar">
-  <div class="brand">
-    <div class="logo"><span class="bolt">⚡</span> PULSE</div>
-    <div class="sub">BingX adaptive futures</div>
-  </div>
+  <div class="brand"><div class="logo"><span class="bolt">⚡</span>PULSE</div><div class="sub">adaptive futures terminal</div></div>
   <div id="mode-pill" class="pill idle"><span class="dot"></span><span id="mode-text">IDLE</span></div>
-  <div style="display:flex;align-items:center;gap:6px">
-    <div id="feed-dot" class="feed-dot"></div><span id="feed-label" class="feed-label">feed</span>
-  </div>
-  <div class="top-stats">
-    <div class="tstat"><div class="k">Equity</div><div class="v num" id="top-equity">—</div></div>
-    <div class="tstat"><div class="k">Day PnL</div><div class="v num" id="top-daypnl">—</div></div>
-    <div class="tstat"><div class="k">Win rate</div><div class="v num" id="top-wr">—</div></div>
-    <div class="tstat"><div class="k">Trades</div><div class="v num" id="top-trades">—</div></div>
+  <div class="feed"><span id="feed-dot" class="dot"></span><span id="feed-label">feed</span></div>
+  <div class="feed">⏱ <span id="lat">— ms</span></div>
+  <div class="tstats">
+    <div class="tstat"><div class="k">Equity</div><div class="v" id="t-eq">—</div></div>
+    <div class="tstat"><div class="k">Day PnL</div><div class="v" id="t-day">—</div></div>
+    <div class="tstat"><div class="k">Win rate</div><div class="v" id="t-wr">—</div></div>
+    <div class="tstat"><div class="k">Trades</div><div class="v" id="t-tr">—</div></div>
+    <div class="tstat"><div class="k">Health</div><div class="v" id="t-health">—</div></div>
   </div>
   <div class="top-actions">
     <select id="mode-select" class="btn">
-      <option value="idle">Idle</option>
-      <option value="paper" selected>Paper</option>
-      <option value="live">Live</option>
+      <option value="idle">Idle</option><option value="paper" selected>Paper</option><option value="live">Live</option>
     </select>
     <button id="btn-kill" class="btn danger" title="Flatten everything and halt entries">KILL</button>
   </div>
 </header>
 
+<div class="tape"><div class="tape-track" id="tape-track"></div></div>
+
 <div class="wrap">
   <div class="grid">
-
-    <!-- ============================== left: charts -->
-    <section class="panel">
-      <div class="panel-head">
-        <div class="sym-tabs" id="sym-tabs"></div>
-        <div class="price-read">
-          <span class="px num" id="px-last">—</span>
-          <span class="meta" id="px-meta">spread — · OBI —</span>
+    <!-- LEFT: charts -->
+    <div class="col">
+      <section class="panel">
+        <div class="phead">
+          <div class="sym-tabs" id="sym-tabs"></div>
+          <div class="price-read"><span class="px" id="px-last">—</span>
+            <span class="meta" id="px-meta">spread — · OBI — · flow —</span></div>
         </div>
-      </div>
-      <div id="chart-main"></div>
-      <div class="chart-caption"><span>Equity curve — session</span><span class="val num" id="eq-caption">—</span></div>
-      <div id="chart-equity"></div>
-    </section>
+        <div id="chart-main"></div>
+        <div class="cap"><span>Equity — session</span><span class="val" id="eq-cap">—</span></div>
+        <div id="chart-equity"></div>
+      </section>
+    </div>
 
-    <!-- ============================== right: the brain -->
-    <aside class="panel">
-      <div class="panel-head"><h2>Adaptive brain</h2><span id="brain-sym" class="mono-note" style="margin-left:auto"></span></div>
-      <div class="panel-body">
-        <div class="regime-row">
-          <span class="badge ghost" id="regime-badge"><span class="glyph">◈</span><span id="regime-text">warming up</span></span>
-          <span class="badge ghost" id="conf-badge">conf —</span>
-          <span class="badge ghost" id="thr-badge">thr —</span>
-        </div>
+    <!-- RIGHT: the machine -->
+    <div class="col">
+      <section class="panel">
+        <div class="phead"><h2>Execution cycle</h2><span class="right" id="cycle-sym"></span></div>
+        <div class="pbody"><div class="pipe" id="pipe"></div></div>
+      </section>
 
-        <div class="gauge-wrap">
-          <div class="gauge-labels"><span>SHORT −1</span><span>ensemble score</span><span>LONG +1</span></div>
-          <div class="gauge">
-            <div class="mid"></div>
-            <div class="thr" id="thr-neg"></div>
-            <div class="thr" id="thr-pos"></div>
-            <div class="needle" id="score-needle"></div>
+      <section class="panel">
+        <div class="phead"><h2>Adaptive brain</h2><span class="right" id="brain-graded">—</span></div>
+        <div class="pbody">
+          <div class="gauges">
+            <div class="gauge-box">
+              <div class="lab"><span>Fused edge</span><span id="edge-thr">thr —</span></div>
+              <div class="big" id="edge-val">0.00</div>
+              <div class="bar-track edge-track"><div class="mid"></div><div class="thr" id="edge-thr-neg"></div><div class="thr" id="edge-thr-pos"></div><div class="needle" id="edge-needle"></div></div>
+            </div>
+            <div class="gauge-box">
+              <div class="lab"><span>P(win) calibrated</span><span id="cal-skill">skill —</span></div>
+              <div class="big" id="pwin-val">—</div>
+              <div class="bar-track"><div class="bar-fill" id="pwin-fill" style="background:var(--good)"></div></div>
+            </div>
           </div>
-          <div class="gauge-read">
-            <span id="score-read" class="num">score 0.00</span>
-            <span id="gate-read">—</span>
+          <div class="badges">
+            <span class="badge" id="b-regime"><span class="g">◈</span><span id="regime-text">warming up</span></span>
+            <span class="badge" id="b-conf">conf —</span>
+            <span class="badge" id="b-vol">vol —</span>
+            <span class="badge" id="b-gate">gate —</span>
+          </div>
+
+          <div class="subt">Desk allocation — the CIO backing live winners</div>
+          <div class="desks" id="desks"></div>
+
+          <div class="kvs">
+            <div class="kv"><span class="k">Learning β</span><span class="v" id="kv-beta">—</span></div>
+            <div class="kv"><span class="k">Calibration Brier</span><span class="v" id="kv-brier">—</span></div>
+            <div class="kv"><span class="k">Bars seen</span><span class="v" id="kv-bars">—</span></div>
+            <div class="kv"><span class="k">Graded calls</span><span class="v" id="kv-graded">—</span></div>
+            <div class="kv"><span class="k">Risk state</span><span class="v" id="kv-risk">—</span></div>
+            <div class="kv"><span class="k">Cooldown</span><span class="v" id="kv-cool">—</span></div>
+          </div>
+          <div style="margin-top:8px">
+            <div class="kv"><span class="k">Health governor · risk scalar</span><span class="v" id="kv-health">—</span></div>
+            <div class="health-meter"><div class="health-fill" id="health-fill"></div></div>
           </div>
         </div>
+      </section>
 
-        <div class="alpha-list" id="alpha-list"></div>
-
-        <div class="brain-foot">
-          <div class="kv"><span class="k">Learning β</span><span class="v num" id="kv-beta">—</span></div>
-          <div class="kv"><span class="k">Graded calls</span><span class="v num" id="kv-graded">—</span></div>
-          <div class="kv"><span class="k">Bars seen</span><span class="v num" id="kv-bars">—</span></div>
-          <div class="kv"><span class="k">Risk state</span><span class="v" id="kv-risk">—</span></div>
-          <div class="kv"><span class="k">Cooldown</span><span class="v num" id="kv-cooldown">—</span></div>
-          <div class="kv"><span class="k">Entry gate</span><span class="v" id="kv-block" style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">—</span></div>
-        </div>
-      </div>
-    </aside>
+      <section class="panel">
+        <div class="phead"><h2>Alpha floor · 18 signals</h2><span class="right">● firing ○ dormant</span></div>
+        <div class="pbody"><div class="alpha-desks" id="alpha-desks"></div></div>
+      </section>
+    </div>
   </div>
 
-  <!-- ============================== bottom: tabs -->
-  <section class="panel" style="margin-top:14px">
+  <!-- bottom tabs -->
+  <section class="panel" style="margin-top:12px">
     <div class="tabs">
       <button class="tab active" data-tab="positions">Positions</button>
       <button class="tab" data-tab="trades">Trades</button>
       <button class="tab" data-tab="backtest">Backtest</button>
       <button class="tab" data-tab="optimizer">Optimizer</button>
+      <button class="tab" data-tab="autotuner">Auto-Tuner</button>
       <button class="tab" data-tab="settings">Settings</button>
     </div>
 
     <div class="tab-page active" data-page="positions">
-      <table class="tbl">
-        <thead><tr>
-          <th>Symbol</th><th>Side</th><th class="r">Qty</th><th class="r">Entry</th>
-          <th class="r">Mark</th><th class="r">Stop</th><th class="r">Target</th>
-          <th class="r">uPnL</th><th class="r">Lev</th><th>Opened</th><th></th>
-        </tr></thead>
-        <tbody id="pos-body"><tr><td colspan="11" class="empty">No open positions</td></tr></tbody>
-      </table>
-      <div style="margin-top:10px;display:flex;gap:8px">
-        <button class="btn small" id="btn-flatten">Flatten all</button>
-        <button class="btn small" id="btn-reset-kill">Reset kill switch</button>
+      <table class="tbl"><thead><tr>
+        <th>Symbol</th><th>Side</th><th class="r">Qty</th><th class="r">Entry</th><th class="r">Mark</th>
+        <th class="r">Stop</th><th class="r">Target</th><th class="r">uPnL</th><th class="r">Lev</th><th>Opened</th><th></th>
+      </tr></thead><tbody id="pos-body"><tr><td colspan="11" class="empty">No open positions</td></tr></tbody></table>
+      <div style="margin-top:9px;display:flex;gap:7px">
+        <button class="btn sm" id="btn-flatten">Flatten all</button>
+        <button class="btn sm" id="btn-reset-kill">Reset kill switch</button>
       </div>
     </div>
 
     <div class="tab-page" data-page="trades">
       <div class="cards" id="trade-cards"></div>
-      <table class="tbl">
-        <thead><tr>
-          <th>Closed</th><th>Symbol</th><th>Side</th><th class="r">Qty</th>
-          <th class="r">Entry</th><th class="r">Exit</th><th class="r">PnL</th>
-          <th class="r">R</th><th>Opened by</th><th>Closed by</th>
-        </tr></thead>
-        <tbody id="trades-body"><tr><td colspan="10" class="empty">No closed trades yet</td></tr></tbody>
-      </table>
+      <table class="tbl"><thead><tr>
+        <th>Closed</th><th>Symbol</th><th>Side</th><th class="r">Qty</th><th class="r">Entry</th>
+        <th class="r">Exit</th><th class="r">PnL</th><th class="r">R</th><th>Opened by</th><th>Closed by</th>
+      </tr></thead><tbody id="trades-body"><tr><td colspan="10" class="empty">No closed trades yet</td></tr></tbody></table>
     </div>
 
     <div class="tab-page" data-page="backtest">
       <div class="form-row">
-        <div class="form-field"><label>Symbol</label><input class="field" id="bt-symbol" value="BTC-USDT"></div>
-        <div class="form-field"><label>Interval</label>
-          <select class="btn" id="bt-interval">
-            <option>1m</option><option>3m</option><option selected>5m</option>
-            <option>15m</option><option>30m</option><option>1h</option>
-          </select>
-        </div>
-        <div class="form-field"><label>Days back</label><input class="field" id="bt-days" type="number" value="30" min="1" max="365"></div>
-        <label class="check"><input type="checkbox" id="bt-synth"> synthetic data (offline demo)</label>
+        <div class="ff"><label>Symbol</label><input class="field" id="bt-symbol" value="BTC-USDT"></div>
+        <div class="ff"><label>Interval</label><select class="btn" id="bt-interval">
+          <option>1m</option><option>3m</option><option selected>5m</option><option>15m</option><option>30m</option><option>1h</option></select></div>
+        <div class="ff"><label>Days back</label><input class="field" id="bt-days" type="number" value="30" min="1" max="365"></div>
+        <label class="check"><input type="checkbox" id="bt-synth"> synthetic (offline)</label>
         <button class="btn primary" id="bt-run">Run backtest</button>
       </div>
       <div class="progress" id="bt-progress"><div class="bar"></div></div>
       <div id="bt-results" style="display:none">
         <div class="cards" id="bt-cards"></div>
         <div id="bt-charts">
-          <div><div class="subtle-title">Equity curve</div><div id="chart-bt-equity"></div></div>
-          <div><div class="subtle-title">Alpha weights over time (online learning)</div><div id="chart-bt-weights"></div></div>
+          <div><div class="subt">Equity curve</div><div id="chart-bt-equity"></div></div>
+          <div><div class="subt">Desk allocation over time — the CIO reallocating</div><div id="chart-bt-alloc"></div></div>
         </div>
-        <div class="subtle-title" style="margin-top:12px">Trades (last 200)</div>
-        <div style="max-height:320px;overflow:auto">
-          <table class="tbl">
-            <thead><tr>
-              <th>Exit time</th><th>Side</th><th class="r">Entry</th><th class="r">Exit</th>
-              <th class="r">PnL</th><th class="r">R</th><th>Closed by</th>
-            </tr></thead>
-            <tbody id="bt-trades-body"></tbody>
-          </table>
+        <div class="mc-row">
+          <div><div class="subt">Monte Carlo — 5,000 bootstrapped trade sequences</div><div id="mc-chart"></div></div>
+          <div><div class="subt">Robustness</div><div class="mc-stats" id="mc-stats"></div></div>
         </div>
+        <div class="subt" style="margin-top:12px">Trades (last 200)</div>
+        <div style="max-height:300px;overflow:auto"><table class="tbl"><thead><tr>
+          <th>Exit</th><th>Side</th><th class="r">Entry</th><th class="r">Exit</th><th class="r">PnL</th><th class="r">R</th><th>Closed by</th>
+        </tr></thead><tbody id="bt-trades-body"></tbody></table></div>
       </div>
     </div>
 
     <div class="tab-page" data-page="optimizer">
-      <p class="mono-note" style="margin-top:0">Random search over strategy + exit parameters. Train on the first 70%, rank finalists on the held-out 30% — parameters that only memorized the past fall away. Apply the winner to the running config with one click.</p>
+      <p class="foot-note" style="margin-top:0">Random search over strategy + exit params, trained on the first 70% and ranked on the held-out 30% so overfit sets fall away. This is what the Auto-Tuner runs automatically in the background — here you can drive it by hand and apply a winner.</p>
       <div class="form-row">
-        <div class="form-field"><label>Symbol</label><input class="field" id="op-symbol" value="BTC-USDT"></div>
-        <div class="form-field"><label>Interval</label>
-          <select class="btn" id="op-interval">
-            <option>1m</option><option>3m</option><option selected>5m</option><option>15m</option>
-          </select>
-        </div>
-        <div class="form-field"><label>Days back</label><input class="field" id="op-days" type="number" value="45" min="7" max="365"></div>
-        <div class="form-field"><label>Trials</label><input class="field" id="op-trials" type="number" value="40" min="5" max="300"></div>
-        <label class="check"><input type="checkbox" id="op-synth"> synthetic data</label>
+        <div class="ff"><label>Symbol</label><input class="field" id="op-symbol" value="BTC-USDT"></div>
+        <div class="ff"><label>Interval</label><select class="btn" id="op-interval"><option>1m</option><option>3m</option><option selected>5m</option><option>15m</option></select></div>
+        <div class="ff"><label>Days back</label><input class="field" id="op-days" type="number" value="45" min="7" max="365"></div>
+        <div class="ff"><label>Trials</label><input class="field" id="op-trials" type="number" value="40" min="5" max="300"></div>
+        <label class="check"><input type="checkbox" id="op-synth"> synthetic</label>
         <button class="btn primary" id="op-run">Run optimizer</button>
       </div>
       <div class="progress" id="op-progress"><div class="bar"></div></div>
       <div id="op-results" style="display:none">
-        <div class="subtle-title" style="margin-top:10px">Finalists — ranked by validation fitness</div>
-        <div style="overflow:auto">
-          <table class="tbl">
-            <thead><tr>
-              <th>#</th><th class="r">Fit (valid)</th><th class="r">WR valid</th><th class="r">PF valid</th>
-              <th class="r">Trades</th><th class="r">Fit (train)</th><th>Params</th><th></th>
-            </tr></thead>
-            <tbody id="op-body"></tbody>
-          </table>
-        </div>
+        <div class="subt" style="margin-top:10px">Finalists — ranked by validation fitness</div>
+        <div style="overflow:auto"><table class="tbl"><thead><tr>
+          <th>#</th><th class="r">Fit (valid)</th><th class="r">WR</th><th class="r">PF</th><th class="r">Trades</th><th class="r">Fit (train)</th><th>Params</th><th></th>
+        </tr></thead><tbody id="op-body"></tbody></table></div>
       </div>
+    </div>
+
+    <div class="tab-page" data-page="autotuner">
+      <p class="foot-note" style="margin-top:0">The quant-research desk. On a timer it re-runs the walk-forward search on recent data and hot-swaps new parameters into the live brains <b>only</b> if they beat what's currently running on the held-out slice. You don't tune settings — it does.</p>
+      <div class="at-row" id="at-row"><div class="empty">Auto-tuner idle (engine not running)</div></div>
+      <div class="subt" style="margin-top:14px">Last research pass</div>
+      <div id="at-last" class="foot-note">—</div>
     </div>
 
     <div class="tab-page" data-page="settings">
       <div class="settings-grid">
-        <div class="settings-group">
+        <div class="sgroup">
           <h3>General</h3>
-          <div class="form-field"><label>Symbols (comma separated)</label><input class="field" id="cfg-symbols"></div>
-          <div class="form-field"><label>Data feed</label>
-            <select class="btn" id="cfg-feed"><option value="bingx">BingX (real market)</option><option value="synthetic">Synthetic (offline demo)</option></select>
-          </div>
-          <div class="form-field"><label>Bar interval</label>
-            <select class="btn" id="cfg-interval"><option>1m</option><option>3m</option><option>5m</option><option>15m</option><option>30m</option></select>
-          </div>
-          <div class="hint">Changing these requires switching to Idle and back to restart the engine.</div>
+          <div class="ff"><label>Symbols (comma separated)</label><input class="field" id="cfg-symbols"></div>
+          <div class="ff"><label>Data feed</label><select class="btn" id="cfg-feed"><option value="bingx">BingX (real market)</option><option value="synthetic">Synthetic (offline demo)</option></select></div>
+          <div class="ff"><label>Bar interval</label><select class="btn" id="cfg-interval"><option>1m</option><option>3m</option><option>5m</option><option>15m</option><option>30m</option></select></div>
+          <div class="hint">Changing these restarts the engine (switch to Idle and back).</div>
         </div>
-        <div class="settings-group">
-          <h3>Strategy</h3>
-          <div class="form-field"><label>Base threshold (0.2–0.9)</label><input class="field num" id="cfg-threshold" type="number" step="0.01"></div>
-          <div class="form-field"><label>Cost multiple</label><input class="field num" id="cfg-costmult" type="number" step="0.1"></div>
-          <div class="form-field"><label>Target trades / hour</label><input class="field num" id="cfg-tph" type="number" step="0.1"></div>
+        <div class="sgroup">
+          <h3>Brain</h3>
+          <div class="ff"><label>Base threshold</label><input class="field" id="cfg-threshold" type="number" step="0.01"></div>
+          <div class="ff"><label>Cost multiple</label><input class="field" id="cfg-costmult" type="number" step="0.1"></div>
+          <div class="ff"><label>Min P(win)</label><input class="field" id="cfg-minp" type="number" step="0.01"></div>
+          <div class="ff"><label>Kelly fraction</label><input class="field" id="cfg-kelly" type="number" step="0.05"></div>
           <label class="check"><input type="checkbox" id="cfg-adapt"> adaptive threshold</label>
+          <label class="check"><input type="checkbox" id="cfg-usekelly"> Kelly sizing</label>
           <label class="check"><input type="checkbox" id="cfg-micro"> order-flow entry veto</label>
+          <label class="check"><input type="checkbox" id="cfg-autotune"> background auto-tuner</label>
         </div>
-        <div class="settings-group">
+        <div class="sgroup">
           <h3>Risk</h3>
-          <div class="form-field"><label>Risk per trade (fraction of equity)</label><input class="field num" id="cfg-risk" type="number" step="0.001"></div>
-          <div class="form-field"><label>Max leverage</label><input class="field num" id="cfg-lev" type="number" step="1"></div>
-          <div class="form-field"><label>Max daily loss (fraction)</label><input class="field num" id="cfg-dayloss" type="number" step="0.005"></div>
-          <div class="form-field"><label>Max open positions</label><input class="field num" id="cfg-maxpos" type="number" step="1"></div>
-          <div class="form-field"><label>Paper starting balance</label><input class="field num" id="cfg-balance" type="number" step="100"></div>
+          <div class="ff"><label>Risk per trade (fraction)</label><input class="field" id="cfg-risk" type="number" step="0.001"></div>
+          <div class="ff"><label>Max leverage</label><input class="field" id="cfg-lev" type="number" step="1"></div>
+          <div class="ff"><label>Max daily loss (fraction)</label><input class="field" id="cfg-dayloss" type="number" step="0.005"></div>
+          <div class="ff"><label>Max open positions</label><input class="field" id="cfg-maxpos" type="number" step="1"></div>
+          <div class="ff"><label>Paper starting balance</label><input class="field" id="cfg-balance" type="number" step="100"></div>
         </div>
-        <div class="settings-group danger-zone">
+        <div class="sgroup danger-zone">
           <h3>Live trading</h3>
           <div class="kv" style="margin-bottom:8px"><span class="k">API keys</span><span class="v" id="cfg-keys">—</span></div>
           <label class="check"><input type="checkbox" id="cfg-allowlive"> allow_live — arm real-money trading</label>
-          <div class="hint">Keys live only in <b>.env</b> (BINGX_API_KEY / BINGX_API_SECRET). Switching to Live additionally requires typing a confirmation phrase. Start with paper trading; graduate only after the paper stats convince you.</div>
+          <div class="hint">Keys live only in <b>.env</b> (BINGX_API_KEY / BINGX_API_SECRET). Switching to Live also requires typing a confirmation phrase. Prove it in paper first.</div>
         </div>
       </div>
-      <div style="margin-top:14px"><button class="btn primary" id="cfg-save">Save settings</button></div>
+      <div style="margin-top:13px"><button class="btn primary" id="cfg-save">Save settings</button></div>
     </div>
   </section>
 
-  <p class="mono-note" style="margin-top:12px">
-    Bar-close decisions with tick-level exits · adaptive alpha ensemble (Hedge weights, regime gating, cost-aware threshold) ·
-    volatility-based sizing · exchange-side SL/TP in live mode · kill switch at daily loss limit.
-    Paper &amp; backtest run without API keys. This is not financial advice — futures with leverage can lose money fast.
+  <p class="foot-note">
+    18 alphas across 5 desks · online Hedge weights · meta-allocator backs live winners · regime gating · calibrated P(win) · fractional-Kelly sizing ·
+    health-governed auto-correction · background walk-forward self-tuning · tick-level exits · exchange-side SL/TP in live mode · daily-loss kill switch.
+    Paper &amp; backtest need no API keys. Not financial advice — leveraged futures can lose money fast.
   </p>
 </div>
 
-<!-- live confirm modal -->
-<div class="modal-back" id="live-modal">
-  <div class="modal">
-    <h3>Arm LIVE trading</h3>
-    <p>Real orders with real money on BingX perpetual futures. The bot will trade autonomously under its risk limits. Losses are yours.</p>
-    <p>Type <b id="live-phrase">TRADE LIVE</b> to confirm:</p>
-    <input class="field" id="live-confirm-input" placeholder="type the phrase">
-    <div class="row">
-      <button class="btn" id="live-cancel">Cancel</button>
-      <button class="btn danger" id="live-go" disabled>Go live</button>
-    </div>
-  </div>
-</div>
+<div class="modal-back" id="live-modal"><div class="modal">
+  <h3>⚠ ARM LIVE TRADING</h3>
+  <p>Real orders, real money on BingX perpetual futures. The bot trades autonomously under its risk limits. Losses are yours.</p>
+  <p>Type <b id="live-phrase">TRADE LIVE</b> to confirm:</p>
+  <input class="field" id="live-confirm-input" placeholder="type the phrase">
+  <div class="row"><button class="btn" id="live-cancel">Cancel</button><button class="btn danger" id="live-go" disabled>Go live</button></div>
+</div></div>
 
 <div id="toasts"></div>
 

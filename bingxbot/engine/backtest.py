@@ -1,4 +1,4 @@
-"""Event-driven historical simulation running the SAME AlphaEnsemble and
+"""Event-driven historical simulation running the SAME TradingBrain and
 RiskManager code as live trading, plus a train/validate random-search
 optimizer with an overfit guard.
 
@@ -20,12 +20,14 @@ import numpy as np
 from ..config import RiskConfig, StrategyConfig
 from ..exchange.models import LONG, SHORT, Candle, ContractSpec
 from ..risk.manager import RiskManager
-from ..strategy.ensemble import AlphaEnsemble
+from ..strategy.alphas import DESK_ORDER
+from ..strategy.brain import TradingBrain
 from ..strategy.features import FeatureFrame
 from ..util import clamp, interval_ms
 from .portfolio import Portfolio
 
 NO_MICRO = {"obi": 0.0, "flow": 0.0, "cvd_slope": 0.0, "spread_bps": 0.0, "ticks_per_s": 0.0}
+NO_CTX: dict = {}
 ASSUMED_SPREAD_BPS = 1.0
 
 
@@ -64,11 +66,12 @@ def run_backtest(
     o, h, l, c, ts = arrays["open"], arrays["high"], arrays["low"], arrays["close"], arrays["ts"]
 
     bars_per_hour = 3_600_000 / interval_ms(interval)
-    ens = AlphaEnsemble(
+    brain = TradingBrain(
         eta=strat.hedge_eta, weight_floor=strat.weight_floor, horizon_bars=strat.horizon_bars,
         base_threshold=strat.base_threshold, threshold_adapt=strat.threshold_adapt,
         target_trades_per_hour=strat.target_trades_per_hour,
         bars_per_hour=bars_per_hour, cost_multiple=strat.cost_multiple,
+        min_p_win=strat.min_p_win, kelly_fraction=strat.kelly_fraction,
     )
     sim_ts = {"v": float(ts[warmup]) / 1000.0}
     risk = RiskManager(risk_cfg, clock=lambda: sim_ts["v"])
@@ -112,7 +115,8 @@ def run_backtest(
             side = pending_entry["side"]
             px = fill(o[i], is_buy=(side == LONG))
             sized = risk.size_entry(pf.equity({symbol: px}), px, pending_entry["atr"], side, spec,
-                                    pending_entry["regime"], roundtrip_cost_pct=rt_cost)
+                                    pending_entry["regime"], roundtrip_cost_pct=rt_cost,
+                                    size_mult=pending_entry["size_mult"])
             if sized is not None:
                 fee = sized.qty * px * taker_fee
                 from ..exchange.models import Position
@@ -145,37 +149,42 @@ def run_backtest(
                 close_at(i, o[i] if gap_through else tp, "take profit")
             pos = pf.positions.get(symbol)
 
-        # 3) evaluate ensemble on this close (grades pending alpha calls too)
-        ev = ens.evaluate(row, NO_MICRO)
-        regime_counts[ev["regime"]] = regime_counts.get(ev["regime"], 0) + 1
+        # 3) run the full brain on this close (grades pending calls too)
+        ev = brain.evaluate(row, NO_MICRO, NO_CTX)
+        edge, p_win, regime = ev["edge"], ev["p_win"], ev["regime"]
+        regime_counts[regime] = regime_counts.get(regime, 0) + 1
 
         # 4) bar-close position management
         if pos is not None:
             bars_held += 1
             if risk.time_stop_hit(bars_held):
                 close_at(i, c[i], f"time stop ({bars_held} bars)")
-            elif ev["score"] * pos.direction() < 0 and abs(ev["score"]) >= 0.85 * ev["threshold"]:
-                close_at(i, c[i], f"opposite signal {ev['score']:+.2f}")
+            elif edge * pos.direction() < 0 and abs(edge) >= 0.85 * ev["threshold"]:
+                close_at(i, c[i], f"opposite edge {edge:+.2f}")
             else:
-                risk.update_trailing(pos, c[i], row.get("atr", 0.0), ev["regime"])
+                risk.update_trailing(pos, c[i], row.get("atr", 0.0), regime)
         else:
             # 5) entry decision for the next open
-            score = ev["score"]
             equity = pf.equity({symbol: c[i]})
             ok, _ = risk.can_enter(equity, len(pf.positions), ASSUMED_SPREAD_BPS)
             if ok:
-                ok, _ = ens.entry_ok(score, row, fees_rt, ASSUMED_SPREAD_BPS, slippage_bps)
+                ok, _ = brain.entry_ok(edge, p_win, row, fees_rt, ASSUMED_SPREAD_BPS, slippage_bps)
                 if ok:
+                    b = risk.payoff_ratio(regime)
+                    kelly = brain.kelly_size_mult(p_win, b) if strat.use_kelly else 1.0
+                    size_mult = kelly * risk.health.scalar
                     pending_entry = {
-                        "side": LONG if score > 0 else SHORT,
+                        "side": LONG if edge > 0 else SHORT,
                         "atr": row.get("atr", 0.0),
-                        "regime": ev["regime"],
-                        "reason": f"score {score:+.2f} thr {ev['threshold']:.2f} {ev['regime']}",
+                        "regime": regime,
+                        "size_mult": size_mult,
+                        "reason": f"edge {edge:+.2f} P{p_win:.0%} {regime}",
                     }
 
         pf.record_equity(int(ts[i]), {symbol: c[i]}, min_gap_ms=0)
         if collect_series and (i - warmup) % max(1, (n - warmup) // 160) == 0:
-            weights_timeline.append({"ts": int(ts[i]), **{k: round(v, 4) for k, v in ens.weights.items()}})
+            alloc = ev["alloc"]
+            weights_timeline.append({"ts": int(ts[i]), **{d: round(alloc.get(d, 0.0), 4) for d in DESK_ORDER}})
         if progress_cb and (i - warmup) % 500 == 0:
             progress_cb((i - warmup) / (n - warmup))
 
@@ -195,7 +204,7 @@ def run_backtest(
         "end_ts": int(ts[-1]),
         "starting_balance": starting_balance,
         "stats": stats,
-        "ensemble": ens.snapshot(),
+        "brain": brain.snapshot(),
         "regime_counts": regime_counts,
         "params": {"strategy": asdict(strat), "risk": asdict(risk_cfg),
                    "taker_fee": taker_fee, "slippage_bps": slippage_bps},
