@@ -18,8 +18,10 @@ from ..data.feed import BaseFeed, MarketState
 from ..exchange.models import LONG, SHORT, ContractSpec
 from ..risk.manager import RiskManager
 from ..strategy.brain import TradingBrain
+from ..strategy.exits import AdaptiveExitManager
 from ..strategy.features import FeatureFrame
 from ..util import now_ms
+from .backtest import _entry_signal_ok
 from .brokers import Broker, LiveBroker
 from .portfolio import Portfolio
 
@@ -58,6 +60,7 @@ class TraderEngine:
         self.portfolio = portfolio
         self.risk = risk
         self.specs = specs
+        self.exits = AdaptiveExitManager(cfg.risk)
         self.on_update = on_update  # async callback(kind: str) -> None
         s = cfg.strategy
         bars_per_hour = 3_600_000 / max(1, self._interval_ms())
@@ -184,22 +187,19 @@ class TraderEngine:
             await self.on_update("bar")
 
     async def _manage_position_on_bar(self, ctx: SymbolCtx, st: MarketState, row: dict, ev: dict) -> None:
+        """Adaptive exit management on bar close — the brain decides whether the
+        move continues (hold / advance the chandelier trail) or is done (exit)."""
         symbol = ctx.symbol
         pos = self.portfolio.positions.get(symbol)
         if pos is None:
             return
-        price = st.mark_price() or row["close"]
-        atr_val = row.get("atr", 0.0)
-
-        if self.risk.time_stop_hit(ctx.bars_held):
-            await self._close(symbol, f"time stop ({ctx.bars_held} bars)")
-            return
-        edge, thr = ev["edge"], ev["threshold"]
-        if edge * pos.direction() < 0 and abs(edge) >= 0.85 * thr:
-            await self._close(symbol, f"opposite edge {edge:+.2f}")
-            return
-        if self.risk.update_trailing(pos, price, atr_val, ev["regime"]):
-            log.info("%s stop -> %.6g (trail)", symbol, pos.stop_price)
+        moved, reason = self.exits.manage(
+            pos, row["close"], row["high"], row["low"], row.get("atr", 0.0),
+            row, ev["edge"], ev["threshold"], ev["regime"], ctx.bars_held)
+        if reason:
+            await self._close(symbol, reason)
+        elif moved:
+            log.info("%s stop -> %.6g (adaptive trail)", symbol, pos.stop_price)
 
     async def _try_enter(self, ctx: SymbolCtx, st: MarketState, row: dict, ev: dict) -> None:
         symbol = ctx.symbol
@@ -213,16 +213,11 @@ class TraderEngine:
         if not ok:
             ctx.last_entry_block = why
             return
-        if abs(edge) < ev["threshold"]:
-            ctx.last_entry_block = f"edge {edge:+.2f} < thr {ev['threshold']:.2f}"
-            return
-        ctx.set_stage("DETECT")
         spec = self.specs.get(symbol, ContractSpec(symbol))
-        fees_rt = 2.0 * spec.taker_fee
+        fees_rt = spec.taker_fee + (spec.maker_fee if self.cfg.strategy.entry_mode == "maker" else spec.taker_fee)
         slip = self.cfg.paper.slippage_bps if self.portfolio.mode != "live" else 1.0
-        ok, why = ctx.brain.entry_ok(edge, p_win, row, fees_rt, spread, slip)
-        if not ok:
-            ctx.last_entry_block = why
+        if not _entry_signal_ok(ctx.brain, self.cfg.strategy, edge, p_win, row, ev, fees_rt, slip):
+            ctx.last_entry_block = self._block_reason(ctx.brain, edge, p_win, row, ev, fees_rt, spread, slip)
             return
         if self.cfg.strategy.micro_confirm and not ctx.brain.micro_confirms(edge, st.micro_snapshot()):
             ctx.last_entry_block = "order-flow veto"
@@ -230,26 +225,44 @@ class TraderEngine:
         ctx.set_stage("VALIDATE")
 
         side = LONG if edge > 0 else SHORT
-        rt_cost = fees_rt + (spread + 2 * slip) / 10_000.0
-        b = self.risk.payoff_ratio(ev["regime"])
-        kelly = ctx.brain.kelly_size_mult(p_win, b) if self.cfg.strategy.use_kelly else 1.0
+        price = st.mark_price() or row["close"]
+        bracket = self.exits.initial_bracket(price, side, row.get("atr", 0.0), row, ev["regime"])
+        if bracket is None:
+            ctx.last_entry_block = "no volatility for bracket"
+            return
+        kelly = ctx.brain.kelly_size_mult(p_win, self.risk.payoff_ratio()) if self.cfg.strategy.use_kelly else 1.0
         size_mult = kelly * self.risk.health.scalar
         ctx.set_stage("SIZE")
-        sized = self.risk.size_entry(equity, st.mark_price() or row["close"], row.get("atr", 0.0),
-                                     side, spec, ev["regime"], roundtrip_cost_pct=rt_cost,
-                                     size_mult=size_mult)
+        sized = self.risk.size_entry(equity, price, bracket.init_risk, side, spec, size_mult)
         if sized is None:
             ctx.last_entry_block = "size below exchange minimum"
             return
+        sized.stop_price = bracket.stop
+        sized.take_profit = bracket.take_profit
         reason = f"edge {edge:+.2f} P{p_win:.0%} k{kelly:.2f} {ev['regime']}"
         ctx.set_stage("FILL")
         res = await self.broker.open_position(symbol, side, sized, reason, bar_ts=int(row["ts"]))
         ctx.last_entry_block = "" if res.ok else f"broker: {res.error}"
         if res.ok:
+            pos = self.portfolio.positions.get(symbol)
+            if pos is not None:
+                self.exits.attach(pos, row.get("atr", 0.0), bracket.init_risk)
             self._push_tape(symbol, "OPEN", side, res.filled_price,
                             {"p_win": round(p_win, 3), "edge": round(edge, 3)})
             if self.on_update:
                 await self.on_update("trade")
+
+    @staticmethod
+    def _block_reason(brain, edge, p_win, row, ev, fees_rt, spread, slip) -> str:
+        ok, why = brain.entry_ok(edge, p_win, row, fees_rt, spread, slip)
+        if not ok:
+            return why
+        r = ev["regime"]
+        if r == "RANGE":
+            return "range (discipline: trends only)"
+        if r == "VOLATILE":
+            return "volatile regime (sitting out)"
+        return "awaiting aligned trend"
 
     # ------------------------------------------------------------ tick logic
 

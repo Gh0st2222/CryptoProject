@@ -40,38 +40,55 @@ class ExchangeConfig:
 
 @dataclass
 class StrategyConfig:
-    interval: str = "5m"            # 1m allowed; cost floor keeps geometry honest
+    interval: str = "5m"            # 15m/5m recommended; 1m only with maker entries
     warmup_bars: int = 350          # bars required before the brain may trade
-    horizon_bars: int = 5           # bars over which alpha/desk calls are graded
+    horizon_bars: int = 8           # bars over which alpha/desk calls are graded
     hedge_eta: float = 0.35         # multiplicative-weights learning rate (alphas)
     weight_floor: float = 0.05      # no alpha is ever fully muted
-    base_threshold: float = 0.34    # |fused edge| needed to consider a trade
+    base_threshold: float = 0.30    # |fused edge| needed to consider a trade
     threshold_adapt: bool = True    # auto-tune threshold toward target trade rate
     target_trades_per_hour: float = 1.5
-    cost_multiple: float = 1.4      # predicted move must exceed round-trip cost x this
+    cost_multiple: float = 2.0      # predicted move must exceed round-trip cost x this
     micro_confirm: bool = True      # order-flow agreement gate at entry (live/paper)
+    trend_align_gate: bool = True   # in trends, only trade with multi-TF alignment
+    discipline: bool = True         # regime-appropriate entries (the big anti-bleed fix)
+    min_efficiency: float = 0.35    # trend entries need this Kaufman efficiency ratio
+    trade_range: bool = False       # also fade range extremes (adds trades, lower quality)
+    range_band_edge: float = 0.12   # range fades only within this far into a band tail
+    trade_volatile: bool = False    # sit out VOLATILE/chop (pure fee bleed)
     min_p_win: float = 0.50         # refuse trades below this calibrated win prob
     use_kelly: bool = True          # size by fractional Kelly from P(win)
     kelly_fraction: float = 0.30    # fraction of full Kelly (conservative)
+    entry_mode: str = "maker"       # maker (post-only, pays maker fee) | taker
+    maker_offset_bps: float = 1.0   # how far inside the touch to rest the limit
+    maker_wait_bars: int = 2        # bars to wait for a maker fill before cancelling
     auto_tune: bool = True          # background walk-forward self-tuning
     auto_tune_minutes: int = 90     # how often the auto-tuner re-evaluates
 
 
 @dataclass
 class RiskConfig:
-    risk_per_trade: float = 0.005       # equity fraction lost if the stop is hit
+    risk_per_trade: float = 0.005       # equity fraction lost if the initial stop is hit
     max_leverage: int = 10
     margin_mode: str = "ISOLATED"
-    atr_sl_mult: float = 1.7
-    atr_tp_mult: float = 1.9
-    trail_atr_mult: float = 1.3
-    breakeven_rr: float = 0.75          # move stop to entry at this R multiple
-    time_stop_bars: int = 40
-    cost_floor_mult: float = 3.5        # take-profit distance >= this x round-trip cost
+    # --- adaptive exit geometry (let winners run, cut losers) ---
+    sl_atr_min: float = 1.2             # initial stop: no tighter than this x ATR
+    sl_atr_max: float = 2.8             # ...and no wider than this (structure-clamped between)
+    tp_atr_cap: float = 0.0             # 0 = no fixed target; exit only via trail/edge
+    trail_atr_min: float = 1.6          # chandelier trail width in chop
+    trail_atr_max: float = 3.8          # ...widened in clean trends (Kaufman ER)
+    trail_tighten: float = 0.55         # ratchet trail this much tighter as profit grows
+    be_rr: float = 0.8                  # move stop to breakeven at this R
+    be_offset_atr: float = 0.15         # breakeven sits entry + this x ATR (covers fees)
+    giveback_rr: float = 2.5            # once past this R, protect the open profit
+    giveback_frac: float = 0.5          # ...exit if price retraces this fraction of MFE
+    hold_edge_frac: float = 0.7         # exit if brain edge flips past this x threshold
+    expected_rr: float = 2.2            # assumed winner:loser ratio for Kelly sizing
+    time_stop_bars: int = 120           # long backstop; trends need room to develop
     max_open_positions: int = 2
     max_position_notional_pct: float = 0.35  # of equity x leverage, per position
     max_daily_loss_pct: float = 0.05         # kill switch: flatten + halt for the day
-    max_consecutive_losses: int = 6          # cooldown trigger
+    max_consecutive_losses: int = 8          # cooldown trigger
     cooldown_minutes: int = 45
     max_spread_bps: float = 6.0              # refuse entries into a wide spread
 

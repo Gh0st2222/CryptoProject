@@ -18,10 +18,11 @@ from dataclasses import asdict
 import numpy as np
 
 from ..config import RiskConfig, StrategyConfig
-from ..exchange.models import LONG, SHORT, Candle, ContractSpec
+from ..exchange.models import LONG, SHORT, Candle, ContractSpec, Position
 from ..risk.manager import RiskManager
 from ..strategy.alphas import DESK_ORDER
 from ..strategy.brain import TradingBrain
+from ..strategy.exits import AdaptiveExitManager
 from ..strategy.features import FeatureFrame
 from ..util import clamp, interval_ms
 from .portfolio import Portfolio
@@ -29,6 +30,36 @@ from .portfolio import Portfolio
 NO_MICRO = {"obi": 0.0, "flow": 0.0, "cvd_slope": 0.0, "spread_bps": 0.0, "ticks_per_s": 0.0}
 NO_CTX: dict = {}
 ASSUMED_SPREAD_BPS = 1.0
+TREND_REGIMES = {"TREND_UP", "TREND_DOWN"}
+
+
+def _entry_signal_ok(brain, strat, edge: float, p_win: float, row: dict, ev: dict,
+                     fees_rt: float, slippage_bps: float) -> bool:
+    """Regime-appropriate entry filter. The single biggest fix for fee-drag:
+    only trade where an edge actually exists — ride confirmed, efficient,
+    multi-timeframe-aligned trends, fade only the tails of a range, and sit out
+    choppy/volatile regimes entirely (that's where accounts quietly bleed)."""
+    ok, _ = brain.entry_ok(edge, p_win, row, fees_rt, ASSUMED_SPREAD_BPS, slippage_bps)
+    if not ok:
+        return False
+    regime = ev["regime"]
+    if not strat.discipline:
+        if strat.trend_align_gate and regime in TREND_REGIMES:
+            align = row.get("mtf_align", 0.0)
+            if align * edge < 0 and abs(align) > 0.15:
+                return False
+        return True
+    if regime in TREND_REGIMES:
+        er = row.get("eff_ratio", 0.0)
+        align = row.get("mtf_align", 0.0)
+        return er >= strat.min_efficiency and align * edge > 0
+    if regime == "RANGE":
+        if not strat.trade_range:
+            return False
+        pctb = row.get("bb_pctb", 0.5)
+        b = strat.range_band_edge
+        return (pctb < b and edge > 0) or (pctb > 1 - b and edge < 0)
+    return strat.trade_volatile
 
 
 def candles_to_arrays(candles: list[Candle]) -> dict[str, np.ndarray]:
@@ -75,27 +106,52 @@ def run_backtest(
     )
     sim_ts = {"v": float(ts[warmup]) / 1000.0}
     risk = RiskManager(risk_cfg, clock=lambda: sim_ts["v"])
+    exits = AdaptiveExitManager(risk_cfg)
     pf = Portfolio(starting_balance, mode="backtest")
     slip = slippage_bps / 10_000.0
-    fees_rt = 2.0 * taker_fee
+    maker_fee = getattr(spec, "maker_fee", 0.0002)
+    is_maker = strat.entry_mode == "maker"
+    entry_fee_rate = maker_fee if is_maker else taker_fee
+    fees_rt = taker_fee + entry_fee_rate
     rt_cost = fees_rt + (ASSUMED_SPREAD_BPS + 2 * slippage_bps) / 10_000.0
+    maker_off = strat.maker_offset_bps / 10_000.0
 
-    pending_entry: dict | None = None
+    pending: dict | None = None
     bars_held = 0
     planned_risk = 0.0
     weights_timeline: list[dict] = []
     regime_counts: dict[str, int] = {}
     markers: list[dict] = []
 
-    def fill(px: float, is_buy: bool) -> float:
-        return px * (1 + slip) if is_buy else px * (1 - slip)
+    def open_at(i: int, side: str, px: float, atr: float, regime: str, size_mult: float,
+                reason: str, fee_rate: float) -> bool:
+        nonlocal planned_risk, bars_held
+        br = exits.initial_bracket(px, side, atr, ff.row(i), regime)
+        if br is None:
+            return False
+        sized = risk.size_entry(pf.equity({symbol: px}), px, br.init_risk, side, spec, size_mult)
+        if sized is None:
+            return False
+        fee = sized.qty * px * fee_rate
+        pos = Position(symbol=symbol, side=side, qty=sized.qty, entry_price=px,
+                       opened_ts=int(ts[i]), leverage=sized.leverage,
+                       stop_price=br.stop, take_profit=br.take_profit,
+                       entry_fee=fee, entry_reason=reason, entry_bar_ts=int(ts[i]))
+        exits.attach(pos, atr, br.init_risk)
+        pf.open_position(pos, fee)
+        planned_risk = sized.risk_amount
+        bars_held = 0
+        if collect_series:
+            markers.append({"ts": int(ts[i]), "kind": "entry", "side": side,
+                            "price": round(px, 8), "reason": reason})
+        return True
 
     def close_at(i: int, px: float, reason: str) -> None:
         nonlocal bars_held
         pos = pf.positions.get(symbol)
         if pos is None:
             return
-        px = fill(px, is_buy=(pos.side == SHORT))
+        px = px * (1 - slip) if pos.side == LONG else px * (1 + slip)   # exits are taker
         fee = pos.qty * px * taker_fee
         tr = pf.close_position(symbol, px, int(ts[i]), fee, reason, planned_risk)
         if tr:
@@ -110,43 +166,34 @@ def run_backtest(
         row = ff.row(i)
         pos = pf.positions.get(symbol)
 
-        # 1) execute entry decided on the previous close, at this bar's open
-        if pending_entry is not None and pos is None:
-            side = pending_entry["side"]
-            px = fill(o[i], is_buy=(side == LONG))
-            sized = risk.size_entry(pf.equity({symbol: px}), px, pending_entry["atr"], side, spec,
-                                    pending_entry["regime"], roundtrip_cost_pct=rt_cost,
-                                    size_mult=pending_entry["size_mult"])
-            if sized is not None:
-                fee = sized.qty * px * taker_fee
-                from ..exchange.models import Position
-                pf.open_position(Position(
-                    symbol=symbol, side=side, qty=sized.qty, entry_price=px,
-                    opened_ts=int(ts[i]), leverage=sized.leverage,
-                    stop_price=sized.stop_price, take_profit=sized.take_profit,
-                    entry_fee=fee, entry_reason=pending_entry["reason"], entry_bar_ts=int(ts[i]),
-                ), fee)
-                planned_risk = sized.risk_amount
-                bars_held = 0
-                if collect_series:
-                    markers.append({"ts": int(ts[i]), "kind": "entry", "side": side,
-                                    "price": round(px, 8), "reason": pending_entry["reason"]})
-            pending_entry = None
+        # 1) resolve a pending entry from the previous close
+        if pending is not None and pos is None:
+            side = pending["side"]
+            if pending["mode"] == "taker":
+                px = o[i] * (1 + slip) if side == LONG else o[i] * (1 - slip)
+                open_at(i, side, px, pending["atr"], pending["regime"], pending["size_mult"],
+                        pending["reason"], taker_fee)
+                pending = None
+            else:  # maker: rest post-only, fill only if price trades to the limit
+                lim = pending["limit"]
+                hit = (l[i] <= lim) if side == LONG else (h[i] >= lim)
+                if hit:
+                    open_at(i, side, lim, pending["atr"], pending["regime"], pending["size_mult"],
+                            pending["reason"], maker_fee)
+                    pending = None
+                elif i >= pending["expires_bar"]:
+                    pending = None  # unfilled -> cancelled, no trade
             pos = pf.positions.get(symbol)
 
-        # 2) intrabar protective exits (stop first when both hit - pessimistic)
+        # 2) intrabar protective stop (and fixed TP if configured)
         if pos is not None:
             d = pos.direction()
             stop, tp = pos.stop_price, pos.take_profit
-            stop_hit = stop > 0 and ((l[i] <= stop) if d > 0 else (h[i] >= stop))
-            tp_hit = tp > 0 and ((h[i] >= tp) if d > 0 else (l[i] <= tp))
-            if stop_hit:
-                gap_through = (o[i] < stop) if d > 0 else (o[i] > stop)
-                close_at(i, o[i] if gap_through else stop,
-                         "stop loss" if not pos.breakeven_moved else "trailing stop")
-            elif tp_hit:
-                gap_through = (o[i] > tp) if d > 0 else (o[i] < tp)
-                close_at(i, o[i] if gap_through else tp, "take profit")
+            if stop > 0 and ((l[i] <= stop) if d > 0 else (h[i] >= stop)):
+                gap = (o[i] < stop) if d > 0 else (o[i] > stop)
+                close_at(i, o[i] if gap else stop, "stop" if not pos.breakeven_moved else "trail stop")
+            elif tp > 0 and ((h[i] >= tp) if d > 0 else (l[i] <= tp)):
+                close_at(i, tp, "target")
             pos = pf.positions.get(symbol)
 
         # 3) run the full brain on this close (grades pending calls too)
@@ -154,32 +201,30 @@ def run_backtest(
         edge, p_win, regime = ev["edge"], ev["p_win"], ev["regime"]
         regime_counts[regime] = regime_counts.get(regime, 0) + 1
 
-        # 4) bar-close position management
+        # 4) bar-close adaptive exit management
         if pos is not None:
             bars_held += 1
-            if risk.time_stop_hit(bars_held):
-                close_at(i, c[i], f"time stop ({bars_held} bars)")
-            elif edge * pos.direction() < 0 and abs(edge) >= 0.85 * ev["threshold"]:
-                close_at(i, c[i], f"opposite edge {edge:+.2f}")
-            else:
-                risk.update_trailing(pos, c[i], row.get("atr", 0.0), regime)
-        else:
-            # 5) entry decision for the next open
+            _, exit_reason = exits.manage(pos, c[i], h[i], l[i], row.get("atr", 0.0),
+                                          row, edge, ev["threshold"], regime, bars_held)
+            if exit_reason:
+                close_at(i, c[i], exit_reason)
+        elif pending is None:
+            # 5) entry decision for the next bar
             equity = pf.equity({symbol: c[i]})
             ok, _ = risk.can_enter(equity, len(pf.positions), ASSUMED_SPREAD_BPS)
-            if ok:
-                ok, _ = brain.entry_ok(edge, p_win, row, fees_rt, ASSUMED_SPREAD_BPS, slippage_bps)
-                if ok:
-                    b = risk.payoff_ratio(regime)
-                    kelly = brain.kelly_size_mult(p_win, b) if strat.use_kelly else 1.0
-                    size_mult = kelly * risk.health.scalar
-                    pending_entry = {
-                        "side": LONG if edge > 0 else SHORT,
-                        "atr": row.get("atr", 0.0),
-                        "regime": regime,
-                        "size_mult": size_mult,
-                        "reason": f"edge {edge:+.2f} P{p_win:.0%} {regime}",
-                    }
+            if ok and _entry_signal_ok(brain, strat, edge, p_win, row, ev, fees_rt, slippage_bps):
+                kelly = brain.kelly_size_mult(p_win, risk.payoff_ratio()) if strat.use_kelly else 1.0
+                size_mult = kelly * risk.health.scalar
+                side = LONG if edge > 0 else SHORT
+                pend = {"side": side, "atr": row.get("atr", 0.0), "regime": regime,
+                        "size_mult": size_mult, "reason": f"edge {edge:+.2f} P{p_win:.0%} {regime}"}
+                if is_maker:
+                    pend["mode"] = "maker"
+                    pend["limit"] = c[i] * (1 - maker_off) if side == LONG else c[i] * (1 + maker_off)
+                    pend["expires_bar"] = i + strat.maker_wait_bars
+                else:
+                    pend["mode"] = "taker"
+                pending = pend
 
         pf.record_equity(int(ts[i]), {symbol: c[i]}, min_gap_ms=0)
         if collect_series and (i - warmup) % max(1, (n - warmup) // 160) == 0:
@@ -222,16 +267,18 @@ def run_backtest(
 # --------------------------------------------------------------- optimizer
 
 SEARCH_SPACE = {
-    "base_threshold": (0.20, 0.48),
-    "cost_multiple": (1.0, 2.4),
-    "hedge_eta": (0.15, 0.60),
-    "horizon_bars": (3, 9),
-    "atr_sl_mult": (1.1, 2.4),
-    "atr_tp_mult": (1.4, 3.4),
-    "trail_atr_mult": (0.8, 1.8),
-    "breakeven_rr": (0.5, 1.3),
-    "time_stop_bars": (25, 100),
-    "cost_floor_mult": (2.0, 5.0),
+    "base_threshold": (0.22, 0.46),
+    "cost_multiple": (1.4, 3.0),
+    "horizon_bars": (5, 14),
+    "sl_atr_min": (1.0, 2.0),
+    "sl_atr_max": (2.2, 3.6),
+    "trail_atr_min": (1.2, 2.4),
+    "trail_atr_max": (2.6, 4.5),
+    "be_rr": (0.6, 1.6),
+    "giveback_rr": (1.8, 3.5),
+    "giveback_frac": (0.35, 0.65),
+    "hold_edge_frac": (0.5, 1.0),
+    "time_stop_bars": (60, 160),
 }
 
 
@@ -240,14 +287,16 @@ def _apply_params(strat: StrategyConfig, risk: RiskConfig, p: dict) -> tuple[Str
     r = RiskConfig(**{**asdict(risk)})
     s.base_threshold = p["base_threshold"]
     s.cost_multiple = p["cost_multiple"]
-    s.hedge_eta = p["hedge_eta"]
     s.horizon_bars = int(p["horizon_bars"])
-    r.atr_sl_mult = p["atr_sl_mult"]
-    r.atr_tp_mult = p["atr_tp_mult"]
-    r.trail_atr_mult = p["trail_atr_mult"]
-    r.breakeven_rr = p["breakeven_rr"]
+    r.sl_atr_min = p["sl_atr_min"]
+    r.sl_atr_max = max(p["sl_atr_max"], p["sl_atr_min"] + 0.4)
+    r.trail_atr_min = p["trail_atr_min"]
+    r.trail_atr_max = max(p["trail_atr_max"], p["trail_atr_min"] + 0.4)
+    r.be_rr = p["be_rr"]
+    r.giveback_rr = p["giveback_rr"]
+    r.giveback_frac = p["giveback_frac"]
+    r.hold_edge_frac = p["hold_edge_frac"]
     r.time_stop_bars = int(p["time_stop_bars"])
-    r.cost_floor_mult = p["cost_floor_mult"]
     return s, r
 
 

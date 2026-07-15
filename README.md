@@ -75,16 +75,33 @@ firing ● vs dormant ○, so a resting alpha never looks broken).
 A cost gate (`β·|edge|·ATR%·√horizon` must clear round-trip fees × `cost_multiple`)
 and an order-flow veto sit in front of every entry.
 
+## Adaptive exits (the algorithm decides when the move is over)
+
+There is no fixed take-profit. Winners are ridden and losers are cut by an
+adaptive engine so a handful of big trends pay for many small losses — the only
+payoff shape that survives fees:
+
+- **Structure-based initial stop** at the recent swing (Donchian), clamped
+  between `sl_atr_min` and `sl_atr_max` × ATR — meaningful, bounded, = 1R.
+- **Profit-scaled chandelier trail** that starts wide (lets a young trend
+  breathe) and ratchets tighter as the trade gains, so a runner banks its move
+  instead of round-tripping to breakeven. Width also widens with trend quality
+  (Kaufman efficiency ratio) and regime.
+- **Edge-flip exit** — every bar the brain re-scores; if the fused edge turns
+  against the position with conviction, it exits *now*. This is the algorithm
+  deciding the move is done rather than waiting for a static stop.
+- Breakeven once +`be_rr` R; give-back lock protects a large open profit; a long
+  time-stop backstops dead trades.
+
 ## Sizing, risk & auto-correction
 
 - **Fractional-Kelly sizing** from calibrated P(win) and the trade's reward:risk,
   on top of a volatility-based base risk — a stop-out still loses a bounded,
-  known fraction of equity; Kelly only scales conviction, never the stop.
+  known fraction of equity; size scales conviction, never the initial stop.
 - **Health governor.** Tracks recent expectancy and drawdown and scales risk
   down when cold, back up as it recovers — hands-off auto-correction.
-- Exchange-side **STOP_MARKET / TAKE_PROFIT_MARKET** on every live entry, so the
-  protective exit survives a bot crash or disconnect.
-- Breakeven shift, ATR trailing stop, time stop, opposite-edge exit.
+- Exchange-side **STOP_MARKET** protection on every live entry, so the stop
+  survives a bot crash or disconnect; the trail is re-synced each bar.
 - **Kill switch** at the daily-loss limit; loss-streak cooldown; spread guard;
   max concurrent positions; manual KILL.
 
@@ -128,15 +145,31 @@ desk-allocation-over-time chart plus a 5,000-path Monte-Carlo robustness panel.
    phrase. *Tip: point `exchange.base_url` at `https://open-api-vst.bingx.com`
    to trade BingX demo (VST) funds first.*
 
-## The fee reality (read this)
+## The fee reality & what to honestly expect
 
-Taker fees are ~0.05%/side; a 1-minute scalp with a 0.15% stop pays ~0.8R
-round-trip regardless of signal. PULSE is honest about it: the cost gate refuses
-trades whose predicted edge can't clear fees, the cost floor stretches targets
-until they can, and the default interval is **5m**. The backtester charges full
-taker fees + slippage. "HFT" here means tick-level *reaction* (exits, order-flow
-features), not sub-second churn — churning at taker fees only enriches the
-exchange.
+Taker fees are ~0.05%/side; on 1-minute bars the round-trip cost is bigger than
+the average bar's move, so **any** signal bleeds to death — this is why naive
+scalpers lose. PULSE attacks that on three fronts:
+
+1. **Maker entries** — resting post-only limit orders pay the maker fee
+   (~0.02%) instead of taker (~0.05%), roughly halving round-trip cost. (Default
+   `entry_mode: "maker"`.)
+2. **Discipline gate** — it only trades where an edge can exist: confirmed,
+   efficient, multi-timeframe-aligned trends. It sits out choppy/volatile
+   regimes entirely (that's where accounts quietly bleed). Trading *less* is the
+   single biggest improvement.
+3. **Let winners run** — asymmetric adaptive exits so a few multi-R trends pay
+   for the many small losers a trend system takes.
+
+**Be realistic.** No bot is reliably profitable in all conditions — that does
+not exist, and anyone claiming it is selling something. This is a disciplined
+trend-follower: it makes money in trending markets and takes small, controlled
+losses in chop. On *realistic* backtests (a hardened near-random-walk generator,
+full fees + slippage) the shipped defaults are net positive across most random
+seeds with ~2% drawdown — but a choppy month will still be red, and **real-market
+results will differ from any backtest.** Prove it in paper on live BingX data
+for weeks before risking a cent. The backtester charges full fees and slippage
+and resolves stops pessimistically — the numbers aren't flattered.
 
 ## Architecture
 
@@ -155,8 +188,9 @@ bingxbot/
 │   ├── regime.py           regime detection + per-desk gating
 │   ├── allocator.py        MetaAllocator — the CIO
 │   ├── calibration.py      online logistic P(win) calibration
+│   ├── exits.py            adaptive exit engine (structure stop + chandelier + edge)
 │   └── brain.py            TradingBrain — the whole firm in one object
-├── risk/manager.py         Kelly-aware sizing, exits, health governor, kill switch
+├── risk/manager.py         Kelly-aware sizing, health governor, kill switch
 ├── engine/
 │   ├── portfolio.py        accounting + stats
 │   ├── brokers.py          PaperBroker / LiveBroker (one interface)
@@ -170,14 +204,17 @@ bingxbot/
 
 | Field | Default | Meaning |
 |---|---|---|
-| `strategy.interval` | `5m` | decision bar size |
-| `strategy.base_threshold` | 0.34 | min fused edge |
-| `strategy.cost_multiple` | 1.4 | edge must beat costs × this |
+| `strategy.interval` | `5m` | decision bar size (15m/5m recommended) |
+| `strategy.entry_mode` | `maker` | `maker` (post-only, cheap) or `taker` |
+| `strategy.discipline` | true | trend-only entries; sit out chop |
+| `strategy.trade_range` | false | also fade range extremes (more trades, lower quality) |
+| `strategy.base_threshold` | 0.30 | min fused edge |
 | `strategy.min_p_win` | 0.50 | refuse trades below this calibrated win prob |
 | `strategy.use_kelly` / `kelly_fraction` | true / 0.30 | fractional-Kelly sizing |
-| `strategy.auto_tune` / `auto_tune_minutes` | true / 90 | background self-tuning |
-| `risk.risk_per_trade` | 0.005 | base equity fraction at stop |
-| `risk.max_leverage` | 10 | leverage cap |
+| `strategy.auto_tune` | true | background walk-forward self-tuning |
+| `risk.risk_per_trade` | 0.005 | base equity fraction at the initial stop |
+| `risk.sl_atr_min/max` | 1.2 / 2.8 | initial stop clamp (× ATR) |
+| `risk.trail_atr_min/max` | 1.6 / 3.8 | chandelier trail width (× ATR) |
 | `risk.max_daily_loss_pct` | 0.05 | kill-switch level |
 | `allow_live` | false | hard gate for real orders |
 
