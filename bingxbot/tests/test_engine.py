@@ -59,7 +59,7 @@ async def test_paper_broker_short_side():
 @pytest.mark.asyncio
 async def test_trader_engine_end_to_end_on_synthetic_feed():
     """Boot the full realtime stack on the synthetic feed at high speed and
-    prove bars flow through ensemble evaluation without errors."""
+    prove bars flow through the brain without errors."""
     cfg = BotConfig()
     cfg.symbols = ["BTC-USDT"]
     cfg.mode = "paper"
@@ -79,8 +79,10 @@ async def test_trader_engine_end_to_end_on_synthetic_feed():
         await engine.stop(flatten=True)
     ctx = engine.ctx["BTC-USDT"]
     assert len(feed.states["BTC-USDT"].candles) > 345, "bars did not accumulate"
-    assert ctx.ensemble.graded > 50, "ensemble never graded alpha calls"
-    assert ctx.last_eval, "no ensemble evaluation happened"
+    assert ctx.brain.graded > 50, "brain never graded alpha calls"
+    assert ctx.last_eval, "no brain evaluation happened"
     snap = engine.snapshot()
     assert snap["portfolio"]["equity"] > 0
-    assert snap["symbols"]["BTC-USDT"]["ensemble"]["weights"]
+    sym = snap["symbols"]["BTC-USDT"]["brain"]
+    assert sym["alphas"] and sym["desks"], "brain snapshot missing alphas/desks"
+    assert 0.0 <= sym["p_win"] <= 1.0

@@ -41,15 +41,20 @@ class ExchangeConfig:
 @dataclass
 class StrategyConfig:
     interval: str = "5m"            # 1m allowed; cost floor keeps geometry honest
-    warmup_bars: int = 350          # bars required before the ensemble may trade
-    horizon_bars: int = 5           # bars over which alpha calls are graded
-    hedge_eta: float = 0.35         # multiplicative-weights learning rate
-    weight_floor: float = 0.04      # no alpha is ever fully muted
-    base_threshold: float = 0.34    # |ensemble score| needed to consider a trade
+    warmup_bars: int = 350          # bars required before the brain may trade
+    horizon_bars: int = 5           # bars over which alpha/desk calls are graded
+    hedge_eta: float = 0.35         # multiplicative-weights learning rate (alphas)
+    weight_floor: float = 0.05      # no alpha is ever fully muted
+    base_threshold: float = 0.34    # |fused edge| needed to consider a trade
     threshold_adapt: bool = True    # auto-tune threshold toward target trade rate
     target_trades_per_hour: float = 1.5
     cost_multiple: float = 1.4      # predicted move must exceed round-trip cost x this
     micro_confirm: bool = True      # order-flow agreement gate at entry (live/paper)
+    min_p_win: float = 0.50         # refuse trades below this calibrated win prob
+    use_kelly: bool = True          # size by fractional Kelly from P(win)
+    kelly_fraction: float = 0.30    # fraction of full Kelly (conservative)
+    auto_tune: bool = True          # background walk-forward self-tuning
+    auto_tune_minutes: int = 90     # how often the auto-tuner re-evaluates
 
 
 @dataclass

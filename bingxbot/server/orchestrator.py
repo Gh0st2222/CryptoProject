@@ -50,6 +50,7 @@ class Orchestrator:
         self.cfg = cfg or load_config()
         self.engine: TraderEngine | None = None
         self.rest: BingXRest | None = None
+        self.autotuner = None       # set lazily to avoid import cycle
         self.specs: dict[str, ContractSpec] = {}
         self.jobs: dict[str, Job] = {}
         self.listeners: set[asyncio.Queue] = set()
@@ -173,7 +174,14 @@ class Orchestrator:
         self.engine = TraderEngine(self.cfg, feed, broker, portfolio, risk, self.specs, on_update)
         await self.engine.start()
 
+        from ..engine.autotuner import AutoTuner
+        self.autotuner = AutoTuner(self)
+        self.autotuner.start()
+
     async def _stop_engine(self) -> None:
+        if self.autotuner is not None:
+            await self.autotuner.stop()
+            self.autotuner = None
         if self.engine is not None:
             try:
                 await self.engine.stop(flatten=False)
@@ -310,12 +318,7 @@ class Orchestrator:
                 setattr(target, k, cast(v))
         save_config(self.cfg)
         if self.engine:
-            for ctx in self.engine.ctx.values():
-                ens = ctx.ensemble
-                ens.base_threshold = s.base_threshold
-                ens.cost_multiple = s.cost_multiple
-                ens.eta = s.hedge_eta
-                ens.horizon = s.horizon_bars
+            self.engine.hot_swap_params(s)
 
     # ---------------------------------------------------------------- status
 
@@ -329,6 +332,8 @@ class Orchestrator:
         }
         if self.engine:
             d["engine"] = self.engine.snapshot()
+        if self.autotuner is not None:
+            d["autotuner"] = self.autotuner.snapshot()
         return d
 
     def update_cfg(self, patch: dict) -> dict:

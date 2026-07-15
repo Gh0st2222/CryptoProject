@@ -1,22 +1,23 @@
 """TraderEngine: the realtime decision loop shared by paper and live modes.
 
-Bar close  -> full ensemble evaluation, entry decisions, trailing/time exits.
+Bar close  -> full brain evaluation, entry decision (Kelly-sized), exits.
 Trade tick -> protective exit checks (stop / take-profit / trailing cross).
 
-The identical AlphaEnsemble + RiskManager pipeline runs in the backtester, so
+The identical TradingBrain + RiskManager pipeline runs in the backtester, so
 what you simulate is what trades.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import asdict as dc_asdict
 
 from ..config import BotConfig, MODE_LIVE
 from ..data.feed import BaseFeed, MarketState
 from ..exchange.models import LONG, SHORT, ContractSpec
 from ..risk.manager import RiskManager
-from ..strategy.ensemble import AlphaEnsemble
+from ..strategy.brain import TradingBrain
 from ..strategy.features import FeatureFrame
 from ..util import now_ms
 from .brokers import Broker, LiveBroker
@@ -24,18 +25,28 @@ from .portfolio import Portfolio
 
 log = logging.getLogger("trader")
 
-FEATURE_TAIL = 1400  # bars fed to FeatureFrame each close (widest window is 240)
+FEATURE_TAIL = 1400  # bars fed to FeatureFrame each close
+
+# Execution-cycle stages surfaced to the UI pipeline.
+STAGES = ("SCAN", "DETECT", "VALIDATE", "SIZE", "FILL", "MANAGE", "SETTLE")
 
 
 class SymbolCtx:
-    def __init__(self, symbol: str, ensemble: AlphaEnsemble):
+    def __init__(self, symbol: str, brain: TradingBrain):
         self.symbol = symbol
-        self.ensemble = ensemble
+        self.brain = brain
         self.last_row: dict = {}
-        self.bars_held = 0
         self.last_eval: dict = {}
+        self.bars_held = 0
         self.last_entry_block = ""
+        self.stage = "SCAN"
+        self.stage_ts = 0
+        self.eval_ms = 0.0
         self.busy = False  # guards against overlapping broker calls
+
+    def set_stage(self, stage: str) -> None:
+        self.stage = stage
+        self.stage_ts = now_ms()
 
 
 class TraderEngine:
@@ -51,11 +62,12 @@ class TraderEngine:
         s = cfg.strategy
         bars_per_hour = 3_600_000 / max(1, self._interval_ms())
         self.ctx: dict[str, SymbolCtx] = {
-            sym: SymbolCtx(sym, AlphaEnsemble(
+            sym: SymbolCtx(sym, TradingBrain(
                 eta=s.hedge_eta, weight_floor=s.weight_floor, horizon_bars=s.horizon_bars,
                 base_threshold=s.base_threshold, threshold_adapt=s.threshold_adapt,
                 target_trades_per_hour=s.target_trades_per_hour,
                 bars_per_hour=bars_per_hour, cost_multiple=s.cost_multiple,
+                min_p_win=s.min_p_win, kelly_fraction=s.kelly_fraction,
             ))
             for sym in cfg.symbols
         }
@@ -63,6 +75,7 @@ class TraderEngine:
         self._housekeeper: asyncio.Task | None = None
         self.running = False
         self.started_ts = 0
+        self.tape: list[dict] = []      # recent fills/exits for the UI ticker
 
     def _interval_ms(self) -> int:
         from ..util import interval_ms
@@ -118,12 +131,20 @@ class TraderEngine:
             beat += 1
             marks = {s: st.mark_price() for s, st in self.feed.states.items()}
             self.portfolio.record_equity(now_ms(), marks)
+            self.risk.health.mark_equity(self.portfolio.equity(marks))
             if isinstance(self.broker, LiveBroker) and beat % 6 == 0:
                 await self.broker.reconcile(self.cfg.symbols)
             if self.risk.state.killed and self.portfolio.positions:
                 await self.broker.flatten_all("kill switch")
             if self.on_update:
                 await self.on_update("state")
+
+    def _push_tape(self, symbol: str, kind: str, side: str, price: float, extra: dict | None = None) -> None:
+        row = {"ts": now_ms(), "symbol": symbol, "kind": kind, "side": side, "price": price}
+        if extra:
+            row.update(extra)
+        self.tape.append(row)
+        self.tape = self.tape[-60:]
 
     # ------------------------------------------------------------ bar logic
 
@@ -135,11 +156,15 @@ class TraderEngine:
         n = len(st.candles)
         if n < self.cfg.strategy.warmup_bars:
             ctx.last_entry_block = f"warmup {n}/{self.cfg.strategy.warmup_bars}"
+            ctx.set_stage("SCAN")
             return
+        t0 = time.perf_counter()
         ff = FeatureFrame(st.candles.arrays(min(n, FEATURE_TAIL)))
         row = ff.row(-1)
         micro = st.micro_snapshot()
-        ev = ctx.ensemble.evaluate(row, micro)
+        data_ctx = st.context_snapshot()
+        ev = ctx.brain.evaluate(row, micro, data_ctx)
+        ctx.eval_ms = (time.perf_counter() - t0) * 1000.0
         ctx.last_row = row
         ctx.last_eval = ev
 
@@ -148,6 +173,7 @@ class TraderEngine:
         try:
             if pos is not None:
                 ctx.bars_held += 1
+                ctx.set_stage("MANAGE")
                 await self._manage_position_on_bar(ctx, st, row, ev)
             else:
                 ctx.bars_held = 0
@@ -168,17 +194,17 @@ class TraderEngine:
         if self.risk.time_stop_hit(ctx.bars_held):
             await self._close(symbol, f"time stop ({ctx.bars_held} bars)")
             return
-        # strong opposite ensemble signal -> exit early instead of riding to SL
-        score, thr = ev["score"], ev["threshold"]
-        if score * pos.direction() < 0 and abs(score) >= 0.85 * thr:
-            await self._close(symbol, f"opposite signal {score:+.2f}")
+        edge, thr = ev["edge"], ev["threshold"]
+        if edge * pos.direction() < 0 and abs(edge) >= 0.85 * thr:
+            await self._close(symbol, f"opposite edge {edge:+.2f}")
             return
         if self.risk.update_trailing(pos, price, atr_val, ev["regime"]):
             log.info("%s stop -> %.6g (trail)", symbol, pos.stop_price)
 
     async def _try_enter(self, ctx: SymbolCtx, st: MarketState, row: dict, ev: dict) -> None:
         symbol = ctx.symbol
-        score = ev["score"]
+        edge, p_win = ev["edge"], ev["p_win"]
+        ctx.set_stage("SCAN")
         marks = {s: s_st.mark_price() for s, s_st in self.feed.states.items()}
         equity = self.portfolio.equity(marks)
         spread = st.spread_bps.get(1.0)
@@ -187,29 +213,43 @@ class TraderEngine:
         if not ok:
             ctx.last_entry_block = why
             return
+        if abs(edge) < ev["threshold"]:
+            ctx.last_entry_block = f"edge {edge:+.2f} < thr {ev['threshold']:.2f}"
+            return
+        ctx.set_stage("DETECT")
         spec = self.specs.get(symbol, ContractSpec(symbol))
         fees_rt = 2.0 * spec.taker_fee
         slip = self.cfg.paper.slippage_bps if self.portfolio.mode != "live" else 1.0
-        ok, why = ctx.ensemble.entry_ok(score, row, fees_rt, spread, slip)
+        ok, why = ctx.brain.entry_ok(edge, p_win, row, fees_rt, spread, slip)
         if not ok:
             ctx.last_entry_block = why
             return
-        if self.cfg.strategy.micro_confirm and not ctx.ensemble.micro_confirms(score, st.micro_snapshot()):
+        if self.cfg.strategy.micro_confirm and not ctx.brain.micro_confirms(edge, st.micro_snapshot()):
             ctx.last_entry_block = "order-flow veto"
             return
+        ctx.set_stage("VALIDATE")
 
-        side = LONG if score > 0 else SHORT
+        side = LONG if edge > 0 else SHORT
         rt_cost = fees_rt + (spread + 2 * slip) / 10_000.0
+        b = self.risk.payoff_ratio(ev["regime"])
+        kelly = ctx.brain.kelly_size_mult(p_win, b) if self.cfg.strategy.use_kelly else 1.0
+        size_mult = kelly * self.risk.health.scalar
+        ctx.set_stage("SIZE")
         sized = self.risk.size_entry(equity, st.mark_price() or row["close"], row.get("atr", 0.0),
-                                     side, spec, ev["regime"], roundtrip_cost_pct=rt_cost)
+                                     side, spec, ev["regime"], roundtrip_cost_pct=rt_cost,
+                                     size_mult=size_mult)
         if sized is None:
             ctx.last_entry_block = "size below exchange minimum"
             return
-        reason = f"score {score:+.2f} thr {ev['threshold']:.2f} {ev['regime']}"
+        reason = f"edge {edge:+.2f} P{p_win:.0%} k{kelly:.2f} {ev['regime']}"
+        ctx.set_stage("FILL")
         res = await self.broker.open_position(symbol, side, sized, reason, bar_ts=int(row["ts"]))
         ctx.last_entry_block = "" if res.ok else f"broker: {res.error}"
-        if res.ok and self.on_update:
-            await self.on_update("trade")
+        if res.ok:
+            self._push_tape(symbol, "OPEN", side, res.filled_price,
+                            {"p_win": round(p_win, 3), "edge": round(edge, 3)})
+            if self.on_update:
+                await self.on_update("trade")
 
     # ------------------------------------------------------------ tick logic
 
@@ -239,13 +279,18 @@ class TraderEngine:
                 ctx.busy = False
 
     async def _close(self, symbol: str, reason: str) -> None:
+        ctx = self.ctx.get(symbol)
+        if ctx:
+            ctx.set_stage("SETTLE")
         res = await self.broker.close_position(symbol, reason)
         if res.ok:
             trades = self.portfolio.trades
             if trades:
                 marks = {s: st.mark_price() for s, st in self.feed.states.items()}
                 self.risk.on_trade_closed(trades[-1], self.portfolio.equity(marks))
-            ctx = self.ctx.get(symbol)
+                t = trades[-1]
+                self._push_tape(symbol, "CLOSE", t.side, t.exit_price,
+                                {"pnl": round(t.pnl, 4), "reason": reason})
             if ctx:
                 ctx.bars_held = 0
             if self.on_update:
@@ -262,15 +307,20 @@ class TraderEngine:
             "feed_healthy": self.feed.healthy(),
             "started_ts": self.started_ts,
             "interval": self.cfg.strategy.interval,
+            "stages": list(STAGES),
+            "tape": self.tape[-40:],
             "symbols": {
                 sym: {
                     "price": marks.get(sym, 0.0),
                     "bars": len(self.feed.states[sym].candles),
                     "warmup_bars": self.cfg.strategy.warmup_bars,
                     "micro": self.feed.states[sym].micro_snapshot(),
-                    "ensemble": c.ensemble.snapshot(),
+                    "context": self.feed.states[sym].context_snapshot(),
+                    "brain": c.brain.snapshot(),
                     "bars_held": c.bars_held,
                     "entry_block": c.last_entry_block,
+                    "stage": c.stage,
+                    "eval_ms": round(c.eval_ms, 2),
                 }
                 for sym, c in self.ctx.items()
             },
@@ -279,3 +329,14 @@ class TraderEngine:
             "equity_curve": list(self.portfolio.equity_curve)[-600:],
             "trades": [dc_asdict(t) for t in self.portfolio.trades[-80:]],
         }
+
+    def hot_swap_params(self, strat) -> None:
+        """Live-apply tuned strategy params to every symbol's brain (auto-tuner)."""
+        for c in self.ctx.values():
+            b = c.brain
+            b.base_threshold = strat.base_threshold
+            b.cost_multiple = strat.cost_multiple
+            b.eta = strat.hedge_eta
+            b.horizon = max(1, strat.horizon_bars)
+            b.kelly_fraction = strat.kelly_fraction
+            b.min_p_win = strat.min_p_win

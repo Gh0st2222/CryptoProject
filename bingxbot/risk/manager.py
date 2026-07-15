@@ -9,14 +9,18 @@ from __future__ import annotations
 import logging
 import math
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 from ..config import RiskConfig
 from ..exchange.models import LONG, ContractSpec, Position, TradeRecord
-from ..strategy.regime import REGIME_EXIT_MULT
-from ..util import round_step
+from ..util import clamp, round_step
 
 log = logging.getLogger("risk")
+
+# Local import guard: regime tables live in strategy but risk shouldn't hard-
+# depend on the strategy package import order.
+from ..strategy.regime import REGIME_EXIT_MULT  # noqa: E402
 
 
 @dataclass
@@ -27,6 +31,7 @@ class SizedOrder:
     stop_price: float
     take_profit: float
     risk_amount: float
+    size_mult: float = 1.0
 
 
 @dataclass
@@ -41,11 +46,57 @@ class RiskState:
     trades_today: int = 0
 
 
+class HealthGovernor:
+    """Auto-correction: watches recent realized performance and drawdown and
+    scales risk down when the strategy is cold, back up as it recovers. No one
+    touches a setting — the machine throttles itself."""
+
+    def __init__(self, window: int = 30):
+        self.r_hist: deque[float] = deque(maxlen=window)
+        self.scalar = 1.0
+        self.peak_equity = 0.0
+        self.drawdown = 0.0
+
+    def on_trade(self, r_multiple: float, equity: float) -> None:
+        self.r_hist.append(clamp(r_multiple, -3.0, 5.0))
+        self.peak_equity = max(self.peak_equity, equity)
+        self.drawdown = (self.peak_equity - equity) / self.peak_equity if self.peak_equity > 0 else 0.0
+        self._recompute()
+
+    def mark_equity(self, equity: float) -> None:
+        self.peak_equity = max(self.peak_equity, equity)
+        if self.peak_equity > 0:
+            self.drawdown = (self.peak_equity - equity) / self.peak_equity
+            self._recompute()
+
+    def _recompute(self) -> None:
+        n = len(self.r_hist)
+        if n < 8:
+            base = 1.0
+        else:
+            expectancy = sum(self.r_hist) / n           # avg R over recent trades
+            # map expectancy in [-0.4, +0.4] R to a risk scalar in [0.4, 1.3]
+            base = clamp(1.0 + expectancy * 0.9, 0.4, 1.3)
+        # drawdown brake: shrink hard as drawdown deepens
+        dd_brake = clamp(1.0 - self.drawdown * 3.0, 0.3, 1.0)
+        self.scalar = clamp(base * dd_brake, 0.3, 1.3)
+
+    def snapshot(self) -> dict:
+        n = len(self.r_hist)
+        return {
+            "scalar": round(self.scalar, 3),
+            "drawdown": round(self.drawdown, 4),
+            "recent_expectancy": round(sum(self.r_hist) / n, 3) if n else 0.0,
+            "sample": n,
+        }
+
+
 class RiskManager:
     def __init__(self, cfg: RiskConfig, clock=time.time):
         self.cfg = cfg
         self.clock = clock  # injectable so backtests run on simulated time
         self.state = RiskState()
+        self.health = HealthGovernor()
 
     # ------------------------------------------------------------- lifecycle
 
@@ -56,6 +107,7 @@ class RiskManager:
 
     def on_trade_closed(self, trade: TradeRecord, equity: float) -> None:
         self._roll_day(equity)
+        self.health.on_trade(trade.r_multiple, equity)
         st = self.state
         st.day_realized += trade.pnl
         st.trades_today += 1
@@ -101,7 +153,12 @@ class RiskManager:
 
     def size_entry(self, equity: float, price: float, atr_val: float, side: str,
                    spec: ContractSpec, regime: str,
-                   roundtrip_cost_pct: float = 0.0) -> SizedOrder | None:
+                   roundtrip_cost_pct: float = 0.0,
+                   size_mult: float = 1.0) -> SizedOrder | None:
+        """`size_mult` folds in the brain's fractional-Kelly conviction and the
+        health governor's auto-correction scalar. It scales the risk budget,
+        never the stop distance, so a losing trade still costs a bounded,
+        known fraction of equity."""
         if price <= 0 or atr_val <= 0 or equity <= 0:
             return None
         ex = REGIME_EXIT_MULT.get(regime, {"sl": 1.0, "tp": 1.0, "trail": 1.0})
@@ -117,7 +174,9 @@ class RiskManager:
             tp_dist *= scale
             sl_dist *= scale
 
-        risk_amount = equity * self.cfg.risk_per_trade
+        eff_mult = clamp(size_mult, 0.1, 2.0)
+        risk_amount = equity * self.cfg.risk_per_trade * eff_mult
+        risk_amount = min(risk_amount, equity * self.cfg.risk_per_trade * 2.0)  # hard cap
         qty = risk_amount / sl_dist
         max_notional = equity * self.cfg.max_leverage * self.cfg.max_position_notional_pct
         qty = min(qty, max_notional / price)
@@ -131,7 +190,14 @@ class RiskManager:
         stop = round_step(price - d * sl_dist, spec.price_precision)
         take = round_step(price + d * tp_dist, spec.price_precision)
         return SizedOrder(qty=qty, notional=notional, leverage=leverage,
-                          stop_price=stop, take_profit=take, risk_amount=qty * sl_dist)
+                          stop_price=stop, take_profit=take, risk_amount=qty * sl_dist,
+                          size_mult=eff_mult)
+
+    def payoff_ratio(self, regime: str) -> float:
+        ex = REGIME_EXIT_MULT.get(regime, {"sl": 1.0, "tp": 1.0})
+        sl = self.cfg.atr_sl_mult * ex["sl"]
+        tp = self.cfg.atr_tp_mult * ex["tp"]
+        return tp / sl if sl > 0 else 1.0
 
     # ------------------------------------------------------------- exits
 
@@ -176,4 +242,5 @@ class RiskManager:
             "day_start_equity": round(st.day_start_equity, 2),
             "trades_today": st.trades_today,
             "consecutive_losses": st.consecutive_losses,
+            "health": self.health.snapshot(),
         }

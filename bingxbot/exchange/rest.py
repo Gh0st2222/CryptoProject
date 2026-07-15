@@ -214,6 +214,22 @@ class BingXRest:
         row = data[0] if isinstance(data, list) and data else data
         return safe_float(row.get("price"))
 
+    async def premium_index(self, symbol: str) -> dict:
+        """Mark price, index price and current funding rate."""
+        data = await self._request("GET", "/openApi/swap/v2/quote/premiumIndex", {"symbol": symbol})
+        row = data[0] if isinstance(data, list) and data else data
+        return {
+            "mark": safe_float(row.get("markPrice")),
+            "index": safe_float(row.get("indexPrice")),
+            "funding_rate": safe_float(row.get("lastFundingRate")),
+            "next_funding_time": int(safe_float(row.get("nextFundingTime"))),
+        }
+
+    async def open_interest(self, symbol: str) -> float:
+        data = await self._request("GET", "/openApi/swap/v2/quote/openInterest", {"symbol": symbol})
+        row = data[0] if isinstance(data, list) and data else data
+        return safe_float(row.get("openInterest"))
+
     # --------------------------------------------------------------- account
 
     async def balance(self) -> dict:

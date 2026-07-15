@@ -129,3 +129,87 @@ def zscore(x: np.ndarray, n: int) -> np.ndarray:
     m = sma(x, n)
     sd = rolling_std(x, n)
     return (x - m) / np.maximum(sd, 1e-12)
+
+
+def macd(close: np.ndarray, fast: int = 12, slow: int = 26, signal: int = 9):
+    """Return (macd_line, signal_line, histogram)."""
+    line = ema(close, fast) - ema(close, slow)
+    sig = ema(np.nan_to_num(line), signal)
+    return line, sig, line - sig
+
+
+def stochastic(high: np.ndarray, low: np.ndarray, close: np.ndarray, n: int = 14, d: int = 3):
+    """Fast %K and %D of the stochastic oscillator, in [0, 100]."""
+    k = np.full_like(close, np.nan, dtype=np.float64)
+    if len(close) >= n:
+        hh = np.lib.stride_tricks.sliding_window_view(high, n).max(axis=1)
+        ll = np.lib.stride_tricks.sliding_window_view(low, n).min(axis=1)
+        k[n - 1:] = 100.0 * (close[n - 1:] - ll) / np.maximum(hh - ll, 1e-12)
+    return k, sma(np.nan_to_num(k, nan=50.0), d)
+
+
+def keltner(high: np.ndarray, low: np.ndarray, close: np.ndarray, n: int = 20, mult: float = 1.5):
+    """Keltner channel (EMA +/- mult*ATR). Returns (mid, upper, lower)."""
+    mid = ema(close, n)
+    a = atr(high, low, close, n)
+    return mid, mid + mult * a, mid - mult * a
+
+
+def efficiency_ratio(close: np.ndarray, n: int = 20) -> np.ndarray:
+    """Kaufman efficiency ratio in [0, 1]: net move / summed absolute moves.
+    High => clean directional trend; low => choppy/noisy."""
+    out = np.full_like(close, np.nan, dtype=np.float64)
+    if len(close) > n:
+        diff = np.abs(np.diff(close))
+        vol = np.convolve(diff, np.ones(n), "valid")           # sum |Δ| over n
+        signal = np.abs(close[n:] - close[:-n])
+        out[n:] = signal / np.maximum(vol, 1e-12)
+    return out
+
+
+def linreg_slope(close: np.ndarray, n: int = 20) -> np.ndarray:
+    """Per-bar slope of a rolling linear regression, normalized by price."""
+    out = np.full_like(close, np.nan, dtype=np.float64)
+    if len(close) >= n:
+        x = np.arange(n, dtype=np.float64)
+        x -= x.mean()
+        denom = (x * x).sum()
+        w = np.lib.stride_tricks.sliding_window_view(close, n)
+        wm = w - w.mean(axis=1, keepdims=True)
+        slope = (wm * x).sum(axis=1) / denom
+        out[n - 1:] = slope / np.maximum(w[:, -1], 1e-12)
+    return out
+
+
+def rolling_max(x: np.ndarray, n: int) -> np.ndarray:
+    out = np.full_like(x, np.nan, dtype=np.float64)
+    if len(x) >= n:
+        out[n - 1:] = np.lib.stride_tricks.sliding_window_view(x, n).max(axis=1)
+    return out
+
+
+def rolling_min(x: np.ndarray, n: int) -> np.ndarray:
+    out = np.full_like(x, np.nan, dtype=np.float64)
+    if len(x) >= n:
+        out[n - 1:] = np.lib.stride_tricks.sliding_window_view(x, n).min(axis=1)
+    return out
+
+
+def resample_ohlc(ts: np.ndarray, o: np.ndarray, h: np.ndarray, l: np.ndarray,
+                  c: np.ndarray, v: np.ndarray, factor: int):
+    """Aggregate base bars into higher-timeframe bars (grouped by `factor`).
+    Returns arrays aligned so index i//factor maps base bar i to its HTF bar;
+    used to build multi-timeframe context features without extra downloads."""
+    n = len(c)
+    groups = (n + factor - 1) // factor
+    ho = np.empty(groups); hh = np.empty(groups); hl = np.empty(groups)
+    hc = np.empty(groups); hv = np.empty(groups)
+    for g in range(groups):
+        a = g * factor
+        b = min(a + factor, n)
+        ho[g] = o[a]
+        hh[g] = h[a:b].max()
+        hl[g] = l[a:b].min()
+        hc[g] = c[b - 1]
+        hv[g] = v[a:b].sum()
+    return ho, hh, hl, hc, hv
