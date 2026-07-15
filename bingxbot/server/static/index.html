@@ -178,39 +178,38 @@
     </div>
 
     <div class="tab-page" data-page="autotuner">
-      <p class="foot-note" style="margin-top:0">The quant-research desk. On a timer it re-runs the walk-forward search on recent data and hot-swaps new parameters into the live brains <b>only</b> if they beat what's currently running on the held-out slice. You don't tune settings — it does.</p>
+      <p class="foot-note" style="margin-top:0">The always-on research desk. Every couple of minutes it evolves the current champion parameters + random explorers over the <b>entire</b> strategy &amp; risk space, validates the survivors on a held-out slice, and hot-swaps a challenger into the live brains <b>only</b> when it clearly beats what's running. It never touches the settings you own. You don't tune — it does, continuously.</p>
       <div class="at-row" id="at-row"><div class="empty">Auto-tuner idle (engine not running)</div></div>
-      <div class="subt" style="margin-top:14px">Last research pass</div>
-      <div id="at-last" class="foot-note">—</div>
+      <div class="subt" style="margin-top:14px">Promotions — parameters it has adopted</div>
+      <div style="overflow:auto"><table class="tbl"><thead><tr>
+        <th>When</th><th class="r">Fitness →</th><th class="r">WR</th><th class="r">PF</th><th>Key params adopted</th>
+      </tr></thead><tbody id="at-history"><tr><td colspan="5" class="empty">No promotions yet — it only swaps genuine improvements</td></tr></tbody></table></div>
     </div>
 
     <div class="tab-page" data-page="settings">
+      <p class="foot-note" style="margin-top:0"><b>You own these.</b> Everything else — thresholds, exits, sizing, Kelly, all of it — is owned and continuously optimized by the auto-tuner; its current live values are shown below, read-only.</p>
       <div class="settings-grid">
         <div class="sgroup">
-          <h3>General</h3>
+          <h3>Your settings</h3>
           <div class="ff"><label>Symbols (comma separated)</label><input class="field" id="cfg-symbols"></div>
           <div class="ff"><label>Data feed</label><select class="btn" id="cfg-feed"><option value="bingx">BingX (real market)</option><option value="synthetic">Synthetic (offline demo)</option></select></div>
           <div class="ff"><label>Bar interval</label><select class="btn" id="cfg-interval"><option>1m</option><option>3m</option><option>5m</option><option>15m</option><option>30m</option></select></div>
-          <div class="hint">Changing these restarts the engine (switch to Idle and back).</div>
-        </div>
-        <div class="sgroup">
-          <h3>Brain</h3>
-          <div class="ff"><label>Base threshold</label><input class="field" id="cfg-threshold" type="number" step="0.01"></div>
-          <div class="ff"><label>Cost multiple</label><input class="field" id="cfg-costmult" type="number" step="0.1"></div>
-          <div class="ff"><label>Min P(win)</label><input class="field" id="cfg-minp" type="number" step="0.01"></div>
-          <div class="ff"><label>Kelly fraction</label><input class="field" id="cfg-kelly" type="number" step="0.05"></div>
-          <label class="check"><input type="checkbox" id="cfg-adapt"> adaptive threshold</label>
-          <label class="check"><input type="checkbox" id="cfg-usekelly"> Kelly sizing</label>
-          <label class="check"><input type="checkbox" id="cfg-micro"> order-flow entry veto</label>
-          <label class="check"><input type="checkbox" id="cfg-autotune"> background auto-tuner</label>
-        </div>
-        <div class="sgroup">
-          <h3>Risk</h3>
-          <div class="ff"><label>Risk per trade (fraction)</label><input class="field" id="cfg-risk" type="number" step="0.001"></div>
-          <div class="ff"><label>Max leverage</label><input class="field" id="cfg-lev" type="number" step="1"></div>
-          <div class="ff"><label>Max daily loss (fraction)</label><input class="field" id="cfg-dayloss" type="number" step="0.005"></div>
-          <div class="ff"><label>Max open positions</label><input class="field" id="cfg-maxpos" type="number" step="1"></div>
           <div class="ff"><label>Paper starting balance</label><input class="field" id="cfg-balance" type="number" step="100"></div>
+          <div class="ff"><label>Max open positions</label><input class="field" id="cfg-maxpos" type="number" step="1"></div>
+          <div class="hint">Interval / symbols / feed changes restart the engine (Idle → back).</div>
+        </div>
+        <div class="sgroup">
+          <h3>Leverage &amp; risk band</h3>
+          <div class="ff"><label>Min leverage</label><input class="field" id="cfg-levmin" type="number" step="1" min="1" max="20"></div>
+          <div class="ff"><label>Max leverage</label><input class="field" id="cfg-levmax" type="number" step="1" min="1" max="20"></div>
+          <div class="ff"><label>Max daily loss (fraction)</label><input class="field" id="cfg-dayloss" type="number" step="0.005"></div>
+          <div class="ff"><label>Hard per-trade risk cap (fraction)</label><input class="field" id="cfg-hardrisk" type="number" step="0.005"></div>
+          <label class="check"><input type="checkbox" id="cfg-autotune"> auto-tuner running</label>
+          <div class="hint">The bot auto-adapts leverage <i>within</i> your band based on volatility &amp; conviction.</div>
+        </div>
+        <div class="sgroup">
+          <h3 style="color:#7db4ee">Auto-managed <span style="color:var(--muted)">· live values</span></h3>
+          <div id="auto-params" class="mono" style="font-size:11px;line-height:1.9"></div>
         </div>
         <div class="sgroup danger-zone">
           <h3>Live trading</h3>
@@ -219,7 +218,7 @@
           <div class="hint">Keys live only in <b>.env</b> (BINGX_API_KEY / BINGX_API_SECRET). Switching to Live also requires typing a confirmation phrase. Prove it in paper first.</div>
         </div>
       </div>
-      <div style="margin-top:13px"><button class="btn primary" id="cfg-save">Save settings</button></div>
+      <div style="margin-top:13px"><button class="btn primary" id="cfg-save">Save my settings</button></div>
     </div>
   </section>
 

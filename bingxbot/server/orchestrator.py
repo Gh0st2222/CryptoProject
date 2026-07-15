@@ -306,22 +306,14 @@ class Orchestrator:
         return job
 
     def apply_params(self, params: dict) -> None:
-        """Promote optimizer parameters into the running config."""
-        s, r = self.cfg.strategy, self.cfg.risk
-        mapping = {
-            "base_threshold": (s, float), "cost_multiple": (s, float),
-            "hedge_eta": (s, float), "horizon_bars": (s, int),
-            "atr_sl_mult": (r, float), "atr_tp_mult": (r, float),
-            "trail_atr_mult": (r, float), "breakeven_rr": (r, float),
-            "time_stop_bars": (r, int), "cost_floor_mult": (r, float),
-        }
-        for k, v in params.items():
-            if k in mapping:
-                target, cast = mapping[k]
-                setattr(target, k, cast(v))
+        """Promote tuned parameters into the running config (in place, so the
+        risk manager and exit engine — which hold the same cfg by reference —
+        pick them up immediately) and hot-swap the brains."""
+        from ..engine.backtest import apply_tunables_inplace
+        apply_tunables_inplace(self.cfg.strategy, self.cfg.risk, params)
         save_config(self.cfg)
         if self.engine:
-            self.engine.hot_swap_params(s)
+            self.engine.hot_swap_params(self.cfg.strategy)
 
     # ---------------------------------------------------------------- status
 
@@ -340,8 +332,11 @@ class Orchestrator:
         return d
 
     def update_cfg(self, patch: dict) -> dict:
-        restart_keys = {"symbols", "feed", "strategy", "exchange"}
-        needs_restart = bool(restart_keys & set(patch.keys())) and self.mode != MODE_IDLE
+        # Only data-shape changes need an engine restart; risk band, max
+        # positions and auto-tune toggle all take effect live (read by ref).
+        before = (tuple(self.cfg.symbols), self.cfg.feed, self.cfg.strategy.interval)
         update_config(self.cfg, patch)
+        after = (tuple(self.cfg.symbols), self.cfg.feed, self.cfg.strategy.interval)
+        needs_restart = before != after and self.mode != MODE_IDLE
         return {"ok": True, "needs_restart": needs_restart,
                 "config": config_public_dict(self.cfg)}

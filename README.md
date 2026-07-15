@@ -1,13 +1,14 @@
 # ⚡ PULSE — BingX Adaptive Futures Terminal
 
 A self-adapting, multi-strategy trading machine for **BingX USDT-M perpetual
-futures** with leverage, three execution modes, and a dense realtime web
-terminal. It runs like a small trading firm: an analyst floor of 18 alpha
-signals across five specialist **desks**, a **meta-allocator** (the CIO) that
-shifts capital toward whatever is actually working, **calibrated win
-probabilities** driving **fractional-Kelly** sizing, a **health governor** that
-throttles risk when it's cold, and a **background auto-tuner** that re-tunes
-itself so you don't have to touch settings.
+futures** with **volatility-targeted 2–7× leverage**, three execution modes, and
+a dense realtime web terminal. It runs like a small trading firm: an analyst
+floor of 18 alpha signals across five specialist **desks**, a **meta-allocator**
+(the CIO) that shifts capital toward whatever is actually working, **calibrated
+win probabilities** driving **fractional-Kelly** sizing, a **health governor**
+that throttles risk when it's cold, and a **continuous evolutionary auto-tuner**
+that optimizes the entire parameter space around the clock so you never tune a
+setting yourself.
 
 - **Live trading** — real orders on BingX, exchange-side stop-loss/take-profit
   on every entry, kill switch, reconciliation against exchange state.
@@ -93,17 +94,37 @@ payoff shape that survives fees:
 - Breakeven once +`be_rr` R; give-back lock protects a large open profit; a long
   time-stop backstops dead trades.
 
-## Sizing, risk & auto-correction
+## Leverage, sizing & auto-correction
 
-- **Fractional-Kelly sizing** from calibrated P(win) and the trade's reward:risk,
-  on top of a volatility-based base risk — a stop-out still loses a bounded,
-  known fraction of equity; size scales conviction, never the initial stop.
+- **Volatility-targeted 2–7× leverage.** Risk-based sizing is expressed as a
+  *leverage* and clamped to your band `[min_leverage, max_leverage]` (default
+  2–7). Because the stop is ATR-based, leverage rises in calm markets and falls
+  in volatile ones — classic vol targeting — while per-trade risk stays roughly
+  constant. Conviction (Kelly) and the health governor move where in the band it
+  sits; a **hard per-trade risk cap** overrides the band in a storm. Live mode
+  sets the chosen leverage on the exchange per trade.
+- **Fractional-Kelly sizing** from calibrated P(win) and the trade's reward:risk.
 - **Health governor.** Tracks recent expectancy and drawdown and scales risk
   down when cold, back up as it recovers — hands-off auto-correction.
 - Exchange-side **STOP_MARKET** protection on every live entry, so the stop
   survives a bot crash or disconnect; the trail is re-synced each bar.
 - **Kill switch** at the daily-loss limit; loss-streak cooldown; spread guard;
   max concurrent positions; manual KILL.
+
+## Continuous self-tuning (you never touch settings)
+
+The auto-tuner is an **always-on research desk**. Every couple of minutes it
+evolves the current champion parameters (gaussian perturbations) plus fresh
+random explorers across the **entire** strategy + risk/exit space (~22
+parameters), scores them on a train split, validates the survivors on a held-out
+slice, and **hot-swaps a challenger into the live brains only when it clearly
+beats the running champion** — otherwise it changes nothing. Promotions persist
+and show up on the Auto-Tuner tab with their fitness jump and the params adopted.
+
+It never touches the settings **you** own: symbols, feed, interval, starting
+balance, max open positions, the leverage band, and the daily-loss limit. On the
+Settings tab those are the only editable fields; everything else is displayed
+read-only as the live values the tuner has chosen.
 
 ## Self-tuning (don't touch settings)
 
@@ -200,25 +221,29 @@ bingxbot/
 └── server/                 FastAPI + WebSocket + the terminal (vendored charts)
 ```
 
-## Configuration (`config.json`, UI-editable)
+## Configuration
+
+The **only** settings you own (editable on the Settings tab); everything else is
+owned and continuously optimized by the auto-tuner and shown read-only:
 
 | Field | Default | Meaning |
 |---|---|---|
+| `symbols` | BTC-USDT, ETH-USDT | traded contracts |
+| `feed` | `bingx` | `bingx` (real market) or `synthetic` (offline) |
 | `strategy.interval` | `5m` | decision bar size (15m/5m recommended) |
-| `strategy.entry_mode` | `maker` | `maker` (post-only, cheap) or `taker` |
-| `strategy.discipline` | true | trend-only entries; sit out chop |
-| `strategy.trade_range` | false | also fade range extremes (more trades, lower quality) |
-| `strategy.base_threshold` | 0.30 | min fused edge |
-| `strategy.min_p_win` | 0.50 | refuse trades below this calibrated win prob |
-| `strategy.use_kelly` / `kelly_fraction` | true / 0.30 | fractional-Kelly sizing |
-| `strategy.auto_tune` | true | background walk-forward self-tuning |
-| `risk.risk_per_trade` | 0.005 | base equity fraction at the initial stop |
-| `risk.sl_atr_min/max` | 1.2 / 2.8 | initial stop clamp (× ATR) |
-| `risk.trail_atr_min/max` | 1.6 / 3.8 | chandelier trail width (× ATR) |
+| `paper.starting_balance` | 10000 | simulation bankroll |
+| `risk.max_open_positions` | 2 | concurrent positions |
+| `risk.min_leverage` / `max_leverage` | 2 / 7 | leverage band (auto-adapted within) |
+| `risk.max_risk_hard_pct` | 0.035 | hard cap on any single trade's loss |
 | `risk.max_daily_loss_pct` | 0.05 | kill-switch level |
+| `strategy.auto_tune` | true | run the continuous tuner |
 | `allow_live` | false | hard gate for real orders |
 
-API keys live **only** in `.env` — never in `config.json`, never in the browser.
+Auto-managed (the tuner owns them): `base_threshold`, `cost_multiple`,
+`target_trades_per_hour`, `min_p_win`, `kelly_fraction`, `min_efficiency`,
+`hedge_eta`, `horizon_bars`, `risk_per_trade`, and the full exit geometry
+(`sl_atr_*`, `trail_atr_*`, `trail_tighten`, `be_rr`, `giveback_*`,
+`hold_edge_frac`, `time_stop_bars`, …). API keys live **only** in `.env`.
 
 ## Tests
 

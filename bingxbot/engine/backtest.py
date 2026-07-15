@@ -266,43 +266,68 @@ def run_backtest(
 
 # --------------------------------------------------------------- optimizer
 
-SEARCH_SPACE = {
-    "base_threshold": (0.22, 0.46),
-    "cost_multiple": (1.4, 3.0),
-    "horizon_bars": (5, 14),
-    "sl_atr_min": (1.0, 2.0),
-    "sl_atr_max": (2.2, 3.6),
-    "trail_atr_min": (1.2, 2.4),
-    "trail_atr_max": (2.6, 4.5),
-    "be_rr": (0.6, 1.6),
-    "giveback_rr": (1.8, 3.5),
-    "giveback_frac": (0.35, 0.65),
-    "hold_edge_frac": (0.5, 1.0),
-    "time_stop_bars": (60, 160),
+# The full auto-owned parameter space the tuner searches. User-owned settings
+# (symbols, feed, interval, warmup, leverage band, daily-loss, max positions,
+# starting balance) are deliberately excluded. (lo, hi, target, kind)
+TUNABLES: dict[str, tuple] = {
+    # strategy
+    "base_threshold":         (0.20, 0.46, "strategy", "float"),
+    "target_trades_per_hour": (0.4, 3.0, "strategy", "float"),
+    "cost_multiple":          (1.2, 3.2, "strategy", "float"),
+    "hedge_eta":              (0.15, 0.60, "strategy", "float"),
+    "horizon_bars":           (5, 16, "strategy", "int"),
+    "min_efficiency":         (0.25, 0.50, "strategy", "float"),
+    "min_p_win":              (0.48, 0.60, "strategy", "float"),
+    "kelly_fraction":         (0.15, 0.60, "strategy", "float"),
+    "maker_offset_bps":       (0.0, 3.0, "strategy", "float"),
+    "trade_range":            (0, 1, "strategy", "bool"),
+    # risk / exits
+    "risk_per_trade":         (0.004, 0.014, "risk", "float"),
+    "sl_atr_min":             (1.0, 2.2, "risk", "float"),
+    "sl_atr_max":             (2.2, 3.8, "risk", "float"),
+    "trail_atr_min":          (1.2, 2.6, "risk", "float"),
+    "trail_atr_max":          (2.6, 4.6, "risk", "float"),
+    "trail_tighten":          (0.30, 0.75, "risk", "float"),
+    "be_rr":                  (0.5, 1.6, "risk", "float"),
+    "giveback_rr":            (1.6, 3.6, "risk", "float"),
+    "giveback_frac":          (0.35, 0.70, "risk", "float"),
+    "hold_edge_frac":         (0.5, 1.0, "risk", "float"),
+    "expected_rr":            (1.6, 3.0, "risk", "float"),
+    "time_stop_bars":         (60, 200, "risk", "int"),
 }
+
+
+def _coerce(name: str, v):
+    kind = TUNABLES[name][3]
+    if kind == "int":
+        return int(round(v))
+    if kind == "bool":
+        return bool(v >= 0.5) if not isinstance(v, bool) else v
+    return round(float(v), 4)
+
+
+def apply_tunables_inplace(strat: StrategyConfig, risk: RiskConfig, p: dict) -> None:
+    for name, val in p.items():
+        spec = TUNABLES.get(name)
+        if not spec:
+            continue
+        target = strat if spec[2] == "strategy" else risk
+        setattr(target, name, _coerce(name, val))
+    # keep dependent bounds coherent
+    risk.sl_atr_max = max(risk.sl_atr_max, risk.sl_atr_min + 0.4)
+    risk.trail_atr_max = max(risk.trail_atr_max, risk.trail_atr_min + 0.4)
 
 
 def _apply_params(strat: StrategyConfig, risk: RiskConfig, p: dict) -> tuple[StrategyConfig, RiskConfig]:
     s = StrategyConfig(**{**asdict(strat)})
     r = RiskConfig(**{**asdict(risk)})
-    s.base_threshold = p["base_threshold"]
-    s.cost_multiple = p["cost_multiple"]
-    s.horizon_bars = int(p["horizon_bars"])
-    r.sl_atr_min = p["sl_atr_min"]
-    r.sl_atr_max = max(p["sl_atr_max"], p["sl_atr_min"] + 0.4)
-    r.trail_atr_min = p["trail_atr_min"]
-    r.trail_atr_max = max(p["trail_atr_max"], p["trail_atr_min"] + 0.4)
-    r.be_rr = p["be_rr"]
-    r.giveback_rr = p["giveback_rr"]
-    r.giveback_frac = p["giveback_frac"]
-    r.hold_edge_frac = p["hold_edge_frac"]
-    r.time_stop_bars = int(p["time_stop_bars"])
+    apply_tunables_inplace(s, r, p)
     return s, r
 
 
 def _fitness(stats: dict) -> float:
     t = stats.get("trades", 0)
-    if t < 12:
+    if t < 10:
         return -1.0
     pf_capped = min(stats.get("profit_factor", 0.0), 3.5)
     dd = stats.get("max_drawdown", 1.0)
@@ -336,9 +361,9 @@ def run_optimizer(
 
     for t in range(n_trials):
         p = {}
-        for k, (lo, hi) in SEARCH_SPACE.items():
+        for k, (lo, hi, _grp, kind) in TUNABLES.items():
             v = rng.uniform(lo, hi)
-            p[k] = int(round(v)) if k in ("horizon_bars", "time_stop_bars") else round(v, 3)
+            p[k] = _coerce(k, v)
         s, r = _apply_params(strat, risk_cfg, p)
         res_t = run_backtest(train, symbol, interval, s, r, spec,
                              taker_fee=taker_fee, slippage_bps=slippage_bps, collect_series=False)

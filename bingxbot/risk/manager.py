@@ -153,24 +153,36 @@ class RiskManager:
 
     def size_entry(self, equity: float, price: float, stop_dist: float, side: str,
                    spec: ContractSpec, size_mult: float = 1.0) -> SizedOrder | None:
-        """Size a position so hitting the initial stop (a `stop_dist` price move)
-        loses `risk_per_trade` of equity. `size_mult` folds in fractional-Kelly
-        conviction and the health governor's scalar — it scales the risk budget,
-        never the stop, so a loss is always a bounded, known fraction of equity.
-        The stop/target prices themselves are owned by the AdaptiveExitManager."""
+        """Volatility-targeted leverage sizing.
+
+        Risk-based sizing (lose `risk_per_trade` of equity if the initial stop
+        hits) is expressed as a *leverage*, then clamped into the operating band
+        [min_leverage, max_leverage]. Because the stop is ATR-based, this makes
+        leverage rise in calm markets and fall in volatile ones (classic vol
+        targeting) while per-trade risk stays ~constant. `size_mult` (Kelly x
+        health) pushes conviction/health into where in the band we sit. A hard
+        per-trade risk cap overrides the band in extreme volatility."""
         if price <= 0 or stop_dist <= 0 or equity <= 0:
             return None
         eff_mult = clamp(size_mult, 0.1, 2.0)
-        risk_amount = min(equity * self.cfg.risk_per_trade * eff_mult,
-                          equity * self.cfg.risk_per_trade * 2.0)
-        qty = risk_amount / stop_dist
-        max_notional = equity * self.cfg.max_leverage * self.cfg.max_position_notional_pct
-        qty = min(qty, max_notional / price)
+        risk_amount = equity * self.cfg.risk_per_trade * eff_mult
+        lev_min, lev_max = self.cfg.min_leverage, self.cfg.max_leverage
+
+        implied_lev = (risk_amount / stop_dist) * price / equity   # leverage risk-sizing wants
+        lev = clamp(implied_lev, lev_min, lev_max)
+        qty = lev * equity / price
+
+        # hard safety cap: no single trade may risk more than max_risk_hard_pct,
+        # even if that means dropping below the nominal min leverage in a storm.
+        max_risk = equity * self.cfg.max_risk_hard_pct
+        if qty * stop_dist > max_risk:
+            qty = max_risk / stop_dist
+
         qty = round_step(qty, spec.qty_precision)
         if qty < spec.min_qty or qty * price < spec.min_notional_usdt:
             return None
         notional = qty * price
-        leverage = max(1, min(self.cfg.max_leverage, math.ceil(notional / max(equity * 0.9, 1e-9))))
+        leverage = int(clamp(round(notional / max(equity, 1e-9)), 1, lev_max))
         return SizedOrder(qty=qty, notional=notional, leverage=leverage,
                           stop_price=0.0, take_profit=0.0, risk_amount=qty * stop_dist,
                           size_mult=eff_mult)
