@@ -41,13 +41,21 @@ class AdaptiveExitManager:
 
     # ------------------------------------------------------------- entry
 
-    def initial_bracket(self, entry: float, side: str, atr: float, row: dict, regime: str) -> Bracket | None:
+    def initial_bracket(self, entry: float, side: str, atr: float, row: dict, regime: str,
+                        style: str = "trend") -> Bracket | None:
         if entry <= 0 or atr <= 0:
             return None
         cfg = self.cfg
+        d = 1 if side == LONG else -1
+        if style == "scalp":
+            # tight, symmetric-ish: a passive maker target and a close stop.
+            dist = cfg.scalp_sl_atr * atr
+            stop = entry - d * dist
+            tp = entry + d * cfg.scalp_tp_atr * atr
+            return Bracket(stop=stop, take_profit=tp, init_risk=dist)
+        # trend: structure stop, let it run (no fixed target)
         ex = REGIME_EXIT_MULT.get(regime, {"sl": 1.0, "tp": 1.0})
         lo, hi = cfg.sl_atr_min * ex["sl"] * atr, cfg.sl_atr_max * ex["sl"] * atr
-        d = 1 if side == LONG else -1
         if side == LONG:
             swing = row.get("dc_lo", entry - lo)
             struct_dist = entry - swing
@@ -91,6 +99,21 @@ class AdaptiveExitManager:
         # 1) edge-flip exit — the brain says the move reversed
         if edge * d <= -cfg.hold_edge_frac * threshold and abs(edge) > 0.15:
             return False, f"edge reversed {edge:+.2f}"
+
+        # scalp: the passive maker target is the primary exit (handled intrabar
+        # by the fill model). Here we just run a tight stop, breakeven and a
+        # short time-stop; no chandelier riding.
+        if pos.style == "scalp":
+            m2 = False
+            if not pos.breakeven_moved and rr >= 0.6:
+                be = pos.entry_price + d * cfg.be_offset_atr * atr
+                if (be - pos.stop_price) * d > 0:
+                    pos.stop_price = be
+                    pos.breakeven_moved = True
+                    m2 = True
+            if bars_held >= cfg.scalp_time_stop:
+                return m2, f"scalp time stop ({bars_held})"
+            return m2, None
 
         moved = False
         # 2) breakeven once we're up be_rr

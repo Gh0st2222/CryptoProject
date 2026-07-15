@@ -26,7 +26,7 @@ from ..config import MODE_IDLE
 from ..exchange.models import ContractSpec
 from ..util import clamp
 from .backtest import (TUNABLES, _apply_params, _coerce, _fitness, apply_tunables_inplace,
-                       run_backtest)
+                       robust_fitness, run_backtest)
 
 log = logging.getLogger("autotuner")
 
@@ -170,9 +170,8 @@ class AutoTuner:
 
         for c in cands:
             s, r = _apply_params(base_strat, base_risk, c["params"])
-            st = run_backtest(train, symbol, interval, s, r, spec, taker_fee=taker,
-                              slippage_bps=slip, collect_series=False).get("stats", {})
-            c["train"] = _fitness(st)
+            # rank on robustness across sub-windows, not a single fit
+            c["train"] = robust_fitness(train, symbol, interval, s, r, spec, taker, slip, folds=3)
         cands.sort(key=lambda x: x["train"], reverse=True)
         top = cands[:N_VALIDATE]
         champ_c = next(c for c in cands if c["tag"] == "champion")
@@ -180,10 +179,9 @@ class AutoTuner:
             top.append(champ_c)
         for c in top:
             s, r = _apply_params(base_strat, base_risk, c["params"])
-            st = run_backtest(valid, symbol, interval, s, r, spec, taker_fee=taker,
-                              slippage_bps=slip, collect_series=False).get("stats", {})
-            c["valid"] = _fitness(st)
-            c["valid_stats"] = st
+            c["valid"] = robust_fitness(valid, symbol, interval, s, r, spec, taker, slip, folds=2)
+            c["valid_stats"] = run_backtest(valid, symbol, interval, s, r, spec, taker_fee=taker,
+                                            slippage_bps=slip, collect_series=False).get("stats", {})
         top.sort(key=lambda x: x["valid"], reverse=True)
         champ_valid = next((c["valid"] for c in top if c["tag"] == "champion"), 0.0)
         return top[0], champ_valid, top

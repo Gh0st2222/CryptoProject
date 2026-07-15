@@ -53,8 +53,8 @@ class StrategyConfig:
     trend_align_gate: bool = True   # in trends, only trade with multi-TF alignment
     discipline: bool = True         # regime-appropriate entries (the big anti-bleed fix)
     min_efficiency: float = 0.35    # trend entries need this Kaufman efficiency ratio
-    trade_range: bool = False       # also fade range extremes (adds trades, lower quality)
-    range_band_edge: float = 0.12   # range fades only within this far into a band tail
+    trade_range: bool = False       # opt-in: scalp range extremes (maker in/out). Off by
+    range_band_edge: float = 0.15   # default — range mean-reversion is a weak edge; the
     trade_volatile: bool = False    # sit out VOLATILE/chop (pure fee bleed)
     min_p_win: float = 0.50         # refuse trades below this calibrated win prob
     use_kelly: bool = True          # size by fractional Kelly from P(win)
@@ -85,8 +85,14 @@ class RiskConfig:
     giveback_rr: float = 2.5            # once past this R, protect the open profit
     giveback_frac: float = 0.5          # ...exit if price retraces this fraction of MFE
     hold_edge_frac: float = 0.7         # exit if brain edge flips past this x threshold
-    expected_rr: float = 2.2            # assumed winner:loser ratio for Kelly sizing
+    expected_rr: float = 2.2            # assumed winner:loser ratio for Kelly sizing (trend)
     time_stop_bars: int = 120           # long backstop; trends need room to develop
+    # --- scalp style (range/mean-reversion): passive maker target, quick ---
+    scalp_tp_atr: float = 1.1           # passive limit target distance (x ATR)
+    scalp_sl_atr: float = 1.0           # tight stop for scalps (x ATR)
+    scalp_time_stop: int = 24           # scalps are quick; bail if it stalls
+    scalp_expected_rr: float = 1.1      # ~1:1 target:stop for Kelly on scalps
+    maker_adverse_bps: float = 0.4      # honest adverse-selection penalty on maker fills
     max_open_positions: int = 2
     max_position_notional_pct: float = 0.35  # of equity x leverage, per position
     max_daily_loss_pct: float = 0.05         # kill switch: flatten + halt for the day
