@@ -92,6 +92,7 @@ class Position:
     trail_price: float = 0.0  # high-water (LONG) / low-water (SHORT) for trailing
     exchange_position_id: str = ""
     # adaptive-exit state
+    style: str = "trend"      # trend (ride with trail) | scalp (passive maker target)
     atr_ref: float = 0.0      # ATR at entry, the risk unit for this trade
     init_risk: float = 0.0    # initial stop distance in price (defines 1R)
     peak_price: float = 0.0   # best price reached since entry (chandelier anchor)

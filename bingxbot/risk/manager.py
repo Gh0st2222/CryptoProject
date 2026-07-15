@@ -187,9 +187,10 @@ class RiskManager:
                           stop_price=0.0, take_profit=0.0, risk_amount=qty * stop_dist,
                           size_mult=eff_mult)
 
-    def payoff_ratio(self) -> float:
-        """Assumed winner:loser ratio for Kelly, given the let-winners-run exit."""
-        return self.cfg.expected_rr
+    def payoff_ratio(self, style: str = "trend") -> float:
+        """Assumed winner:loser ratio for Kelly. Trends run (asymmetric); scalps
+        are ~1:1 to a passive target."""
+        return self.cfg.scalp_expected_rr if style == "scalp" else self.cfg.expected_rr
 
     def time_stop_hit(self, bars_held: int) -> bool:
         return bars_held >= self.cfg.time_stop_bars

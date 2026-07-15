@@ -123,18 +123,24 @@ def run_backtest(
     regime_counts: dict[str, int] = {}
     markers: list[dict] = []
 
-    def open_at(i: int, side: str, px: float, atr: float, regime: str, size_mult: float,
-                reason: str, fee_rate: float) -> bool:
+    maker_adv = risk_cfg.maker_adverse_bps / 10_000.0
+
+    def open_at(i: int, side: str, px: float, atr: float, regime: str, style: str,
+                size_mult: float, reason: str, maker: bool) -> bool:
         nonlocal planned_risk, bars_held
-        br = exits.initial_bracket(px, side, atr, ff.row(i), regime)
+        d = 1 if side == LONG else -1
+        # honest adverse selection: a resting maker fill is slightly worse than
+        # its limit; a taker fill crosses the spread + slippage.
+        eff = px * (1 + d * maker_adv) if maker else px * (1 + d * slip)
+        br = exits.initial_bracket(eff, side, atr, ff.row(i), regime, style)
         if br is None:
             return False
-        sized = risk.size_entry(pf.equity({symbol: px}), px, br.init_risk, side, spec, size_mult)
+        sized = risk.size_entry(pf.equity({symbol: eff}), eff, br.init_risk, side, spec, size_mult)
         if sized is None:
             return False
-        fee = sized.qty * px * fee_rate
-        pos = Position(symbol=symbol, side=side, qty=sized.qty, entry_price=px,
-                       opened_ts=int(ts[i]), leverage=sized.leverage,
+        fee = sized.qty * eff * (maker_fee if maker else taker_fee)
+        pos = Position(symbol=symbol, side=side, qty=sized.qty, entry_price=eff,
+                       opened_ts=int(ts[i]), leverage=sized.leverage, style=style,
                        stop_price=br.stop, take_profit=br.take_profit,
                        entry_fee=fee, entry_reason=reason, entry_bar_ts=int(ts[i]))
         exits.attach(pos, atr, br.init_risk)
@@ -143,16 +149,19 @@ def run_backtest(
         bars_held = 0
         if collect_series:
             markers.append({"ts": int(ts[i]), "kind": "entry", "side": side,
-                            "price": round(px, 8), "reason": reason})
+                            "price": round(eff, 8), "reason": reason})
         return True
 
-    def close_at(i: int, px: float, reason: str) -> None:
+    def close_at(i: int, px: float, reason: str, maker: bool = False) -> None:
         nonlocal bars_held
         pos = pf.positions.get(symbol)
         if pos is None:
             return
-        px = px * (1 - slip) if pos.side == LONG else px * (1 + slip)   # exits are taker
-        fee = pos.qty * px * taker_fee
+        if maker:                    # passive limit target: fills at the price, maker fee
+            fee = pos.qty * px * maker_fee
+        else:                        # stop / signal exit: cross the spread, taker fee
+            px = px * (1 - slip) if pos.side == LONG else px * (1 + slip)
+            fee = pos.qty * px * taker_fee
         tr = pf.close_position(symbol, px, int(ts[i]), fee, reason, planned_risk)
         if tr:
             risk.on_trade_closed(tr, pf.equity({symbol: px}))
@@ -170,22 +179,22 @@ def run_backtest(
         if pending is not None and pos is None:
             side = pending["side"]
             if pending["mode"] == "taker":
-                px = o[i] * (1 + slip) if side == LONG else o[i] * (1 - slip)
-                open_at(i, side, px, pending["atr"], pending["regime"], pending["size_mult"],
-                        pending["reason"], taker_fee)
+                open_at(i, side, o[i], pending["atr"], pending["regime"], pending["style"],
+                        pending["size_mult"], pending["reason"], maker=False)
                 pending = None
             else:  # maker: rest post-only, fill only if price trades to the limit
                 lim = pending["limit"]
                 hit = (l[i] <= lim) if side == LONG else (h[i] >= lim)
                 if hit:
-                    open_at(i, side, lim, pending["atr"], pending["regime"], pending["size_mult"],
-                            pending["reason"], maker_fee)
+                    open_at(i, side, lim, pending["atr"], pending["regime"], pending["style"],
+                            pending["size_mult"], pending["reason"], maker=True)
                     pending = None
                 elif i >= pending["expires_bar"]:
                     pending = None  # unfilled -> cancelled, no trade
             pos = pf.positions.get(symbol)
 
-        # 2) intrabar protective stop (and fixed TP if configured)
+        # 2) intrabar exits: protective stop is taker; a scalp's passive target
+        #    is a resting maker limit that captures spread + the maker rebate.
         if pos is not None:
             d = pos.direction()
             stop, tp = pos.stop_price, pos.take_profit
@@ -193,7 +202,7 @@ def run_backtest(
                 gap = (o[i] < stop) if d > 0 else (o[i] > stop)
                 close_at(i, o[i] if gap else stop, "stop" if not pos.breakeven_moved else "trail stop")
             elif tp > 0 and ((h[i] >= tp) if d > 0 else (l[i] <= tp)):
-                close_at(i, tp, "target")
+                close_at(i, tp, "target", maker=True)
             pos = pf.positions.get(symbol)
 
         # 3) run the full brain on this close (grades pending calls too)
@@ -213,11 +222,12 @@ def run_backtest(
             equity = pf.equity({symbol: c[i]})
             ok, _ = risk.can_enter(equity, len(pf.positions), ASSUMED_SPREAD_BPS)
             if ok and _entry_signal_ok(brain, strat, edge, p_win, row, ev, fees_rt, slippage_bps):
-                kelly = brain.kelly_size_mult(p_win, risk.payoff_ratio()) if strat.use_kelly else 1.0
+                style = "scalp" if regime == "RANGE" else "trend"
+                kelly = brain.kelly_size_mult(p_win, risk.payoff_ratio(style)) if strat.use_kelly else 1.0
                 size_mult = kelly * risk.health.scalar
                 side = LONG if edge > 0 else SHORT
-                pend = {"side": side, "atr": row.get("atr", 0.0), "regime": regime,
-                        "size_mult": size_mult, "reason": f"edge {edge:+.2f} P{p_win:.0%} {regime}"}
+                pend = {"side": side, "atr": row.get("atr", 0.0), "regime": regime, "style": style,
+                        "size_mult": size_mult, "reason": f"{style} edge {edge:+.2f} P{p_win:.0%} {regime}"}
                 if is_maker:
                     pend["mode"] = "maker"
                     pend["limit"] = c[i] * (1 - maker_off) if side == LONG else c[i] * (1 + maker_off)
@@ -335,6 +345,33 @@ def _fitness(stats: dict) -> float:
     return pf_capped * math.sqrt(t) * (1.0 - clamp(dd * 2.5, 0.0, 0.9)) * (0.5 + wr)
 
 
+def robust_fitness(candles, symbol, interval, strat, risk_cfg, spec,
+                   taker_fee=0.0005, slippage_bps=1.5, folds: int = 3) -> float:
+    """Score a parameter set across several disjoint time windows and reward
+    consistency: median fold fitness minus a penalty for how much it varies.
+    A config that only prints in one window (overfit) scores poorly here — this
+    is the main defense against shipping fragile params that die live."""
+    n = len(candles)
+    if n < folds * 1500:
+        st = run_backtest(candles, symbol, interval, strat, risk_cfg, spec,
+                          taker_fee=taker_fee, slippage_bps=slippage_bps, collect_series=False)
+        return _fitness(st.get("stats", {})) if "error" not in st else -1.0
+    size = n // folds
+    fits = []
+    for k in range(folds):
+        lo = k * size
+        hi = n if k == folds - 1 else (k + 1) * size
+        st = run_backtest(candles[lo:hi], symbol, interval, strat, risk_cfg, spec,
+                          taker_fee=taker_fee, slippage_bps=slippage_bps, collect_series=False)
+        fits.append(_fitness(st.get("stats", {})) if "error" not in st else -1.0)
+    import statistics
+    med = statistics.median(fits)
+    sd = statistics.pstdev(fits) if len(fits) > 1 else 0.0
+    worst = min(fits)
+    # median, penalized for instability and for any window that fell apart
+    return med - 0.4 * sd + 0.15 * worst
+
+
 def run_optimizer(
     candles: list[Candle],
     symbol: str,
@@ -365,10 +402,9 @@ def run_optimizer(
             v = rng.uniform(lo, hi)
             p[k] = _coerce(k, v)
         s, r = _apply_params(strat, risk_cfg, p)
-        res_t = run_backtest(train, symbol, interval, s, r, spec,
-                             taker_fee=taker_fee, slippage_bps=slippage_bps, collect_series=False)
-        fit_t = _fitness(res_t.get("stats", {})) if "error" not in res_t else -1.0
-        trials.append({"params": p, "train": res_t.get("stats", {}), "train_fitness": round(fit_t, 3)})
+        # rank on robustness across sub-windows of the train segment
+        fit_t = robust_fitness(train, symbol, interval, s, r, spec, taker_fee, slippage_bps, folds=2)
+        trials.append({"params": p, "train_fitness": round(fit_t, 3)})
         if progress_cb:
             progress_cb(0.75 * (t + 1) / n_trials)
 
@@ -378,9 +414,9 @@ def run_optimizer(
         s, r = _apply_params(strat, risk_cfg, tr["params"])
         res_v = run_backtest(valid, symbol, interval, s, r, spec,
                              taker_fee=taker_fee, slippage_bps=slippage_bps, collect_series=False)
-        fit_v = _fitness(res_v.get("stats", {})) if "error" not in res_v else -1.0
         tr["valid"] = res_v.get("stats", {})
-        tr["valid_fitness"] = round(fit_v, 3)
+        tr["valid_fitness"] = round(robust_fitness(valid, symbol, interval, s, r, spec,
+                                                   taker_fee, slippage_bps, folds=2), 3)
         if progress_cb:
             progress_cb(0.75 + 0.25 * (j + 1) / len(finalists))
 

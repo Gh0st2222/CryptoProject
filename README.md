@@ -116,10 +116,24 @@ payoff shape that survives fees:
 The auto-tuner is an **always-on research desk**. Every couple of minutes it
 evolves the current champion parameters (gaussian perturbations) plus fresh
 random explorers across the **entire** strategy + risk/exit space (~22
-parameters), scores them on a train split, validates the survivors on a held-out
-slice, and **hot-swaps a challenger into the live brains only when it clearly
-beats the running champion** — otherwise it changes nothing. Promotions persist
-and show up on the Auto-Tuner tab with their fitness jump and the params adopted.
+parameters), and **hot-swaps a challenger into the live brains only when it
+clearly beats the running champion** — otherwise it changes nothing. Promotions
+persist and show up on the Auto-Tuner tab with their fitness jump and the params
+adopted.
+
+Candidates are scored with **robust multi-window fitness**: every parameter set
+is run across several disjoint time windows and ranked on *median minus
+variance* (plus a worst-window penalty). A config that only prints in one lucky
+window scores poorly, so the tuner prefers parameters that hold up across
+different market conditions — the main defense against overfitting, which is the
+number-one reason retail bots that "backtest great" die in production.
+
+**Exit style is regime-conditional.** Trend setups ride the chandelier trail
+(let winners run). Range setups (opt-in, `trade_range`) are *scalped*: enter
+maker, exit at a **passive post-only limit target** that captures the spread and
+the maker rebate, with a tight stop and short time-stop. Range mean-reversion is
+a weak edge, so it ships **off** by default — but the maker-in/maker-out scalp
+machinery is there for markets where it works.
 
 It never touches the settings **you** own: symbols, feed, interval, starting
 balance, max open positions, the leverage band, and the daily-loss limit. On the

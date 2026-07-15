@@ -225,12 +225,13 @@ class TraderEngine:
         ctx.set_stage("VALIDATE")
 
         side = LONG if edge > 0 else SHORT
+        style = "scalp" if ev["regime"] == "RANGE" else "trend"
         price = st.mark_price() or row["close"]
-        bracket = self.exits.initial_bracket(price, side, row.get("atr", 0.0), row, ev["regime"])
+        bracket = self.exits.initial_bracket(price, side, row.get("atr", 0.0), row, ev["regime"], style)
         if bracket is None:
             ctx.last_entry_block = "no volatility for bracket"
             return
-        kelly = ctx.brain.kelly_size_mult(p_win, self.risk.payoff_ratio()) if self.cfg.strategy.use_kelly else 1.0
+        kelly = ctx.brain.kelly_size_mult(p_win, self.risk.payoff_ratio(style)) if self.cfg.strategy.use_kelly else 1.0
         size_mult = kelly * self.risk.health.scalar
         ctx.set_stage("SIZE")
         sized = self.risk.size_entry(equity, price, bracket.init_risk, side, spec, size_mult)
@@ -246,6 +247,7 @@ class TraderEngine:
         if res.ok:
             pos = self.portfolio.positions.get(symbol)
             if pos is not None:
+                pos.style = style
                 self.exits.attach(pos, row.get("atr", 0.0), bracket.init_risk)
             self._push_tape(symbol, "OPEN", side, res.filled_price,
                             {"p_win": round(p_win, 3), "edge": round(edge, 3)})
