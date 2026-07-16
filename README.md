@@ -165,11 +165,29 @@ contribution breakdown, and the realized average cross-symbol correlation. Same
 engine and accounting as the single-symbol backtest — it's literally several
 per-symbol simulators sharing one `Portfolio` and `RiskManager`.
 
+## Continuous evaluation & the timeframe ladder
+
+The brain does **not** wait for a candle to close to look for a trade. Between
+closes it re-scores several times a second on the **live-forming bar** plus the
+current order book and trade flow, so an entry can fire the moment the setup
+appears — no more sitting idle for minutes while opportunities pass. Scoring is
+split from learning: the online weights/calibrator still grade exactly once per
+**closed** bar (so they can't be corrupted by intra-bar re-scoring), but the
+*decision* runs continuously.
+
+It also reads a real **1m / 5m / 15m / 1h timeframe ladder** — each rung with its
+own EMA stack, RSI, ADX and slope — and fuses them into a genuine cross-timeframe
+alignment the entry gate and trend desk use. Because coarser rungs are exact
+aggregations of the base bar, a 1m feed yields the whole ladder with **no extra
+data pulled** (well inside rate limits). The terminal shows the ladder live so you
+see exactly what the brain sees on each timeframe.
+
 ## Data intake ("not a bit escapes it")
 
-Live mode ingests klines (multi-timeframe context built by resampling), the full
-trade tape (CVD / aggressor flow), L20 order book (imbalance), best bid/ask, and
-polls **funding rate, mark price and open interest** for the carry desk. Offline
+Live mode ingests klines (a true 1m/5m/15m/1h indicator ladder), the full trade
+tape (CVD / aggressor flow), L20 order book (imbalance), best bid/ask, and polls
+**funding rate, mark price and open interest** for the carry desk — all streaming
+continuously into per-symbol state that the brain re-reads on every tick. Offline
 the carry alphas stay dormant rather than firing on absent data.
 
 ## The terminal

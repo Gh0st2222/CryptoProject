@@ -79,6 +79,23 @@ class CandleSeries:
             "volume": self._view(self._v, n),
         }
 
+    def arrays_live(self, n: int | None = None) -> dict[str, np.ndarray]:
+        """Closed bars PLUS the in-progress bar appended as the last row — the
+        live-forming view the reactive scorer reads so indicators reflect the
+        current, still-moving price instead of waiting for the bar to close."""
+        a = self.arrays(n)
+        p = self.partial
+        if p is not None and (len(a["ts"]) == 0 or p.ts > a["ts"][-1]):
+            a = {
+                "ts": np.append(a["ts"], np.int64(p.ts)),
+                "open": np.append(a["open"], p.open),
+                "high": np.append(a["high"], p.high),
+                "low": np.append(a["low"], p.low),
+                "close": np.append(a["close"], p.close),
+                "volume": np.append(a["volume"], p.volume),
+            }
+        return a
+
     def tail(self, n: int) -> list[Candle]:
         a = self.arrays(n)
         return [

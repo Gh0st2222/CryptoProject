@@ -90,7 +90,7 @@ class _SymSim:
         self.o, self.h, self.l = arrays["open"], arrays["high"], arrays["low"]
         self.c, self.ts = arrays["close"], arrays["ts"]
         self.n = len(self.c)
-        self.ff = ff if ff is not None else FeatureFrame(arrays)   # reusable across candidates
+        self.ff = ff if ff is not None else FeatureFrame(arrays, interval=interval)   # reusable across candidates
         bph = 3_600_000 / interval_ms(interval)
         self.brain = TradingBrain(
             eta=strat.hedge_eta, weight_floor=strat.weight_floor, horizon_bars=strat.horizon_bars,

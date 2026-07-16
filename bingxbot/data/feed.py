@@ -26,6 +26,9 @@ from .candles import CandleSeries
 log = logging.getLogger("feed")
 
 FLOW_WINDOW_S = 30.0
+# seed enough base bars that the full 1m/5m/15m/1h ladder is populated from the
+# first tick (the 1h rung on a 1m base needs ~8h of history to be meaningful).
+MTF_SEED_MIN = 1200
 
 
 class MarketState:
@@ -183,7 +186,8 @@ class LiveFeed(BaseFeed):
 
     async def start(self) -> None:
         for s in self.symbols:
-            candles = await self.rest.klines(s, self.interval, limit=min(self.warmup_bars + 60, 1440))
+            seed_n = min(max(self.warmup_bars + 60, MTF_SEED_MIN), 1440)
+            candles = await self.rest.klines(s, self.interval, limit=seed_n)
             if candles:
                 candles = candles[:-1]  # last row is the still-open bar
             n = self.states[s].candles.seed(candles)
@@ -284,8 +288,9 @@ class SyntheticFeed(BaseFeed):
 
     async def start(self) -> None:
         from .history import synthetic_candles
+        seed_n = max(self.warmup_bars, MTF_SEED_MIN)
         for s in self.symbols:
-            candles = synthetic_candles(s, self.interval, self.warmup_bars,
+            candles = synthetic_candles(s, self.interval, seed_n,
                                         seed=self._rng.randint(0, 10**9),
                                         start_price=self._px[s])
             self.states[s].candles.seed(candles)

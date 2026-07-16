@@ -81,10 +81,16 @@ class TradingBrain:
         self.threshold = base_threshold
         self.graded = 0
         self.last: dict = {}       # last decision snapshot
+        self._sc: dict | None = None   # components of the most recent score()
 
     # ------------------------------------------------------------- evaluate
 
-    def evaluate(self, row: dict, micro: dict, ctx: dict | None = None) -> dict:
+    def score(self, row: dict, micro: dict, ctx: dict | None = None) -> dict:
+        """Pure decision pass: features -> alphas -> desks -> fused edge -> P(win).
+        No learning state is touched, so this can run **as often as we like**
+        between bar closes (on every tick / order-book update) to react to live
+        price, flow and the multi-timeframe context without corrupting the online
+        weights. Returns the decision snapshot (also stored on ``self.last``)."""
         ctx = ctx or {}
         regime, conf = detect_regime(row)
 
@@ -119,15 +125,9 @@ class TradingBrain:
         atr_pctile = row.get("atr_pctile", 0.5)
         p_win = self.calibrator.predict(edge, regime, atr_pctile)
 
-        self._grade(row)
-        self._pending.append(_Pending(
-            idx=self._idx, close=row.get("close", 0.0), atr=max(row.get("atr", 0.0), 1e-12),
-            atr_pctile=atr_pctile, regime=regime, alpha_scores=dict(alpha_scores),
-            desk_sig=dict(desk_sig), edge=edge,
-        ))
-        self._score_hist.append(abs(edge))
-        self._idx += 1
-        self._adapt_threshold()
+        # stash exactly what observe() needs to grade this bar later
+        self._sc = {"alpha_scores": alpha_scores, "desk_sig": desk_sig,
+                    "edge": edge, "atr_pctile": atr_pctile, "regime": regime}
 
         expected_move = self.beta * abs(edge) * row.get("atr_pct", 0.0) * math.sqrt(self.horizon)
         self.last = {
@@ -135,7 +135,32 @@ class TradingBrain:
             "threshold": self.threshold, "beta": self.beta,
             "alpha_scores": alpha_scores, "desk_sig": desk_sig, "desk_conf": desk_conf,
             "alloc": alloc, "expected_move": expected_move,
+            "mtf_align": row.get("mtf_align", 0.0), "mtf_bias": row.get("mtf_bias", 0.0),
         }
+        return self.last
+
+    def observe(self, row: dict) -> None:
+        """Learning step for a **closed** bar: grade matured predictions, record
+        this bar's prediction for future grading, advance the clock and adapt the
+        threshold. Call exactly once per closed bar — never on a reactive score."""
+        sc = self._sc
+        if sc is None:
+            return
+        self._grade(row)
+        self._pending.append(_Pending(
+            idx=self._idx, close=row.get("close", 0.0), atr=max(row.get("atr", 0.0), 1e-12),
+            atr_pctile=sc["atr_pctile"], regime=sc["regime"], alpha_scores=dict(sc["alpha_scores"]),
+            desk_sig=dict(sc["desk_sig"]), edge=sc["edge"],
+        ))
+        self._score_hist.append(abs(sc["edge"]))
+        self._idx += 1
+        self._adapt_threshold()
+
+    def evaluate(self, row: dict, micro: dict, ctx: dict | None = None) -> dict:
+        """Score **and** learn from one closed bar (backtest + the live bar-close
+        path). Identical behaviour to before the score/observe split."""
+        self.score(row, micro, ctx)
+        self.observe(row)
         return self.last
 
     # ------------------------------------------------------------- grading

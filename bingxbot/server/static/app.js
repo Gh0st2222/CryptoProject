@@ -110,6 +110,22 @@ function renderPipeline(){
     return `<div class="pstage ${cls}"><div class="n">${String(i+1).padStart(2,"0")}</div><div class="l">${s}</div></div>`;
   }).join("");
 }
+function renderMTF(es){
+  const strip=$("mtf-strip"); if(!strip) return;
+  const mtf=es?.mtf||{};
+  const order=["1m","5m","15m","1h"].filter(tf=>mtf[tf]);
+  if(!order.length){ strip.innerHTML=`<span class="mtf-empty">warming up…</span>`; return; }
+  strip.innerHTML=order.map(tf=>{
+    const m=mtf[tf], d=m.dir||0;
+    const cls=d>0.15?"up":d<-0.15?"dn":"flat";
+    const arrow=d>0.15?"▲":d<-0.15?"▼":"▬";
+    const w=Math.round(Math.abs(clamp(d,-1,1))*100);
+    return `<div class="mtf-cell ${cls}"><div class="tf">${tf}</div>
+      <div class="dir">${arrow}</div>
+      <div class="tfbar"><div class="tffill" style="width:${w}%"></div></div>
+      <div class="tfrsi">RSI ${Math.round(m.rsi)}</div></div>`;
+  }).join("");
+}
 function renderEdgeGauge(b, es){
   // price + edge/p(win) gauges + entry gate — the elements that must feel live,
   // so both the full render and the fast 'hot' channel call this.
@@ -144,6 +160,7 @@ function renderBrain(){
   rb.className=`badge ${rm.cls}`; rb.innerHTML=`<span class="g">${rm.g}</span><span>${rm.label}</span>`;
   $("b-conf").textContent=`conf ${fmt.pct(b.regime_conf,0)}`;
   $("b-vol").textContent=`vol ${(micro.spread_bps).toFixed(1)}bp`;
+  renderMTF(es);
 
   // desks
   renderDesks(b.desks);
@@ -287,6 +304,7 @@ function applyHot(h){
   for(const [sym,hs] of Object.entries(he.symbols||{})){
     const s=S.engine.symbols?.[sym]; if(!s) continue;
     s.price=hs.price; s.stage=hs.stage; s.eval_ms=hs.eval_ms; s.entry_block=hs.entry_block; s.bars_held=hs.bars_held;
+    if(hs.mtf) s.mtf=hs.mtf;
     if(s.brain){ s.brain.edge=hs.edge; s.brain.p_win=hs.p_win; s.brain.regime=hs.regime; }
   }
   for(const [sym,hp] of Object.entries(he.positions||{})){
@@ -298,7 +316,7 @@ function applyHot(h){
 function renderHot(){
   if(!S?.engine) return;
   renderTop(); renderPipeline(); renderPositions(); renderTape();
-  const es=engSym(); if(es&&es.brain) renderEdgeGauge(es.brain, es);
+  const es=engSym(); if(es&&es.brain){ renderEdgeGauge(es.brain, es); renderMTF(es); }
 }
 
 /* ---------------------------------------------------------------- ws */
