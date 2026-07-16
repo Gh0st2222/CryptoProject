@@ -17,9 +17,11 @@ from . import indicators as ta
 
 WARMUP_MIN = 260  # rows before this contain NaNs from the widest rolling window
 
-# Higher-timeframe factors relative to the base bar (e.g. base 5m -> 20m, 60m).
-MTF_MED = 4
-MTF_HI = 12
+# The multi-timeframe ladder (label, minutes). Rungs finer than the base bar are
+# skipped (you can't see below your data); the rung equal to the base is the base
+# series itself; coarser rungs are exact aggregations of the base bars — so a 1m
+# base gives a true 1m / 5m / 15m / 1h view with no extra data pulled.
+LADDER = (("1m", 1), ("5m", 5), ("15m", 15), ("1h", 60))
 
 
 def _broadcast(htf: np.ndarray, factor: int, n: int) -> np.ndarray:
@@ -29,10 +31,35 @@ def _broadcast(htf: np.ndarray, factor: int, n: int) -> np.ndarray:
     return htf[idx]
 
 
-class FeatureFrame:
-    __slots__ = ("n", "f")
+def _base_minutes(interval: str | None, ts: np.ndarray) -> int:
+    if interval:
+        from ..util import interval_ms
+        return max(1, int(round(interval_ms(interval) / 60_000)))
+    if len(ts) >= 3:
+        d = int(np.median(np.diff(ts[-50:] if len(ts) > 50 else ts)))
+        return max(1, int(round(d / 60_000)))
+    return 1
 
-    def __init__(self, arrays: dict[str, np.ndarray]):
+
+def mtf_from_row(row: dict, ladder) -> dict:
+    """Compact per-timeframe view assembled from a feature row — what the brain
+    reads for cross-TF context and what the terminal shows for each rung."""
+    out = {}
+    for lab in ladder:
+        d = row.get(f"tf_{lab}_dir")
+        if d is None or not np.isfinite(d):
+            continue
+        out[lab] = {"dir": round(float(d), 3),
+                    "rsi": round(float(row.get(f"tf_{lab}_rsi", 50.0)), 1),
+                    "adx": round(float(row.get(f"tf_{lab}_adx", 0.0)), 1)}
+    return out
+
+
+class FeatureFrame:
+    __slots__ = ("n", "f", "ladder")
+
+    def __init__(self, arrays: dict[str, np.ndarray], interval: str | None = None):
+        self.ladder: list[str] = []
         o = arrays.get("open", arrays["close"])
         c, h, l, v = arrays["close"], arrays["high"], arrays["low"], arrays["volume"]
         self.n = len(c)
@@ -95,29 +122,55 @@ class FeatureFrame:
         f["vwap_z"] = ta.zscore(c - vwap_filled, 60)
         f["vol_z"] = ta.zscore(v, 96)
 
-        # --- multi-timeframe context (resample base -> medium & high TF)
-        self._add_mtf(f, o, h, l, c, v)
+        # --- true multi-timeframe ladder (1m/5m/15m/1h relative to the base)
+        self._add_mtf(f, o, h, l, c, v, _base_minutes(interval, arrays["ts"]))
 
         self.f = f
 
-    def _add_mtf(self, f, o, h, l, c, v) -> None:
+    def _add_mtf(self, f, o, h, l, c, v, base_min: int) -> None:
+        """Build a real timeframe ladder: for each standard rung at/above the base
+        bar, an EMA-stack + slope direction, RSI and ADX, broadcast back onto base
+        bars. Coarser rungs are exact aggregations of the base, so a 1m base yields
+        a genuine 1m/5m/15m/1h read — the brain's real cross-TF context."""
         n = self.n
-        for factor, tag in ((MTF_MED, "med"), (MTF_HI, "hi")):
-            if n < factor * 12:
-                f[f"htf_{tag}_slope"] = np.zeros(n)
-                f[f"htf_{tag}_dir"] = np.zeros(n)
-                continue
-            _o, _h, _l, _c, _v = ta.resample_ohlc(f["ts"], o, h, l, c, v, factor)
-            he = ta.ema(_c, 21)
-            hslope = np.gradient(he) / np.maximum(_c, 1e-12)
-            hrsi = ta.rsi(_c, 14)
-            f[f"htf_{tag}_slope"] = _broadcast(np.nan_to_num(hslope), factor, n)
-            f[f"htf_{tag}_dir"] = _broadcast(np.nan_to_num(np.tanh(hslope * 4000)), factor, n)
-            f[f"htf_{tag}_rsi"] = _broadcast(np.nan_to_num(hrsi, nan=50.0), factor, n)
-        # alignment across base + medium + high TF, in [-1, 1]
-        base_dir = np.tanh(np.nan_to_num(f["linreg_slope"]) * 4000)
-        f["mtf_align"] = (base_dir + f.get("htf_med_dir", np.zeros(n))
-                          + f.get("htf_hi_dir", np.zeros(n))) / 3.0
+        base_dir = np.clip(np.tanh(np.nan_to_num(f["linreg_slope"]) * 4000), -1, 1)
+        dirs = [base_dir]          # base counted once for alignment
+        higher: list[np.ndarray] = []
+        present: list[str] = []
+        for label, mins in LADDER:
+            if mins < base_min:
+                continue           # can't see finer than the base data
+            if mins == base_min:
+                di = base_dir
+                ri = np.nan_to_num(f["rsi_14"], nan=50.0)
+                ai = np.nan_to_num(f["adx"])
+                sl = np.nan_to_num(f["ema21_slope"])
+            else:
+                factor = max(2, int(round(mins / base_min)))
+                if n < factor * 8:
+                    continue
+                _o, _h, _l, _c, _v = ta.resample_ohlc(f["ts"], o, h, l, c, v, factor)
+                he21, he55 = ta.ema(_c, 21), ta.ema(_c, 55)
+                hslope = np.gradient(he21) / np.maximum(_c, 1e-12)
+                stack = np.sign(_c - he21) + np.sign(he21 - he55)   # price/ema alignment
+                hdir = 0.6 * np.tanh(hslope * 4000) + 0.4 * np.clip(stack / 2.0, -1, 1)
+                di = np.clip(_broadcast(np.nan_to_num(hdir), factor, n), -1, 1)
+                ri = _broadcast(np.nan_to_num(ta.rsi(_c, 14), nan=50.0), factor, n)
+                ai = _broadcast(np.nan_to_num(ta.adx(_h, _l, _c, 14)), factor, n)
+                sl = _broadcast(np.nan_to_num(hslope), factor, n)
+            f[f"tf_{label}_dir"], f[f"tf_{label}_rsi"] = di, ri
+            f[f"tf_{label}_adx"], f[f"tf_{label}_slope"] = ai, sl
+            present.append(label)
+            if mins > base_min:
+                dirs.append(di)
+                higher.append(di)
+        self.ladder = present
+        f["mtf_align"] = np.clip(np.mean(np.vstack(dirs), axis=0), -1, 1) if len(dirs) > 1 else base_dir
+        # consensus of the rungs strictly above the base — the trend backdrop
+        f["mtf_bias"] = np.clip(np.mean(np.vstack(higher), axis=0), -1, 1) if higher else np.zeros(n)
+        # legacy aliases so existing MTF alphas read the real ladder unchanged
+        f["htf_med_dir"] = higher[0] if higher else np.zeros(n)
+        f["htf_hi_dir"] = higher[-1] if higher else np.zeros(n)
 
     def row(self, i: int) -> dict[str, float]:
         if i < 0:

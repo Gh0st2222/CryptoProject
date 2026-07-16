@@ -94,6 +94,7 @@ class RiskConfig:
     scalp_expected_rr: float = 1.1      # ~1:1 target:stop for Kelly on scalps
     maker_adverse_bps: float = 0.4      # honest adverse-selection penalty on maker fills
     max_open_positions: int = 2
+    correlation_haircut: float = 0.65        # shrink a same-direction add across symbols
     max_position_notional_pct: float = 0.35  # of equity x leverage, per position
     max_daily_loss_pct: float = 0.05         # kill switch: flatten + halt for the day
     max_consecutive_losses: int = 8          # cooldown trigger

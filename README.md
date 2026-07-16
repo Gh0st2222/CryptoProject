@@ -140,20 +140,54 @@ balance, max open positions, the leverage band, and the daily-loss limit. On the
 Settings tab those are the only editable fields; everything else is displayed
 read-only as the live values the tuner has chosen.
 
-## Self-tuning (don't touch settings)
+**Champion vault (auto-save / auto-prune).** Every promotion is written to a
+persistent store (`data_cache/champions.json`), ranked by validation fitness, and
+**pruned to the best 12** — the worst/old sets are deleted automatically. The
+Auto-Tuner tab shows the vault, and any champion can be re-applied to the live
+brains with one click. The tuner also **hunts faster right after a promotion**
+(tight cadence while it's clearly improving, relaxed cadence when stable).
 
-The **background auto-tuner** is the quant-research desk. On a timer it re-runs
-the walk-forward search on recent data and **hot-swaps** new parameters into the
-live brains *only* if they beat what's currently running on the held-out
-validation slice. If nothing clears the bar, it changes nothing. Everything it
-does is reported on the Auto-Tuner tab. You can still drive the same search by
-hand on the Optimizer tab and apply a winner with one click.
+**It runs on other cores.** The heavy scoring — the continuous tuner and every
+Backtest / Optimizer / Portfolio job — runs in a **process pool** (spawn workers,
+cross-platform), so it never holds the GIL and never stalls the event loop. The
+UI stays responsive even while the research desk is grinding through candidates.
+
+## Multi-symbol portfolio backtest (one shared account)
+
+The **Portfolio** tab backtests several symbols on a **single shared account** —
+one equity pool, one position cap, one daily-loss kill switch, one health
+governor. Symbols are aligned on their common bars and stepped in lockstep, and a
+**correlation haircut** shrinks a same-direction add while another symbol is
+already carrying that bet (BTC/ETH move together — don't stack the same trade).
+Diversification smooths the equity curve, so the account can safely carry size no
+single symbol could. Results include the shared-account curve, a per-symbol
+contribution breakdown, and the realized average cross-symbol correlation. Same
+engine and accounting as the single-symbol backtest — it's literally several
+per-symbol simulators sharing one `Portfolio` and `RiskManager`.
+
+## Continuous evaluation & the timeframe ladder
+
+The brain does **not** wait for a candle to close to look for a trade. Between
+closes it re-scores several times a second on the **live-forming bar** plus the
+current order book and trade flow, so an entry can fire the moment the setup
+appears — no more sitting idle for minutes while opportunities pass. Scoring is
+split from learning: the online weights/calibrator still grade exactly once per
+**closed** bar (so they can't be corrupted by intra-bar re-scoring), but the
+*decision* runs continuously.
+
+It also reads a real **1m / 5m / 15m / 1h timeframe ladder** — each rung with its
+own EMA stack, RSI, ADX and slope — and fuses them into a genuine cross-timeframe
+alignment the entry gate and trend desk use. Because coarser rungs are exact
+aggregations of the base bar, a 1m feed yields the whole ladder with **no extra
+data pulled** (well inside rate limits). The terminal shows the ladder live so you
+see exactly what the brain sees on each timeframe.
 
 ## Data intake ("not a bit escapes it")
 
-Live mode ingests klines (multi-timeframe context built by resampling), the full
-trade tape (CVD / aggressor flow), L20 order book (imbalance), best bid/ask, and
-polls **funding rate, mark price and open interest** for the carry desk. Offline
+Live mode ingests klines (a true 1m/5m/15m/1h indicator ladder), the full trade
+tape (CVD / aggressor flow), L20 order book (imbalance), best bid/ask, and polls
+**funding rate, mark price and open interest** for the carry desk — all streaming
+continuously into per-symbol state that the brain re-reads on every tick. Offline
 the carry alphas stay dormant rather than firing on absent data.
 
 ## The terminal
@@ -162,8 +196,16 @@ A dense dark trading terminal: live tape ticker, an execution-cycle pipeline
 (Scan→Detect→Validate→Size→Fill→Manage→Settle), fused-edge and calibrated-P(win)
 gauges, the live desk-allocation leaderboard, the 18-alpha floor with
 firing/dormant state and hit rates, regime + health meters, a candlestick chart
-with trade markers, the session equity curve, and a Backtest tab with the
-desk-allocation-over-time chart plus a 5,000-path Monte-Carlo robustness panel.
+with trade markers, the session equity curve, a Backtest tab with the
+desk-allocation-over-time chart plus a 5,000-path Monte-Carlo robustness panel, a
+Portfolio tab (multi-symbol shared-account backtest), and an Auto-Tuner tab with
+the promotion log and the champion vault.
+
+The dashboard pushes over a **split WebSocket**: a light **hot** channel streams
+prices, open-position uPnL and the execution stage several times a second (so the
+numbers feel live between bar closes), while the heavier full snapshot — brain
+internals, equity curve, trade history — rides a slower channel. The two never
+contend for the same cycle, which is what killed the earlier lag/latency spikes.
 
 ## The path to live
 
@@ -230,9 +272,9 @@ bingxbot/
 │   ├── portfolio.py        accounting + stats
 │   ├── brokers.py          PaperBroker / LiveBroker (one interface)
 │   ├── trader.py           realtime decision loop + execution pipeline
-│   ├── backtest.py         event-driven simulator + walk-forward optimizer
-│   └── autotuner.py        background self-tuning research desk
-└── server/                 FastAPI + WebSocket + the terminal (vendored charts)
+│   ├── backtest.py         event-driven per-symbol simulator + portfolio (shared account) + optimizer
+│   └── autotuner.py        background self-tuning research desk (runs in the process pool)
+└── server/                 FastAPI + split WebSocket + process pool + the terminal (vendored charts)
 ```
 
 ## Configuration

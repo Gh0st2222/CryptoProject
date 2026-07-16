@@ -76,6 +76,9 @@
             <span class="badge" id="b-gate">gate —</span>
           </div>
 
+          <div class="subt">Timeframe ladder — trend the brain reads on every tick</div>
+          <div class="mtf-strip" id="mtf-strip"><span class="mtf-empty">warming up…</span></div>
+
           <div class="subt">Desk allocation — the CIO backing live winners</div>
           <div class="desks" id="desks"></div>
 
@@ -107,6 +110,7 @@
       <button class="tab active" data-tab="positions">Positions</button>
       <button class="tab" data-tab="trades">Trades</button>
       <button class="tab" data-tab="backtest">Backtest</button>
+      <button class="tab" data-tab="portfolio">Portfolio</button>
       <button class="tab" data-tab="optimizer">Optimizer</button>
       <button class="tab" data-tab="autotuner">Auto-Tuner</button>
       <button class="tab" data-tab="settings">Settings</button>
@@ -158,6 +162,29 @@
       </div>
     </div>
 
+    <div class="tab-page" data-page="portfolio">
+      <p class="foot-note" style="margin-top:0">Backtest several symbols on <b>one shared account</b> — one equity pool, one position cap, one daily-loss kill switch, and a correlation haircut that shrinks stacking the same directional bet. Diversification smooths the curve, so the account can safely carry size no single symbol could. Symbols are aligned on their common bars.</p>
+      <div class="form-row">
+        <div class="ff" style="flex:2"><label>Symbols (comma separated)</label><input class="field" id="pf-symbols" value="BTC-USDT, ETH-USDT, SOL-USDT"></div>
+        <div class="ff"><label>Interval</label><select class="btn" id="pf-interval">
+          <option>1m</option><option>3m</option><option selected>5m</option><option>15m</option><option>30m</option><option>1h</option></select></div>
+        <div class="ff"><label>Days back</label><input class="field" id="pf-days" type="number" value="45" min="1" max="365"></div>
+        <label class="check"><input type="checkbox" id="pf-synth"> synthetic (offline)</label>
+        <button class="btn primary" id="pf-run">Run portfolio</button>
+      </div>
+      <div class="progress" id="pf-progress"><div class="bar"></div></div>
+      <div id="pf-results" style="display:none">
+        <div class="cards" id="pf-cards"></div>
+        <div><div class="subt">Shared-account equity curve</div><div id="chart-pf-equity"></div></div>
+        <div class="mc-row" style="margin-top:12px">
+          <div><div class="subt">Per-symbol contribution</div>
+            <table class="tbl"><thead><tr><th>Symbol</th><th class="r">Trades</th><th class="r">Win rate</th><th class="r">PnL</th></tr></thead>
+            <tbody id="pf-symbols-body"></tbody></table></div>
+          <div><div class="subt">Diversification</div><div class="mc-stats" id="pf-div"></div></div>
+        </div>
+      </div>
+    </div>
+
     <div class="tab-page" data-page="optimizer">
       <p class="foot-note" style="margin-top:0">Random search over strategy + exit params, trained on the first 70% and ranked on the held-out 30% so overfit sets fall away. This is what the Auto-Tuner runs automatically in the background — here you can drive it by hand and apply a winner.</p>
       <div class="form-row">
@@ -184,6 +211,11 @@
       <div style="overflow:auto"><table class="tbl"><thead><tr>
         <th>When</th><th class="r">Fitness →</th><th class="r">WR</th><th class="r">PF</th><th>Key params adopted</th>
       </tr></thead><tbody id="at-history"><tr><td colspan="5" class="empty">No promotions yet — it only swaps genuine improvements</td></tr></tbody></table></div>
+
+      <div class="subt" style="margin-top:16px">Champion vault — top parameter sets, auto-saved &amp; pruned <span style="color:var(--muted)">(keeps the best 12, deletes the rest)</span></div>
+      <div style="overflow:auto"><table class="tbl"><thead><tr>
+        <th>Saved</th><th class="r">Fitness</th><th class="r">WR</th><th class="r">PF</th><th>Key params</th><th></th>
+      </tr></thead><tbody id="champ-body"><tr><td colspan="6" class="empty">No champions saved yet — the vault fills as the tuner promotes winners</td></tr></tbody></table></div>
     </div>
 
     <div class="tab-page" data-page="settings">

@@ -1,19 +1,18 @@
 """Continuous evolutionary auto-tuner — the firm's always-on research desk.
 
-It never stops. Every cycle it:
+Every cycle it builds candidates = the current champion + gaussian perturbations
+(exploit) + fresh random draws (explore) over the FULL tunable space, scores
+them with robust multi-window fitness, validates the survivors on a held-out
+split, and promotes a challenger into the live config ONLY if it clearly beats
+the running champion — otherwise it changes nothing.
 
-  1. pulls a recent window of the primary symbol,
-  2. builds candidates = the current champion + gaussian perturbations of it
-     (exploit) + fresh random draws (explore) over the FULL tunable space,
-  3. scores every candidate on a train split, validates the survivors on a
-     held-out split (so overfit sets fall away),
-  4. promotes a challenger into the live config ONLY if it beats the running
-     champion on validation by a clear margin — otherwise it changes nothing.
+The heavy scoring runs in a **separate process** (via the orchestrator's process
+pool) so it never holds the GIL and never stalls the event loop / UI. Promotions
+persist to config.json, hot-swap into the live brains, and are logged to the
+champions store (best kept, worst/old pruned).
 
-It tunes the entire strategy + risk/exit parameter space but never touches the
-settings the user owns (symbols, feed, interval, warmup, leverage band,
-daily-loss limit, max positions, starting balance). Promotions persist to
-config.json and hot-swap into the live brains without interrupting trading.
+It never touches user-owned settings (symbols, feed, interval, warmup, leverage
+band, daily-loss, max positions, starting balance).
 """
 from __future__ import annotations
 
@@ -25,19 +24,19 @@ import time
 from ..config import MODE_IDLE
 from ..exchange.models import ContractSpec
 from ..util import clamp
-from .backtest import (TUNABLES, _apply_params, _coerce, _fitness, apply_tunables_inplace,
-                       robust_fitness, run_backtest)
+from .backtest import (TUNABLES, _apply_params, _coerce, _fitness, robust_fitness, run_backtest)
 
 log = logging.getLogger("autotuner")
 
-CYCLE_GAP_S = 120          # constant light background cadence
 N_EVOLVE = 10              # perturbations of the champion per cycle
-N_RANDOM = 8               # fresh random explorers per cycle
-N_VALIDATE = 6             # top train candidates to validate
-IMPROVE_MARGIN = 1.08      # challenger must beat champion validation fitness x this
+N_RANDOM = 8              # fresh random explorers per cycle
+N_VALIDATE = 6            # top train candidates to validate
+IMPROVE_MARGIN = 1.08     # challenger must beat champion validation fitness x this
 MIN_ABS_FITNESS = 0.5
-LOOKBACK_DAYS = 60.0       # enough trades in the validation slice to be meaningful
-DATA_TTL_S = 1800          # refresh the tuning window this often
+LOOKBACK_DAYS = 60.0
+DATA_TTL_S = 1800
+GAP_FAST = 30             # cadence right after a promotion (keep searching)
+GAP_SLOW = 100            # cadence when stable
 
 
 def _current_params(cfg) -> dict:
@@ -66,6 +65,35 @@ def _perturb(champ: dict, rng: random.Random, scale: float = 0.22) -> dict:
     return p
 
 
+def run_tuner_cycle(candles, symbol, interval, spec, taker, slip, strat, risk, champ, seed) -> dict:
+    """One evolutionary cycle. Module-level and picklable so it runs in a worker
+    process. Returns the best challenger + the champion's own validation score."""
+    rng = random.Random(seed)
+    n = len(candles)
+    cut = int(n * 0.7)
+    train, valid = candles[:cut], candles[max(0, cut - 300):]
+    cands = [{"tag": "champion", "params": champ}]
+    cands += [{"tag": "evolve", "params": _perturb(champ, rng)} for _ in range(N_EVOLVE)]
+    cands += [{"tag": "random", "params": _random_params(rng)} for _ in range(N_RANDOM)]
+
+    for c in cands:
+        s, r = _apply_params(strat, risk, c["params"])
+        c["train"] = robust_fitness(train, symbol, interval, s, r, spec, taker, slip, folds=3)
+    cands.sort(key=lambda x: x["train"], reverse=True)
+    top = cands[:N_VALIDATE]
+    champ_c = next(c for c in cands if c["tag"] == "champion")
+    if champ_c not in top:
+        top.append(champ_c)
+    for c in top:
+        s, r = _apply_params(strat, risk, c["params"])
+        c["valid"] = robust_fitness(valid, symbol, interval, s, r, spec, taker, slip, folds=2)
+        c["valid_stats"] = run_backtest(valid, symbol, interval, s, r, spec, taker_fee=taker,
+                                        slippage_bps=slip, collect_series=False).get("stats", {})
+    top.sort(key=lambda x: x["valid"], reverse=True)
+    champ_valid = next((c["valid"] for c in top if c["tag"] == "champion"), 0.0)
+    return {"best": top[0], "champ_valid": champ_valid, "candidates": len(top)}
+
+
 class AutoTuner:
     def __init__(self, orch):
         self.orch = orch
@@ -74,7 +102,6 @@ class AutoTuner:
         self.rng = random.Random()
         self._candles: list = []
         self._data_ts = 0.0
-        # observable state
         self.cycles = 0
         self.improvements = 0
         self.next_run_ts = 0.0
@@ -98,16 +125,19 @@ class AutoTuner:
             self._task = None
 
     async def _loop(self) -> None:
-        await asyncio.sleep(45)  # let the engine warm up first
+        await asyncio.sleep(30)
+        gap = GAP_SLOW
         while self.running:
             cfg = self.orch.cfg
+            promoted = False
             if cfg.strategy.auto_tune and self.orch.mode != MODE_IDLE and self.orch.engine is not None:
                 try:
-                    await self._cycle()
+                    promoted = await self._cycle()
                 except Exception as e:  # noqa: BLE001
                     log.warning("auto-tune cycle failed: %s", e)
-            self.next_run_ts = time.time() + CYCLE_GAP_S
-            await asyncio.sleep(CYCLE_GAP_S)
+            gap = GAP_FAST if promoted else GAP_SLOW      # hammer when improving
+            self.next_run_ts = time.time() + gap
+            await asyncio.sleep(gap)
 
     async def _ensure_data(self):
         if self._candles and time.time() - self._data_ts < DATA_TTL_S:
@@ -119,17 +149,19 @@ class AutoTuner:
         self._data_ts = time.time()
         return self._candles
 
-    async def _cycle(self) -> None:
+    async def _cycle(self) -> bool:
         cfg = self.orch.cfg
         symbol, interval = cfg.symbols[0], cfg.strategy.interval
         candles = await self._ensure_data()
         if len(candles) < 2500:
-            return
+            return False
         spec = self.orch.specs.get(symbol, ContractSpec(symbol))
         champ = _current_params(cfg)
-        best, champ_valid, top = await asyncio.to_thread(
-            self._run_cycle_sync, candles, symbol, interval, spec,
-            spec.taker_fee, cfg.paper.slippage_bps, cfg.strategy, cfg.risk, champ)
+        # heavy scoring off the event loop, in a worker process (no GIL stall)
+        res = await self.orch.run_cpu(
+            run_tuner_cycle, candles, symbol, interval, spec, spec.taker_fee,
+            cfg.paper.slippage_bps, cfg.strategy, cfg.risk, champ, self.rng.randint(0, 2**31))
+        best, champ_valid = res["best"], res["champ_valid"]
 
         self.cycles += 1
         self.champion_fitness = round(champ_valid, 3)
@@ -138,7 +170,7 @@ class AutoTuner:
             self.orch.apply_params(best["params"])
             promoted = True
             self.improvements += 1
-            self.history.append({
+            entry = {
                 "ts": int(time.time() * 1000),
                 "from_fitness": round(champ_valid, 3),
                 "to_fitness": round(best["valid"], 3),
@@ -147,44 +179,21 @@ class AutoTuner:
                 "params": {k: best["params"][k] for k in ("base_threshold", "risk_per_trade",
                            "sl_atr_min", "trail_atr_max", "giveback_rr", "target_trades_per_hour")
                            if k in best["params"]},
-            })
+            }
+            self.history.append(entry)
             self.history = self.history[-25:]
+            self.orch.record_champion(best["params"], best["valid"], best["valid_stats"])
             log.info("auto-tune PROMOTED: valid fit %.2f -> %.2f", champ_valid, best["valid"])
         self.last_cycle = {
             "ts": int(time.time() * 1000), "symbol": symbol,
             "champion_fitness": round(champ_valid, 3),
             "best_fitness": round(best["valid"], 3),
             "best_tag": best["tag"], "promoted": promoted,
-            "candidates": len(top),
+            "candidates": res["candidates"],
         }
         if self.orch._notify:
             await self.orch._notify("autotune")
-
-    def _run_cycle_sync(self, candles, symbol, interval, spec, taker, slip, base_strat, base_risk, champ):
-        n = len(candles)
-        cut = int(n * 0.7)
-        train, valid = candles[:cut], candles[max(0, cut - 300):]
-        cands = [{"tag": "champion", "params": champ}]
-        cands += [{"tag": "evolve", "params": _perturb(champ, self.rng)} for _ in range(N_EVOLVE)]
-        cands += [{"tag": "random", "params": _random_params(self.rng)} for _ in range(N_RANDOM)]
-
-        for c in cands:
-            s, r = _apply_params(base_strat, base_risk, c["params"])
-            # rank on robustness across sub-windows, not a single fit
-            c["train"] = robust_fitness(train, symbol, interval, s, r, spec, taker, slip, folds=3)
-        cands.sort(key=lambda x: x["train"], reverse=True)
-        top = cands[:N_VALIDATE]
-        champ_c = next(c for c in cands if c["tag"] == "champion")
-        if champ_c not in top:
-            top.append(champ_c)
-        for c in top:
-            s, r = _apply_params(base_strat, base_risk, c["params"])
-            c["valid"] = robust_fitness(valid, symbol, interval, s, r, spec, taker, slip, folds=2)
-            c["valid_stats"] = run_backtest(valid, symbol, interval, s, r, spec, taker_fee=taker,
-                                            slippage_bps=slip, collect_series=False).get("stats", {})
-        top.sort(key=lambda x: x["valid"], reverse=True)
-        champ_valid = next((c["valid"] for c in top if c["tag"] == "champion"), 0.0)
-        return top[0], champ_valid, top
+        return promoted
 
     def snapshot(self) -> dict:
         return {

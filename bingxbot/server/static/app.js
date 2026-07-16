@@ -35,6 +35,7 @@ const baseOpts=(h)=>({ height:h, layout:{background:{color:"transparent"},textCo
   crosshair:{mode:0,vertLine:{color:C.muted,width:1,style:2},horzLine:{color:C.muted,width:1,style:2}} });
 let mainChart,candleSeries,equityChart,equitySeries;
 let btEquityChart,btEquitySeries,btAllocChart,btAllocSeries={};
+let pfEquityChart,pfEquitySeries;
 function initCharts(){
   mainChart=LightweightCharts.createChart($("chart-main"),baseOpts(384));
   candleSeries=mainChart.addCandlestickSeries({upColor:C.up,downColor:C.dn,borderUpColor:C.up,borderDownColor:C.dn,wickUpColor:C.up,wickDownColor:C.dn});
@@ -109,15 +110,26 @@ function renderPipeline(){
     return `<div class="pstage ${cls}"><div class="n">${String(i+1).padStart(2,"0")}</div><div class="l">${s}</div></div>`;
   }).join("");
 }
-function renderBrain(){
-  const es=engSym(); if(!es) return;
-  const b=es.brain, micro=es.micro, ctx=es.context||{};
+function renderMTF(es){
+  const strip=$("mtf-strip"); if(!strip) return;
+  const mtf=es?.mtf||{};
+  const order=["1m","5m","15m","1h"].filter(tf=>mtf[tf]);
+  if(!order.length){ strip.innerHTML=`<span class="mtf-empty">warming up…</span>`; return; }
+  strip.innerHTML=order.map(tf=>{
+    const m=mtf[tf], d=m.dir||0;
+    const cls=d>0.15?"up":d<-0.15?"dn":"flat";
+    const arrow=d>0.15?"▲":d<-0.15?"▼":"▬";
+    const w=Math.round(Math.abs(clamp(d,-1,1))*100);
+    return `<div class="mtf-cell ${cls}"><div class="tf">${tf}</div>
+      <div class="dir">${arrow}</div>
+      <div class="tfbar"><div class="tffill" style="width:${w}%"></div></div>
+      <div class="tfrsi">RSI ${Math.round(m.rsi)}</div></div>`;
+  }).join("");
+}
+function renderEdgeGauge(b, es){
+  // price + edge/p(win) gauges + entry gate — the elements that must feel live,
+  // so both the full render and the fast 'hot' channel call this.
   $("px-last").textContent=fmt.px(es.price);
-  const fund=ctx.funding_rate!=null?` · fund ${(ctx.funding_rate*100).toFixed(4)}%`:"";
-  $("px-meta").textContent=`spread ${micro.spread_bps.toFixed(1)}bp · OBI ${fmt.signed(micro.obi,2)} · flow ${fmt.signed(micro.flow,2)}${fund}`;
-  $("brain-graded").textContent=`${b.graded} graded`;
-
-  // edge gauge
   const edge=b.edge||0, thr=b.threshold||0.3;
   $("edge-val").textContent=fmt.signed(edge,2);
   $("edge-val").style.color=Math.abs(edge)<thr?"var(--ink)":(edge>0?"#7db4ee":"#ff9b9b");
@@ -125,12 +137,22 @@ function renderBrain(){
   nd.style.background=Math.abs(edge)<thr?C.ink2:(edge>0?"#7db4ee":"#ff9b9b");
   $("edge-thr-pos").style.left=`${50+thr*49}%`; $("edge-thr-neg").style.left=`${50-thr*49}%`;
   $("edge-thr").textContent=`thr ${thr.toFixed(2)}`;
-
-  // p(win) gauge
   const p=b.p_win||0.5; $("pwin-val").textContent=fmt.pct(p,0);
   $("pwin-val").style.color=p>=0.55?"var(--good)":p>=0.5?"var(--ink)":"var(--bad)";
   $("pwin-fill").style.width=`${clamp((p-0.3)/0.6,0,1)*100}%`;
   $("pwin-fill").style.background=p>=0.55?"var(--good)":p>=0.5?"var(--accent)":"var(--bad)";
+  const held=S.engine?.portfolio?.open_positions?.[curSymbol];
+  $("b-gate").textContent=held?`in position ${es.bars_held}b`:(es.entry_block?es.entry_block:(Math.abs(edge)>=thr?"armed":"scanning"));
+}
+function renderBrain(){
+  const es=engSym(); if(!es) return;
+  const b=es.brain, micro=es.micro, ctx=es.context||{};
+  const fund=ctx.funding_rate!=null?` · fund ${(ctx.funding_rate*100).toFixed(4)}%`:"";
+  $("px-meta").textContent=`spread ${micro.spread_bps.toFixed(1)}bp · OBI ${fmt.signed(micro.obi,2)} · flow ${fmt.signed(micro.flow,2)}${fund}`;
+  $("brain-graded").textContent=`${b.graded} graded`;
+
+  // edge + p(win) gauges (also driven by the fast 'hot' channel)
+  renderEdgeGauge(b, es);
   const cal=b.calibration||{}; $("cal-skill").textContent=`skill ${fmt.signed(cal.skill||0,2)}`;
 
   // badges
@@ -138,8 +160,7 @@ function renderBrain(){
   rb.className=`badge ${rm.cls}`; rb.innerHTML=`<span class="g">${rm.g}</span><span>${rm.label}</span>`;
   $("b-conf").textContent=`conf ${fmt.pct(b.regime_conf,0)}`;
   $("b-vol").textContent=`vol ${(micro.spread_bps).toFixed(1)}bp`;
-  const held=S.engine.portfolio.open_positions[curSymbol];
-  $("b-gate").textContent=held?`in position ${es.bars_held}b`:(es.entry_block?es.entry_block:(Math.abs(edge)>=thr?"armed":"scanning"));
+  renderMTF(es);
 
   // desks
   renderDesks(b.desks);
@@ -270,7 +291,32 @@ function renderAll(){
   renderTop(); renderSymTabs(); renderTape();
   if(S.engine){ renderPipeline(); renderBrain(); renderEquity(); renderPositions(); renderTrades();
     const tc=S.engine.portfolio.stats.trades; refreshCandles(false).then(()=>{lastTradeCount=tc;}); }
-  renderAutotuner(); renderSettings();
+  renderAutotuner(); renderChampions(); renderSettings();
+}
+
+/* ------- fast 'hot' channel: patch the live numbers between full pushes ----- */
+function applyHot(h){
+  if(!S||!S.engine||!h?.engine) return;
+  const he=h.engine; S.mode=h.mode??S.mode;
+  const pf=S.engine.portfolio; if(pf) pf.equity=he.equity;
+  if(typeof he.killed==="boolean"&&S.engine.risk) S.engine.risk.killed=he.killed;
+  if(typeof he.feed_healthy==="boolean") S.engine.feed_healthy=he.feed_healthy;
+  for(const [sym,hs] of Object.entries(he.symbols||{})){
+    const s=S.engine.symbols?.[sym]; if(!s) continue;
+    s.price=hs.price; s.stage=hs.stage; s.eval_ms=hs.eval_ms; s.entry_block=hs.entry_block; s.bars_held=hs.bars_held;
+    if(hs.mtf) s.mtf=hs.mtf;
+    if(s.brain){ s.brain.edge=hs.edge; s.brain.p_win=hs.p_win; s.brain.regime=hs.regime; }
+  }
+  for(const [sym,hp] of Object.entries(he.positions||{})){
+    const p=pf?.open_positions?.[sym]; if(p) p.upnl=hp.upnl;
+  }
+  if(he.tape) S.engine.tape=he.tape;
+  renderHot();
+}
+function renderHot(){
+  if(!S?.engine) return;
+  renderTop(); renderPipeline(); renderPositions(); renderTape();
+  const es=engSym(); if(es&&es.brain){ renderEdgeGauge(es.brain, es); renderMTF(es); }
 }
 
 /* ---------------------------------------------------------------- ws */
@@ -278,7 +324,9 @@ let ws,wsRetry=1;
 function connectWS(){
   const proto=location.protocol==="https:"?"wss":"ws";
   ws=new WebSocket(`${proto}://${location.host}/ws`);
-  ws.onmessage=(ev)=>{ const m=JSON.parse(ev.data); if(m.type==="state"){ S=m.data; renderAll(); } };
+  ws.onmessage=(ev)=>{ const m=JSON.parse(ev.data);
+    if(m.type==="state"){ S=m.data; renderAll(); }
+    else if(m.type==="hot"){ applyHot(m.data); } };
   ws.onopen=()=>{wsRetry=1;}; ws.onclose=()=>setTimeout(connectWS,Math.min(wsRetry*=1.6,8)*1000); ws.onerror=()=>ws.close();
 }
 
@@ -300,6 +348,7 @@ document.querySelectorAll(".tab").forEach(b=>{ b.onclick=()=>{
   document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("active",x===b));
   document.querySelectorAll(".tab-page").forEach(p=>p.classList.toggle("active",p.dataset.page===b.dataset.tab));
   if(b.dataset.tab==="backtest") ensureBtCharts();
+  if(b.dataset.tab==="portfolio") ensurePfChart();
 }; });
 document.querySelectorAll('[data-page="settings"] input, [data-page="settings"] select').forEach(el=>el.addEventListener("input",()=>{settingsDirty=true;}));
 $("cfg-save").onclick=async()=>{
@@ -408,6 +457,63 @@ function renderOptimizer(res){
 }
 window.applyParams=async(i)=>{ const f=opFinalists[i]; if(!f) return;
   try{ await api("/api/apply_params",{params:f.params}); toast("Parameters applied to running brains","good"); }catch(e){ toast(e.message,"bad"); } };
+
+/* ---------------------------------------------------------------- portfolio */
+function ensurePfChart(){
+  if(pfEquityChart) return;
+  pfEquityChart=LightweightCharts.createChart($("chart-pf-equity"),baseOpts(240));
+  pfEquitySeries=pfEquityChart.addAreaSeries({lineColor:C.accent,lineWidth:2,topColor:"rgba(57,135,229,0.25)",bottomColor:"rgba(57,135,229,0.02)",priceLineVisible:false});
+  new ResizeObserver(()=>{ pfEquityChart.applyOptions({width:$("chart-pf-equity").clientWidth}); }).observe($("chart-pf-equity"));
+}
+$("pf-run").onclick=async()=>{
+  const symbols=$("pf-symbols").value.split(",").map(s=>s.trim().toUpperCase()).filter(Boolean);
+  if(symbols.length<2){ toast("Enter at least 2 symbols","bad"); return; }
+  try{ const r=await api("/api/portfolio_backtest",{symbols,interval:$("pf-interval").value,
+    days:parseFloat($("pf-days").value),synthetic:$("pf-synth").checked});
+    $("pf-results").style.display="none"; pollJob(r.job_id,$("pf-progress"),renderPortfolio); }catch(e){ toast(e.message,"bad"); }
+};
+function renderPortfolio(res){
+  ensurePfChart(); $("pf-results").style.display="block";
+  if(res.error){ toast(res.error,"bad"); return; }
+  $("pf-cards").innerHTML=statCards(res.stats,res.starting_balance);
+  requestAnimationFrame(()=>{
+    pfEquityChart.applyOptions({width:$("chart-pf-equity").clientWidth});
+    pfEquitySeries.setData(res.equity_curve.map(([ts,eq])=>({time:Math.floor(ts/1000),value:eq})));
+    pfEquityChart.timeScale().fitContent();
+  });
+  const ps=res.per_symbol||{};
+  $("pf-symbols-body").innerHTML=Object.keys(ps).length?Object.entries(ps).map(([s,v])=>
+    `<tr><td>${esc(s)}</td><td class="r">${v.trades}</td><td class="r">${v.trades?fmt.pct(v.win_rate):"—"}</td>
+     <td class="r ${pnlCls(v.pnl)}">${fmt.signed(v.pnl,2)}</td></tr>`).join("")
+    :`<tr><td colspan="4" class="empty">No symbols</td></tr>`;
+  const corr=res.avg_correlation;
+  const corrCls=corr==null?"":corr<0.3?"pnl-pos":corr<0.6?"":"pnl-neg";
+  $("pf-div").innerHTML=[
+    ["Symbols",res.symbols?res.symbols.length:0],
+    ["Aligned bars",res.bars??"—"],
+    ["Avg correlation",corr==null?"—":corr.toFixed(2),corrCls],
+    ["Max DD",fmt.pct(res.stats.max_drawdown)],
+  ].map(([k,v,cls])=>`<div class="card"><div class="k">${k}</div><div class="v ${cls??""}">${v}</div></div>`).join("");
+  const s=res.stats; toast(`Portfolio: ${res.symbols.length} symbols · ${s.trades} trades · WR ${fmt.pct(s.win_rate)} · PF ${s.profit_factor.toFixed(2)}`,s.total_pnl>=0?"good":"warn");
+}
+
+/* champion vault — auto-saved / auto-pruned best parameter sets */
+const CHAMP_KEYS=["base_threshold","risk_per_trade","sl_atr_min","trail_atr_max","giveback_rr","target_trades_per_hour"];
+let champStore=[];
+function renderChampions(){
+  champStore=S?.champions||[];
+  const body=$("champ-body"); if(!body) return;
+  if(!champStore.length){ body.innerHTML=`<tr><td colspan="6" class="empty">No champions saved yet — the vault fills as the tuner promotes winners</td></tr>`; return; }
+  body.innerHTML=champStore.map((c,i)=>{
+    const params=CHAMP_KEYS.filter(k=>c.params&&c.params[k]!=null).map(k=>`${k}=${c.params[k]}`).join("  ");
+    return `<tr><td>${fmt.dt(c.ts)}</td><td class="r pnl-pos">${(c.fitness??0).toFixed(2)}</td>
+      <td class="r">${fmt.pct(c.win_rate,0)}</td><td class="r">${(c.profit_factor||0).toFixed(2)}</td>
+      <td style="color:var(--muted);max-width:420px">${esc(params)}</td>
+      <td><button class="btn sm primary" onclick="applyChampion(${i})">Apply</button></td></tr>`;
+  }).join("");
+}
+window.applyChampion=async(i)=>{ const c=champStore[i]; if(!c?.params) return;
+  try{ await api("/api/apply_params",{params:c.params}); toast("Champion parameters applied to running brains","good"); }catch(e){ toast(e.message,"bad"); } };
 
 initCharts(); connectWS();
 setInterval(()=>{ if(S?.engine) refreshCandles(false); },5000);
