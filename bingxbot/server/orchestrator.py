@@ -52,6 +52,22 @@ def _clean_symbol(raw) -> str:
     return lst[0] if lst else ""
 
 
+def _plan_cores() -> tuple[int, int]:
+    """Split the host's logical cores between the two process pools. Reserve one
+    for the event loop, give a small slice to on-demand user jobs (interactive),
+    and hand the rest to the always-on research desk (the auto-tuner) — so the
+    tuner can use several cores in parallel without ever starving the UI or a
+    backtest the user just launched. Scales with whatever CPU it lands on."""
+    total = os.cpu_count() or 4
+    if total <= 2:
+        return 1, 1
+    if total <= 4:
+        return 1, max(1, total - 2)              # 4 -> 1 interactive + 2 research (+1 loop)
+    interactive = min(3, max(1, total // 5))      # ~20%, capped at 3
+    research = max(1, min(total - 1 - interactive, 16))
+    return interactive, research
+
+
 class Alerter:
     """Optional push alerts to a webhook (Slack/Discord/Telegram-bridge/etc.).
     URL comes from BOT_ALERT_WEBHOOK; with none set every method is a no-op, so
@@ -133,8 +149,10 @@ class Orchestrator:
         self.listeners: set[asyncio.Queue] = set()
         self.mode = MODE_IDLE
         self._switch_lock = asyncio.Lock()
-        self.pool = None            # ProcessPoolExecutor, created lazily
-        self._pool_tried = False
+        self.pool = None            # interactive pool (user backtests/optimizer/walk-fwd)
+        self.research_pool = None   # dedicated pool for the auto-tuner's research
+        self._pools_ready = False
+        self.cores = _plan_cores()  # (interactive_workers, research_workers)
         self.champions: list[dict] = self._load_champions()
         self.journal = TradeJournal()
         self.alerter = Alerter()
@@ -142,38 +160,59 @@ class Orchestrator:
 
     # ------------------------------------------------------------- CPU offload
 
-    def _ensure_pool(self):
-        """Create a process pool on first use so heavy CPU work (tuner,
-        backtests) runs off the event loop on other cores — the GIL fix for the
-        UI lag. Falls back to threads if processes can't be spawned."""
-        if self._pool_tried:
-            return self.pool
-        self._pool_tried = True
+    def _ensure_pools(self):
+        """Create both process pools on first use ('spawn' start method — safe
+        from inside a running event loop, and the only option on Windows). The
+        interactive pool serves user-triggered jobs; the research pool is the
+        auto-tuner's, sized to the host so cycles run several-wide in parallel."""
+        if self._pools_ready:
+            return
+        self._pools_ready = True
         try:
             import multiprocessing as mp
             from concurrent.futures import ProcessPoolExecutor
-            workers = min(4, max(1, (os.cpu_count() or 2) - 1))
-            # 'spawn' (not fork): safe to create from inside a running event
-            # loop — fork would inherit the loop's locks and can deadlock — and
-            # it's the only start method on Windows, where the user also runs.
             ctx = mp.get_context("spawn")
-            self.pool = ProcessPoolExecutor(max_workers=workers, mp_context=ctx)
-            log.info("process pool: %d spawn workers", workers)
+            ni, nr = self.cores
+            self.pool = ProcessPoolExecutor(max_workers=ni, mp_context=ctx)
+            self.research_pool = ProcessPoolExecutor(max_workers=nr, mp_context=ctx)
+            log.info("cores: %d interactive + %d research (of %d logical detected)",
+                     ni, nr, os.cpu_count() or 0)
         except Exception as e:  # noqa: BLE001
-            log.warning("process pool unavailable (%s); using threads", e)
-            self.pool = None
-        return self.pool
+            log.warning("process pools unavailable (%s); using threads", e)
+            self.pool = self.research_pool = None
 
-    async def run_cpu(self, fn, *args):
+    def _pool_for(self, research: bool):
+        self._ensure_pools()
+        return self.research_pool if research else self.pool
+
+    async def run_cpu(self, fn, *args, research: bool = False):
         loop = asyncio.get_running_loop()
-        pool = self._ensure_pool()
+        pool = self._pool_for(research)
         if pool is not None:
             try:
                 return await loop.run_in_executor(pool, fn, *args)
             except Exception as e:  # noqa: BLE001 - worker/pickling failure -> threads
                 log.warning("pool task failed (%s); falling back to thread", e)
-                self.pool = None
         return await asyncio.to_thread(fn, *args)
+
+    async def map_cpu(self, fn, arg_tuples: list[tuple], research: bool = True) -> list:
+        """Run fn(*args) for every args tuple in PARALLEL across a pool and return
+        the results in order — this is what lets one tuner cycle use many cores at
+        once. Falls back to running them sequentially on threads if the pool is
+        unavailable, so the tuner still works on a single core, just slower."""
+        loop = asyncio.get_running_loop()
+        pool = self._pool_for(research)
+        if pool is not None:
+            try:
+                futs = [loop.run_in_executor(pool, fn, *a) for a in arg_tuples]
+                return list(await asyncio.gather(*futs))
+            except Exception as e:  # noqa: BLE001
+                log.warning("pool map failed (%s); thread fallback", e)
+        return [await asyncio.to_thread(fn, *a) for a in arg_tuples]
+
+    @property
+    def research_workers(self) -> int:
+        return self.cores[1]
 
     # ------------------------------------------------------------- champions
 
@@ -193,6 +232,10 @@ class Orchestrator:
         })
         # keep the top-N by fitness (auto-delete the worst/old)
         self.champions.sort(key=lambda x: x["fitness"], reverse=True)
+        self.champions = self.champions[:CHAMPIONS_KEEP]
+        self.save_champions()
+
+    def save_champions(self) -> None:
         self.champions = self.champions[:CHAMPIONS_KEEP]
         try:
             CHAMPIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -389,6 +432,9 @@ class Orchestrator:
 
     async def shutdown(self) -> None:
         await self._stop_engine()
+        for p in (self.pool, self.research_pool):
+            if p is not None:
+                p.shutdown(wait=False, cancel_futures=True)
 
     # ---------------------------------------------------------------- control
 

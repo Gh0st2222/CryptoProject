@@ -247,7 +247,7 @@
     </div>
 
     <div class="tab-page" data-page="autotuner">
-      <p class="foot-note" style="margin-top:0">The always-on research desk. Every couple of minutes it evolves the current champion parameters + random explorers over the <b>entire</b> strategy &amp; risk space, validates the survivors on a held-out slice, and hot-swaps a challenger into the live brains <b>only</b> when it clearly beats what's running. It never touches the settings you own. You don't tune — it does, continuously.</p>
+      <p class="foot-note" style="margin-top:0">The always-on research desk, now a real optimizer. A <b>persistent Differential-Evolution population</b> (it remembers across cycles &amp; restarts) is scored across time folds <b>in parallel on a dedicated pool of research cores</b> — indicators built once per fold, reused for every candidate — ranked by a risk-adjusted, recency-weighted robust score, then the best is <b>validated out-of-sample</b> on the most recent window (with an overfit penalty) and hot-swapped into the live brains <b>only</b> when it clearly beats what's running. The champion vault is periodically re-validated on fresh data and stale sets retired. It never touches the settings you own.</p>
       <div class="at-row" id="at-row"><div class="empty">Auto-tuner idle (engine not running)</div></div>
       <div class="subt" style="margin-top:14px">Promotions — parameters it has adopted</div>
       <div style="overflow:auto"><table class="tbl"><thead><tr>
