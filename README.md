@@ -140,14 +140,30 @@ balance, max open positions, the leverage band, and the daily-loss limit. On the
 Settings tab those are the only editable fields; everything else is displayed
 read-only as the live values the tuner has chosen.
 
-## Self-tuning (don't touch settings)
+**Champion vault (auto-save / auto-prune).** Every promotion is written to a
+persistent store (`data_cache/champions.json`), ranked by validation fitness, and
+**pruned to the best 12** — the worst/old sets are deleted automatically. The
+Auto-Tuner tab shows the vault, and any champion can be re-applied to the live
+brains with one click. The tuner also **hunts faster right after a promotion**
+(tight cadence while it's clearly improving, relaxed cadence when stable).
 
-The **background auto-tuner** is the quant-research desk. On a timer it re-runs
-the walk-forward search on recent data and **hot-swaps** new parameters into the
-live brains *only* if they beat what's currently running on the held-out
-validation slice. If nothing clears the bar, it changes nothing. Everything it
-does is reported on the Auto-Tuner tab. You can still drive the same search by
-hand on the Optimizer tab and apply a winner with one click.
+**It runs on other cores.** The heavy scoring — the continuous tuner and every
+Backtest / Optimizer / Portfolio job — runs in a **process pool** (spawn workers,
+cross-platform), so it never holds the GIL and never stalls the event loop. The
+UI stays responsive even while the research desk is grinding through candidates.
+
+## Multi-symbol portfolio backtest (one shared account)
+
+The **Portfolio** tab backtests several symbols on a **single shared account** —
+one equity pool, one position cap, one daily-loss kill switch, one health
+governor. Symbols are aligned on their common bars and stepped in lockstep, and a
+**correlation haircut** shrinks a same-direction add while another symbol is
+already carrying that bet (BTC/ETH move together — don't stack the same trade).
+Diversification smooths the equity curve, so the account can safely carry size no
+single symbol could. Results include the shared-account curve, a per-symbol
+contribution breakdown, and the realized average cross-symbol correlation. Same
+engine and accounting as the single-symbol backtest — it's literally several
+per-symbol simulators sharing one `Portfolio` and `RiskManager`.
 
 ## Data intake ("not a bit escapes it")
 
@@ -162,8 +178,16 @@ A dense dark trading terminal: live tape ticker, an execution-cycle pipeline
 (Scan→Detect→Validate→Size→Fill→Manage→Settle), fused-edge and calibrated-P(win)
 gauges, the live desk-allocation leaderboard, the 18-alpha floor with
 firing/dormant state and hit rates, regime + health meters, a candlestick chart
-with trade markers, the session equity curve, and a Backtest tab with the
-desk-allocation-over-time chart plus a 5,000-path Monte-Carlo robustness panel.
+with trade markers, the session equity curve, a Backtest tab with the
+desk-allocation-over-time chart plus a 5,000-path Monte-Carlo robustness panel, a
+Portfolio tab (multi-symbol shared-account backtest), and an Auto-Tuner tab with
+the promotion log and the champion vault.
+
+The dashboard pushes over a **split WebSocket**: a light **hot** channel streams
+prices, open-position uPnL and the execution stage several times a second (so the
+numbers feel live between bar closes), while the heavier full snapshot — brain
+internals, equity curve, trade history — rides a slower channel. The two never
+contend for the same cycle, which is what killed the earlier lag/latency spikes.
 
 ## The path to live
 
@@ -230,9 +254,9 @@ bingxbot/
 │   ├── portfolio.py        accounting + stats
 │   ├── brokers.py          PaperBroker / LiveBroker (one interface)
 │   ├── trader.py           realtime decision loop + execution pipeline
-│   ├── backtest.py         event-driven simulator + walk-forward optimizer
-│   └── autotuner.py        background self-tuning research desk
-└── server/                 FastAPI + WebSocket + the terminal (vendored charts)
+│   ├── backtest.py         event-driven per-symbol simulator + portfolio (shared account) + optimizer
+│   └── autotuner.py        background self-tuning research desk (runs in the process pool)
+└── server/                 FastAPI + split WebSocket + process pool + the terminal (vendored charts)
 ```
 
 ## Configuration

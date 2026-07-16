@@ -56,6 +56,13 @@ class OptimizeReq(BacktestReq):
     trials: int = Field(default=40, ge=5, le=300)
 
 
+class PortfolioReq(BaseModel):
+    symbols: list[str] = Field(default_factory=lambda: ["BTC-USDT", "ETH-USDT"])
+    interval: str = "5m"
+    days: float = Field(default=30, ge=0.5, le=365)
+    synthetic: bool = False
+
+
 class ApplyParamsReq(BaseModel):
     params: dict
 
@@ -121,6 +128,12 @@ async def optimize(req: OptimizeReq):
     return {"job_id": job.id}
 
 
+@app.post("/api/portfolio_backtest")
+async def portfolio_backtest(req: PortfolioReq):
+    job = orch.start_portfolio_backtest(req.symbols, req.interval, req.days, req.synthetic)
+    return {"job_id": job.id}
+
+
 @app.get("/api/jobs/{job_id}")
 async def job_status(job_id: str):
     job = orch.jobs.get(job_id)
@@ -135,28 +148,41 @@ async def apply_params(req: ApplyParamsReq):
     return {"ok": True, "config": orch.status()["config"]}
 
 
+# event -> which channel it drives. "hot" is the small high-cadence payload
+# (prices, uPnL, stage); everything structural rides the heavier full state.
+FULL_EVENTS = {"state", "bar", "trade", "mode", "job", "autotune", "config", "heartbeat"}
+FULL_MIN_GAP = 0.9    # seconds between heavy full-state pushes
+HOT_MIN_GAP = 0.25    # seconds between light hot pushes (≈ up to 4/s)
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     q = orch.subscribe()
     try:
         await ws.send_text(json.dumps({"type": "state", "data": orch.status()}))
-        last_state = 0.0
+        last_full = last_hot = 0.0
         while True:
             try:
                 kind = await asyncio.wait_for(q.get(), timeout=2.0)
             except asyncio.TimeoutError:
                 kind = "heartbeat"
-            # coalesce whatever queued up into a single push
+            # coalesce whatever queued up, but remember if a full-state event
+            # was among them so a burst of hot ticks can't starve the full push
+            want_full = kind in FULL_EVENTS
             while not q.empty():
                 try:
-                    q.get_nowait()
+                    k2 = q.get_nowait()
+                    want_full = want_full or (k2 in FULL_EVENTS)
                 except asyncio.QueueEmpty:
                     break
             now = now_ms() / 1000.0
-            if kind in ("state", "bar", "trade", "mode", "job", "heartbeat") and now - last_state > 0.9:
+            if want_full and now - last_full > FULL_MIN_GAP:
                 await ws.send_text(json.dumps({"type": "state", "data": orch.status()}))
-                last_state = now
+                last_full = last_hot = now
+            elif now - last_hot > HOT_MIN_GAP:
+                await ws.send_text(json.dumps({"type": "hot", "data": orch.hot()}))
+                last_hot = now
     except (WebSocketDisconnect, RuntimeError):
         pass
     finally:

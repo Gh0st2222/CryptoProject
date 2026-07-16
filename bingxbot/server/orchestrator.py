@@ -4,15 +4,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import time
 import uuid
+from pathlib import Path
 
-from ..config import (BotConfig, FEED_SYNTHETIC, MODE_IDLE, MODE_LIVE, MODE_PAPER,
+from ..config import (ROOT, BotConfig, FEED_SYNTHETIC, MODE_IDLE, MODE_LIVE, MODE_PAPER,
                       config_public_dict, load_config, save_config, update_config)
 from ..data.feed import BaseFeed, LiveFeed, SyntheticFeed
 from ..data.history import HistoryStore, synthetic_candles
-from ..engine.backtest import run_backtest, run_optimizer
+from ..engine.backtest import run_backtest, run_optimizer, run_portfolio_backtest
 from ..engine.brokers import LiveBroker, PaperBroker
 from ..engine.portfolio import Portfolio
 from ..engine.trader import TraderEngine
@@ -25,6 +28,8 @@ from ..util import interval_ms, now_ms
 log = logging.getLogger("orchestrator")
 
 LIVE_CONFIRM_PHRASE = "TRADE LIVE"
+CHAMPIONS_PATH = ROOT / "data_cache" / "champions.json"
+CHAMPIONS_KEEP = 12   # keep the top-N champions; prune the worst/old
 
 
 class Job:
@@ -56,6 +61,69 @@ class Orchestrator:
         self.listeners: set[asyncio.Queue] = set()
         self.mode = MODE_IDLE
         self._switch_lock = asyncio.Lock()
+        self.pool = None            # ProcessPoolExecutor, created lazily
+        self._pool_tried = False
+        self.champions: list[dict] = self._load_champions()
+
+    # ------------------------------------------------------------- CPU offload
+
+    def _ensure_pool(self):
+        """Create a process pool on first use so heavy CPU work (tuner,
+        backtests) runs off the event loop on other cores — the GIL fix for the
+        UI lag. Falls back to threads if processes can't be spawned."""
+        if self._pool_tried:
+            return self.pool
+        self._pool_tried = True
+        try:
+            import multiprocessing as mp
+            from concurrent.futures import ProcessPoolExecutor
+            workers = min(4, max(1, (os.cpu_count() or 2) - 1))
+            # 'spawn' (not fork): safe to create from inside a running event
+            # loop — fork would inherit the loop's locks and can deadlock — and
+            # it's the only start method on Windows, where the user also runs.
+            ctx = mp.get_context("spawn")
+            self.pool = ProcessPoolExecutor(max_workers=workers, mp_context=ctx)
+            log.info("process pool: %d spawn workers", workers)
+        except Exception as e:  # noqa: BLE001
+            log.warning("process pool unavailable (%s); using threads", e)
+            self.pool = None
+        return self.pool
+
+    async def run_cpu(self, fn, *args):
+        loop = asyncio.get_running_loop()
+        pool = self._ensure_pool()
+        if pool is not None:
+            try:
+                return await loop.run_in_executor(pool, fn, *args)
+            except Exception as e:  # noqa: BLE001 - worker/pickling failure -> threads
+                log.warning("pool task failed (%s); falling back to thread", e)
+                self.pool = None
+        return await asyncio.to_thread(fn, *args)
+
+    # ------------------------------------------------------------- champions
+
+    def _load_champions(self) -> list[dict]:
+        try:
+            return json.loads(CHAMPIONS_PATH.read_text())
+        except (OSError, json.JSONDecodeError):
+            return []
+
+    def record_champion(self, params: dict, fitness: float, stats: dict) -> None:
+        """Save a promoted champion, keep the best CHAMPIONS_KEEP, prune the rest."""
+        self.champions.append({
+            "ts": now_ms(), "fitness": round(float(fitness), 3),
+            "win_rate": round(stats.get("win_rate", 0.0), 4),
+            "profit_factor": round(stats.get("profit_factor", 0.0), 3),
+            "params": params,
+        })
+        # keep the top-N by fitness (auto-delete the worst/old)
+        self.champions.sort(key=lambda x: x["fitness"], reverse=True)
+        self.champions = self.champions[:CHAMPIONS_KEEP]
+        try:
+            CHAMPIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            CHAMPIONS_PATH.write_text(json.dumps(self.champions, indent=2))
+        except OSError as e:
+            log.warning("could not save champions: %s", e)
 
     # ---------------------------------------------------------------- events
 
@@ -255,15 +323,15 @@ class Orchestrator:
                 candles = await self._get_backtest_candles(symbol, interval, days, synthetic, job)
                 if len(candles) < 500:
                     raise ValueError(f"only {len(candles)} bars available for {symbol} {interval}")
-
-                def prog(p: float) -> None:
-                    job.progress = 0.35 + 0.65 * p
+                job.progress = 0.4
+                await self._notify("job")
                 spec = self.specs.get(symbol, ContractSpec(symbol))
-                result = await asyncio.to_thread(
+                # heavy sim runs on another core (process pool) so the UI stays live
+                result = await self.run_cpu(
                     run_backtest, candles, symbol, interval,
                     self.cfg.strategy, self.cfg.risk, spec,
                     self.cfg.paper.starting_balance, spec.taker_fee,
-                    self.cfg.paper.slippage_bps, 300, prog,
+                    self.cfg.paper.slippage_bps, 300, None,
                 )
                 job.result = result
                 job.progress = 1.0
@@ -285,20 +353,59 @@ class Orchestrator:
                 candles = await self._get_backtest_candles(symbol, interval, days, synthetic, job)
                 if len(candles) < 2000:
                     raise ValueError(f"optimizer needs 2000+ bars, got {len(candles)}")
-
-                def prog(p: float) -> None:
-                    job.progress = 0.35 + 0.65 * p
+                job.progress = 0.4
+                await self._notify("job")
                 spec = self.specs.get(symbol, ContractSpec(symbol))
-                result = await asyncio.to_thread(
+                # random search is the heaviest job — run it on another core
+                result = await self.run_cpu(
                     run_optimizer, candles, symbol, interval,
                     self.cfg.strategy, self.cfg.risk, spec,
                     spec.taker_fee, self.cfg.paper.slippage_bps,
-                    trials, None, prog,
+                    trials, None, None,
                 )
                 job.result = result
                 job.progress = 1.0
             except Exception as e:  # noqa: BLE001
                 log.exception("optimizer job failed")
+                job.error = str(e)
+            await self._notify("job")
+
+        asyncio.get_running_loop().create_task(runner())
+        return job
+
+    def start_portfolio_backtest(self, symbols: list[str], interval: str, days: float,
+                                 synthetic: bool = False) -> Job:
+        """Backtest several symbols on ONE shared account (diversified sizing,
+        one position cap, one kill switch, correlation haircut)."""
+        job = Job("portfolio")
+        self.jobs[job.id] = job
+        syms = [s.strip().upper() for s in symbols if s.strip()]
+
+        async def runner() -> None:
+            try:
+                if len(syms) < 2:
+                    raise ValueError("portfolio backtest needs at least 2 symbols")
+                candles_by_symbol: dict[str, list] = {}
+                for k, sym in enumerate(syms):
+                    cs = await self._get_backtest_candles(sym, interval, days, synthetic, job)
+                    if len(cs) >= 500:
+                        candles_by_symbol[sym] = cs
+                    job.progress = 0.4 * (k + 1) / len(syms)
+                    await self._notify("job")
+                if len(candles_by_symbol) < 2:
+                    raise ValueError("need at least 2 symbols with enough history")
+                specs = {s: self.specs.get(s, ContractSpec(s)) for s in candles_by_symbol}
+                spec0 = next(iter(specs.values()))
+                result = await self.run_cpu(
+                    run_portfolio_backtest, candles_by_symbol, interval,
+                    self.cfg.strategy, self.cfg.risk, specs,
+                    self.cfg.paper.starting_balance, spec0.taker_fee,
+                    self.cfg.paper.slippage_bps, 300, None,
+                )
+                job.result = result
+                job.progress = 1.0
+            except Exception as e:  # noqa: BLE001
+                log.exception("portfolio backtest job failed")
                 job.error = str(e)
             await self._notify("job")
 
@@ -329,6 +436,15 @@ class Orchestrator:
             d["engine"] = self.engine.snapshot()
         if self.autotuner is not None:
             d["autotuner"] = self.autotuner.snapshot()
+        if self.champions:
+            d["champions"] = self.champions[:CHAMPIONS_KEEP]
+        return d
+
+    def hot(self) -> dict:
+        """Tiny, fast-changing snapshot for the high-cadence UI channel."""
+        d = {"ts": now_ms(), "mode": self.mode}
+        if self.engine:
+            d["engine"] = self.engine.hot()
         return d
 
     def update_cfg(self, patch: dict) -> dict:

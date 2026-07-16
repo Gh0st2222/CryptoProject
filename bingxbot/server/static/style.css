@@ -242,6 +242,7 @@ input.field { width: 100%; font-family: var(--mono); }
 #bt-charts { display: grid; grid-template-columns: 1fr 1fr; gap: 11px; margin-top: 11px; }
 @media (max-width: 900px) { #bt-charts { grid-template-columns: 1fr; } }
 #chart-bt-equity, #chart-bt-alloc { height: 220px; }
+#chart-pf-equity { height: 240px; }
 #mc-chart { height: 150px; }
 .subt { color: var(--muted); font: 9.5px/1 var(--mono); text-transform: uppercase; letter-spacing: 1px; margin: 3px 0 6px; }
 .mc-row { display: grid; grid-template-columns: 1.4fr 1fr; gap: 12px; align-items: center; margin-top: 8px; }

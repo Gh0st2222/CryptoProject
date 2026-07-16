@@ -76,6 +76,7 @@ class TraderEngine:
         }
         self._task: asyncio.Task | None = None
         self._housekeeper: asyncio.Task | None = None
+        self._fast_pusher: asyncio.Task | None = None
         self.running = False
         self.started_ts = 0
         self.tape: list[dict] = []      # recent fills/exits for the UI ticker
@@ -94,18 +95,19 @@ class TraderEngine:
         self.started_ts = now_ms()
         self._task = asyncio.create_task(self._loop(), name="trader-loop")
         self._housekeeper = asyncio.create_task(self._housekeeping(), name="trader-housekeeping")
+        self._fast_pusher = asyncio.create_task(self._fast_push_loop(), name="trader-fastpush")
         log.info("trader started: %s %s %s", self.portfolio.mode, self.cfg.symbols, self.cfg.strategy.interval)
 
     async def stop(self, flatten: bool = False) -> None:
         self.running = False
-        for t in (self._task, self._housekeeper):
+        for t in (self._task, self._housekeeper, self._fast_pusher):
             if t:
                 t.cancel()
                 try:
                     await t
                 except (asyncio.CancelledError, Exception):
                     pass
-        self._task = self._housekeeper = None
+        self._task = self._housekeeper = self._fast_pusher = None
         if flatten:
             await self.broker.flatten_all("engine stop")
         await self.feed.stop()
@@ -141,6 +143,18 @@ class TraderEngine:
                 await self.broker.flatten_all("kill switch")
             if self.on_update:
                 await self.on_update("state")
+
+    async def _fast_push_loop(self) -> None:
+        """High-cadence 'hot' pushes so live prices / uPnL / stage refresh in
+        near-real-time between bar closes — a small payload, separate from the
+        heavy full-state push, so the two never contend for the same cycle."""
+        while self.running:
+            await asyncio.sleep(0.4)
+            if self.on_update:
+                try:
+                    await self.on_update("hot")
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _push_tape(self, symbol: str, kind: str, side: str, price: float, extra: dict | None = None) -> None:
         row = {"ts": now_ms(), "symbol": symbol, "kind": kind, "side": side, "price": price}
@@ -343,6 +357,40 @@ class TraderEngine:
             "risk": self.risk.status(),
             "equity_curve": list(self.portfolio.equity_curve)[-600:],
             "trades": [dc_asdict(t) for t in self.portfolio.trades[-80:]],
+        }
+
+    def hot(self) -> dict:
+        """Small, fast-changing snapshot for the high-cadence UI channel: live
+        prices, per-symbol edge/stage, open-position uPnL, equity — no brain
+        internals, equity curve or trade history (those ride the slow channel)."""
+        marks = {s: st.mark_price() for s, st in self.feed.states.items()}
+        return {
+            "running": self.running,
+            "feed_healthy": self.feed.healthy(),
+            "equity": round(self.portfolio.equity(marks), 4),
+            "killed": self.risk.state.killed,
+            "symbols": {
+                sym: {
+                    "price": marks.get(sym, 0.0),
+                    "stage": c.stage,
+                    "eval_ms": round(c.eval_ms, 2),
+                    "entry_block": c.last_entry_block,
+                    "edge": round(c.last_eval.get("edge", 0.0), 4),
+                    "p_win": round(c.last_eval.get("p_win", 0.0), 4),
+                    "regime": c.last_eval.get("regime", ""),
+                    "bars_held": c.bars_held,
+                }
+                for sym, c in self.ctx.items()
+            },
+            "positions": {
+                s: {
+                    "side": p.side, "entry": p.entry_price, "stop": p.stop_price,
+                    "tp": p.take_profit, "leverage": p.leverage,
+                    "upnl": round(p.unrealized(marks.get(s, 0.0)), 4) if marks.get(s) else 0.0,
+                }
+                for s, p in self.portfolio.positions.items()
+            },
+            "tape": self.tape[-10:],
         }
 
     def hot_swap_params(self, strat) -> None:
