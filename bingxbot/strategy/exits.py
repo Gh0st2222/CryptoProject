@@ -144,7 +144,12 @@ class AdaptiveExitManager:
             if peak_gain > 0 and retrace / peak_gain >= cfg.giveback_frac:
                 return False, f"giveback {rr:.1f}R"
 
-        # 5) long time backstop
+        # 5) adverse-funding bail: don't hold a thin position into funding we pay
+        funding = row.get("funding_rate", 0.0) or 0.0
+        if funding and d * funding > 0 and abs(funding) >= 0.0004 and 0.0 < rr < cfg.be_rr and bars_held >= 10:
+            return moved, "adverse funding"
+
+        # 6) long time backstop
         if bars_held >= cfg.time_stop_bars:
             return False, f"time stop ({bars_held})"
 

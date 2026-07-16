@@ -50,6 +50,7 @@ class StrategyConfig:
     target_trades_per_hour: float = 1.5
     cost_multiple: float = 2.0      # predicted move must exceed round-trip cost x this
     micro_confirm: bool = True      # order-flow agreement gate at entry (live/paper)
+    entry_confirm_scans: int = 2    # reactive intra-bar signal must persist this many scans
     trend_align_gate: bool = True   # in trends, only trade with multi-TF alignment
     discipline: bool = True         # regime-appropriate entries (the big anti-bleed fix)
     min_efficiency: float = 0.35    # trend entries need this Kaufman efficiency ratio
@@ -96,6 +97,7 @@ class RiskConfig:
     maker_adverse_bps: float = 0.4      # honest adverse-selection penalty on maker fills
     max_open_positions: int = 2
     correlation_haircut: float = 0.65        # shrink a same-direction add across symbols
+    max_net_exposure: float = 2.5            # cap on summed same-direction notional / equity
     max_position_notional_pct: float = 0.35  # of equity x leverage, per position
     max_daily_loss_pct: float = 0.05         # kill switch: flatten + halt for the day
     max_consecutive_losses: int = 8          # cooldown trigger

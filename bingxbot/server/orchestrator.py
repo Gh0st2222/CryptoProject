@@ -17,6 +17,7 @@ from ..data.feed import BaseFeed, LiveFeed, SyntheticFeed
 from ..data.history import HistoryStore, synthetic_candles
 from ..engine.backtest import run_backtest, run_optimizer, run_portfolio_backtest
 from ..engine.brokers import LiveBroker, PaperBroker
+from ..engine.journal import TradeJournal
 from ..engine.portfolio import Portfolio
 from ..engine.trader import TraderEngine
 from ..exchange.errors import BingXError
@@ -83,6 +84,7 @@ class Orchestrator:
         self.pool = None            # ProcessPoolExecutor, created lazily
         self._pool_tried = False
         self.champions: list[dict] = self._load_champions()
+        self.journal = TradeJournal()
 
     # ------------------------------------------------------------- CPU offload
 
@@ -261,7 +263,8 @@ class Orchestrator:
         async def on_update(kind: str) -> None:
             await self._notify(kind)
 
-        self.engine = TraderEngine(self.cfg, feed, broker, portfolio, risk, self.specs, on_update)
+        self.engine = TraderEngine(self.cfg, feed, broker, portfolio, risk, self.specs,
+                                   on_update, journal=self.journal)
         await self.engine.start()
 
         from ..engine.autotuner import AutoTuner

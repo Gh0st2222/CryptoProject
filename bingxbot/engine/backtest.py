@@ -49,6 +49,12 @@ def _entry_signal_ok(brain, strat, edge: float, p_win: float, row: dict, ev: dic
     bias = row.get("mtf_bias", 0.0)
     if strat.mtf_veto > 0 and abs(bias) >= strat.mtf_veto and bias * edge < 0:
         return False
+    # funding awareness: if we'd pay meaningful funding to hold this side and the
+    # edge is only marginal, skip — the carry quietly eats a thin edge. (Funding is
+    # 0 in the backtester's synthetic/historical klines, so this is live-only.)
+    funding = row.get("funding_rate", 0.0) or 0.0
+    if abs(funding) >= 0.0003 and (1 if edge > 0 else -1) * funding > 0 and abs(edge) < strat.base_threshold * 1.3:
+        return False
     regime = ev["regime"]
     if not strat.discipline:
         if strat.trend_align_gate and regime in TREND_REGIMES:
