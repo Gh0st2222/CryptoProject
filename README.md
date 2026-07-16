@@ -182,6 +182,13 @@ aggregations of the base bar, a 1m feed yields the whole ladder with **no extra
 data pulled** (well inside rate limits). The terminal shows the ladder live so you
 see exactly what the brain sees on each timeframe.
 
+**Hard trend veto.** On top of that ladder sits a non-negotiable rule: when the
+higher timeframes (15m/1h) have decided a direction, the bot will **not** take a
+trade against them — in any regime. This is the guard that stops the cardinal
+sin of a trend system, shorting into an uptrend (or buying a downtrend). It is a
+structural gate, not a tuned parameter, so the auto-tuner can never optimize it
+away, and range-fading is no longer in the tuner's search space at all.
+
 ## Data intake ("not a bit escapes it")
 
 Live mode ingests klines (a true 1m/5m/15m/1h indicator ladder), the full trade

@@ -14,8 +14,8 @@ REGIMES = (TREND_UP, TREND_DOWN, RANGE, VOLATILE)
 # desks lead ranges, microstructure works everywhere, everything shrinks in
 # chaos. The meta-allocator adjusts on top of this from live performance.
 REGIME_DESK_MULT: dict[str, dict[str, float]] = {
-    TREND_UP:   {"trend": 1.4, "meanrev": 0.45, "micro": 1.05, "vol": 1.0, "carry": 0.9},
-    TREND_DOWN: {"trend": 1.4, "meanrev": 0.45, "micro": 1.05, "vol": 1.0, "carry": 0.9},
+    TREND_UP:   {"trend": 1.5, "meanrev": 0.28, "micro": 1.0, "vol": 1.0, "carry": 0.9},
+    TREND_DOWN: {"trend": 1.5, "meanrev": 0.28, "micro": 1.0, "vol": 1.0, "carry": 0.9},
     RANGE:      {"trend": 0.5, "meanrev": 1.4, "micro": 1.05, "vol": 1.05, "carry": 1.0},
     VOLATILE:   {"trend": 0.75, "meanrev": 0.6, "micro": 0.85, "vol": 0.7, "carry": 0.8},
 }
