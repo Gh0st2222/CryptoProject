@@ -53,6 +53,7 @@ class StrategyConfig:
     trend_align_gate: bool = True   # in trends, only trade with multi-TF alignment
     discipline: bool = True         # regime-appropriate entries (the big anti-bleed fix)
     min_efficiency: float = 0.35    # trend entries need this Kaufman efficiency ratio
+    mtf_veto: float = 0.35          # HARD gate: never trade against a decided 15m/1h trend
     trade_range: bool = False       # opt-in: scalp range extremes (maker in/out). Off by
     range_band_edge: float = 0.15   # default — range mean-reversion is a weak edge; the
     trade_volatile: bool = False    # sit out VOLATILE/chop (pure fee bleed)
@@ -74,7 +75,7 @@ class RiskConfig:
     max_risk_hard_pct: float = 0.035    # hard cap on any single trade's loss-at-stop
     margin_mode: str = "ISOLATED"
     # --- adaptive exit geometry (let winners run, cut losers) ---
-    sl_atr_min: float = 1.2             # initial stop: no tighter than this x ATR
+    sl_atr_min: float = 1.5             # initial stop: no tighter than this x ATR (room to breathe)
     sl_atr_max: float = 2.8             # ...and no wider than this (structure-clamped between)
     tp_atr_cap: float = 0.0             # 0 = no fixed target; exit only via trail/edge
     trail_atr_min: float = 1.6          # chandelier trail width in chop
@@ -118,7 +119,7 @@ class ServerConfig:
 # override values persisted by an older build. On load, a config written by an
 # older version keeps only the user-owned settings; the tuner-owned params are
 # reset to current defaults (then the auto-tuner evolves from there).
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 
 # Top-level settings the user owns — everything else is auto-managed by the
 # tuner and reset to code defaults when migrating an older config.

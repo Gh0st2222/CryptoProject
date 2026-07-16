@@ -32,6 +32,25 @@ CHAMPIONS_PATH = ROOT / "data_cache" / "champions.json"
 CHAMPIONS_KEEP = 12   # keep the top-N champions; prune the worst/old
 
 
+def _split_symbols(raw) -> list[str]:
+    """Normalize a symbol field into a clean list — tolerates a single string,
+    a list, or a comma/semicolon-joined blob (so 'BTC-USDT, ETH-USDT' can't be
+    sent to the single-contract klines endpoint as one bogus symbol)."""
+    items = raw if isinstance(raw, (list, tuple)) else [raw]
+    out: list[str] = []
+    for item in items:
+        for tok in str(item).replace(";", ",").split(","):
+            tok = tok.strip().upper()
+            if tok and tok not in out:
+                out.append(tok)
+    return out
+
+
+def _clean_symbol(raw) -> str:
+    lst = _split_symbols(raw)
+    return lst[0] if lst else ""
+
+
 class Job:
     def __init__(self, kind: str):
         self.id = uuid.uuid4().hex[:12]
@@ -315,6 +334,7 @@ class Orchestrator:
 
     def start_backtest(self, symbol: str, interval: str, days: float,
                        synthetic: bool = False) -> Job:
+        symbol = _clean_symbol(symbol) or "BTC-USDT"   # one contract only
         job = Job("backtest")
         self.jobs[job.id] = job
 
@@ -345,6 +365,7 @@ class Orchestrator:
 
     def start_optimizer(self, symbol: str, interval: str, days: float,
                         trials: int, synthetic: bool = False) -> Job:
+        symbol = _clean_symbol(symbol) or "BTC-USDT"   # one contract only
         job = Job("optimize")
         self.jobs[job.id] = job
 
@@ -379,7 +400,7 @@ class Orchestrator:
         one position cap, one kill switch, correlation haircut)."""
         job = Job("portfolio")
         self.jobs[job.id] = job
-        syms = [s.strip().upper() for s in symbols if s.strip()]
+        syms = _split_symbols(symbols)
 
         async def runner() -> None:
             try:

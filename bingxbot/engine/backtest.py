@@ -42,6 +42,13 @@ def _entry_signal_ok(brain, strat, edge: float, p_win: float, row: dict, ev: dic
     ok, _ = brain.entry_ok(edge, p_win, row, fees_rt, ASSUMED_SPREAD_BPS, slippage_bps)
     if not ok:
         return False
+    # HARD higher-timeframe trend filter — never fight a decided 15m/1h trend, in
+    # ANY regime. mtf_bias is the consensus of the rungs above the base; if it is
+    # clearly directional, a trade opposing it is refused outright. This is the
+    # rule that stops the account shorting into an uptrend.
+    bias = row.get("mtf_bias", 0.0)
+    if strat.mtf_veto > 0 and abs(bias) >= strat.mtf_veto and bias * edge < 0:
+        return False
     regime = ev["regime"]
     if not strat.discipline:
         if strat.trend_align_gate and regime in TREND_REGIMES:
@@ -417,10 +424,12 @@ TUNABLES: dict[str, tuple] = {
     "min_p_win":              (0.48, 0.60, "strategy", "float"),
     "kelly_fraction":         (0.15, 0.60, "strategy", "float"),
     "maker_offset_bps":       (0.0, 3.0, "strategy", "float"),
-    "trade_range":            (0, 1, "strategy", "bool"),
+    # NOTE: trade_range is deliberately NOT tunable — range-fading is a weak edge
+    # that repeatedly hurt live (it shorted range-tops inside an uptrend). It stays
+    # off unless a human turns it on.
     # risk / exits
     "risk_per_trade":         (0.004, 0.014, "risk", "float"),
-    "sl_atr_min":             (1.0, 2.2, "risk", "float"),
+    "sl_atr_min":             (1.4, 2.6, "risk", "float"),
     "sl_atr_max":             (2.2, 3.8, "risk", "float"),
     "trail_atr_min":          (1.2, 2.6, "risk", "float"),
     "trail_atr_max":          (2.6, 4.6, "risk", "float"),
@@ -464,12 +473,18 @@ def _apply_params(strat: StrategyConfig, risk: RiskConfig, p: dict) -> tuple[Str
 
 def _fitness(stats: dict) -> float:
     t = stats.get("trades", 0)
-    if t < 10:
+    if t < 15:                       # need real evidence, not a lucky handful
         return -1.0
-    pf_capped = min(stats.get("profit_factor", 0.0), 3.5)
+    pf = stats.get("profit_factor", 0.0)
+    if pf < 1.0:                     # a losing set is never a champion, full stop
+        return -1.0
+    pf_capped = min(pf, 3.5)
     dd = stats.get("max_drawdown", 1.0)
     wr = stats.get("win_rate", 0.0)
-    return pf_capped * math.sqrt(t) * (1.0 - clamp(dd * 2.5, 0.0, 0.9)) * (0.5 + wr)
+    # trade-count credit SATURATES at ~40 so the tuner can't win by over-trading
+    # (that is exactly what bled the live account); quality (PF, low DD, WR) leads.
+    trade_factor = math.sqrt(min(t, 40))
+    return pf_capped * trade_factor * (1.0 - clamp(dd * 2.5, 0.0, 0.9)) * (0.5 + wr)
 
 
 def robust_fitness(candles, symbol, interval, strat, risk_cfg, spec,
