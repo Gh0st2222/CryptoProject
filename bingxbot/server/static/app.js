@@ -36,6 +36,7 @@ const baseOpts=(h)=>({ height:h, layout:{background:{color:"transparent"},textCo
 let mainChart,candleSeries,equityChart,equitySeries;
 let btEquityChart,btEquitySeries,btAllocChart,btAllocSeries={};
 let pfEquityChart,pfEquitySeries;
+let wfEquityChart,wfEquitySeries;
 function initCharts(){
   mainChart=LightweightCharts.createChart($("chart-main"),baseOpts(384));
   candleSeries=mainChart.addCandlestickSeries({upColor:C.up,downColor:C.dn,borderUpColor:C.up,borderDownColor:C.dn,wickUpColor:C.up,wickDownColor:C.dn});
@@ -349,6 +350,8 @@ document.querySelectorAll(".tab").forEach(b=>{ b.onclick=()=>{
   document.querySelectorAll(".tab-page").forEach(p=>p.classList.toggle("active",p.dataset.page===b.dataset.tab));
   if(b.dataset.tab==="backtest") ensureBtCharts();
   if(b.dataset.tab==="portfolio") ensurePfChart();
+  if(b.dataset.tab==="walkforward") ensureWfChart();
+  if(b.dataset.tab==="analytics") loadAnalytics();
 }; });
 document.querySelectorAll('[data-page="settings"] input, [data-page="settings"] select').forEach(el=>el.addEventListener("input",()=>{settingsDirty=true;}));
 $("cfg-save").onclick=async()=>{
@@ -514,6 +517,69 @@ function renderChampions(){
 }
 window.applyChampion=async(i)=>{ const c=champStore[i]; if(!c?.params) return;
   try{ await api("/api/apply_params",{params:c.params}); toast("Champion parameters applied to running brains","good"); }catch(e){ toast(e.message,"bad"); } };
+
+/* ---------------------------------------------------------------- walk-forward */
+function ensureWfChart(){
+  if(wfEquityChart) return;
+  wfEquityChart=LightweightCharts.createChart($("chart-wf-equity"),baseOpts(240));
+  wfEquitySeries=wfEquityChart.addAreaSeries({lineColor:C.accent,lineWidth:2,topColor:"rgba(57,135,229,0.25)",bottomColor:"rgba(57,135,229,0.02)",priceLineVisible:false});
+  new ResizeObserver(()=>{ wfEquityChart.applyOptions({width:$("chart-wf-equity").clientWidth}); }).observe($("chart-wf-equity"));
+}
+$("wf-run").onclick=async()=>{ try{ const r=await api("/api/walkforward",{symbol:$("wf-symbol").value.trim().toUpperCase(),
+  interval:$("wf-interval").value,days:parseFloat($("wf-days").value),folds:parseInt($("wf-folds").value,10),
+  trials:parseInt($("wf-trials").value,10),synthetic:$("wf-synth").checked});
+  $("wf-results").style.display="none"; pollJob(r.job_id,$("wf-progress"),renderWalkforward); }catch(e){ toast(e.message,"bad"); } };
+function renderWalkforward(res){
+  ensureWfChart(); $("wf-results").style.display="block";
+  if(res.error){ toast(res.error,"bad"); return; }
+  const ret=res.oos_return_pct;
+  $("wf-cards").innerHTML=[
+    ["OOS return",fmt.signed(ret,1)+"%",pnlCls(ret)],
+    ["OOS win rate",res.oos_trades?fmt.pct(res.oos_win_rate):"—",res.oos_win_rate>=0.5?"pnl-pos":""],
+    ["OOS profit factor",res.oos_profit_factor.toFixed(2),res.oos_profit_factor>=1?"pnl-pos":"pnl-neg"],
+    ["OOS trades",res.oos_trades],
+    ["Max drawdown",fmt.pct(res.oos_max_drawdown)],
+    ["Final equity",fmt.usd(res.final_equity)],
+  ].map(([k,v,cls])=>`<div class="card"><div class="k">${k}</div><div class="v ${cls??""}">${v}</div></div>`).join("");
+  requestAnimationFrame(()=>{
+    wfEquityChart.applyOptions({width:$("chart-wf-equity").clientWidth});
+    wfEquitySeries.setData((res.equity_curve||[]).map(([ts,eq])=>({time:Math.floor(ts/1000),value:eq})));
+    wfEquityChart.timeScale().fitContent();
+  });
+  $("wf-body").innerHTML=(res.per_fold||[]).map(f=>`<tr><td>${f.fold}</td>
+    <td class="r ${pnlCls(f.return_pct)}">${fmt.signed(f.return_pct,1)}%</td>
+    <td class="r">${f.trades?fmt.pct(f.win_rate):"—"}</td><td class="r">${(f.profit_factor||0).toFixed(2)}</td>
+    <td class="r">${f.trades}</td><td class="r">${fmt.pct(f.max_drawdown)}</td>
+    <td class="r">${f.tuned?"yes":"default"}</td></tr>`).join("");
+  toast(`Walk-forward OOS: ${fmt.signed(ret,1)}% · WR ${fmt.pct(res.oos_win_rate)} · PF ${res.oos_profit_factor.toFixed(2)}`,ret>=0?"good":"warn");
+}
+
+/* ---------------------------------------------------------------- analytics */
+async function loadAnalytics(){
+  try{ const mode=$("an-mode").value; const d=await api(`/api/journal${mode?`?mode=${mode}`:""}`); renderAnalytics(d); }
+  catch(e){ toast(e.message,"bad"); }
+}
+$("an-refresh").onclick=loadAnalytics; $("an-mode").onchange=loadAnalytics;
+function anRows(obj){ const e=Object.entries(obj||{}); if(!e.length) return `<tr><td colspan="4" class="empty">no data</td></tr>`;
+  return e.sort((a,b)=>b[1].n-a[1].n).map(([k,v])=>`<tr><td>${esc(k)}</td><td class="r">${v.n}</td>
+    <td class="r ${v.win_rate>=0.5?'pnl-pos':''}">${fmt.pct(v.win_rate,0)}</td>
+    <td class="r ${pnlCls(v.pnl)}">${fmt.signed(v.pnl,2)}</td></tr>`).join(""); }
+function renderAnalytics(d){
+  const s=d.summary||{trades:0};
+  const div=S?.divergence; let dt="";
+  if(div){ if(div.status==="gathering") dt=` · divergence: gathering (${div.live_trades} live trades)`;
+    else dt=` · live WR ${fmt.pct(div.live_win_rate,0)}${div.expected_win_rate!=null?` vs backtest ${fmt.pct(div.expected_win_rate,0)}`:""} ${div.diverged?"⚠ DIVERGED":"✓ on track"}`; }
+  $("an-count").innerHTML=`${s.trades||0} journaled trades<span style="color:${div?.diverged?'var(--bad)':'var(--muted)'}">${esc(dt)}</span>`
+    +(S?.alerts_on?` · <span style="color:var(--good)">alerts on</span>`:"");
+  $("an-cards").innerHTML=!s.trades?`<div class="empty" style="grid-column:1/-1">No journaled trades yet — they accrue as paper/live trades close.</div>`:[
+    ["Win rate",fmt.pct(s.win_rate),s.win_rate>=0.5?"pnl-pos":""],
+    ["Profit factor",(s.profit_factor||0).toFixed(2),s.profit_factor>=1?"pnl-pos":"pnl-neg"],
+    ["Trades",s.trades],["Net PnL",fmt.signed(s.pnl,2),pnlCls(s.pnl)],
+  ].map(([k,v,cls])=>`<div class="card"><div class="k">${k}</div><div class="v ${cls??""}">${v}</div></div>`).join("");
+  $("an-align").innerHTML=anRows(s.by_alignment); $("an-regime").innerHTML=anRows(s.by_regime);
+  $("an-desk").innerHTML=anRows(s.by_desk); $("an-exit").innerHTML=anRows(s.by_exit);
+  $("an-hour").innerHTML=anRows(s.by_hour); $("an-side").innerHTML=anRows(s.by_side);
+}
 
 initCharts(); connectWS();
 setInterval(()=>{ if(S?.engine) refreshCandles(false); },5000);

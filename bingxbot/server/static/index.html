@@ -111,7 +111,9 @@
       <button class="tab" data-tab="trades">Trades</button>
       <button class="tab" data-tab="backtest">Backtest</button>
       <button class="tab" data-tab="portfolio">Portfolio</button>
+      <button class="tab" data-tab="walkforward">Walk-Fwd</button>
       <button class="tab" data-tab="optimizer">Optimizer</button>
+      <button class="tab" data-tab="analytics">Analytics</button>
       <button class="tab" data-tab="autotuner">Auto-Tuner</button>
       <button class="tab" data-tab="settings">Settings</button>
     </div>
@@ -185,6 +187,28 @@
       </div>
     </div>
 
+    <div class="tab-page" data-page="walkforward">
+      <p class="foot-note" style="margin-top:0"><b>The honest test.</b> History is split into sequential folds; each fold is traded <b>once, out-of-sample</b>, with parameters tuned only on the data <i>before</i> it — equity chained fold to fold. No peeking, no in-sample flattery. If the edge survives here, it's real; if it doesn't, no feature will save it.</p>
+      <div class="form-row">
+        <div class="ff"><label>Symbol</label><input class="field" id="wf-symbol" value="BTC-USDT"></div>
+        <div class="ff"><label>Interval</label><select class="btn" id="wf-interval">
+          <option>1m</option><option>3m</option><option selected>5m</option><option>15m</option><option>30m</option><option>1h</option></select></div>
+        <div class="ff"><label>Days back</label><input class="field" id="wf-days" type="number" value="90" min="10" max="365"></div>
+        <div class="ff"><label>Folds</label><input class="field" id="wf-folds" type="number" value="5" min="3" max="10"></div>
+        <div class="ff"><label>Trials/fold</label><input class="field" id="wf-trials" type="number" value="20" min="5" max="120"></div>
+        <label class="check"><input type="checkbox" id="wf-synth"> synthetic</label>
+        <button class="btn primary" id="wf-run">Run walk-forward</button>
+      </div>
+      <div class="progress" id="wf-progress"><div class="bar"></div></div>
+      <div id="wf-results" style="display:none">
+        <div class="cards" id="wf-cards"></div>
+        <div><div class="subt">Out-of-sample equity — chained across folds</div><div id="chart-wf-equity"></div></div>
+        <div class="subt" style="margin-top:12px">Per-fold (each traded out-of-sample)</div>
+        <table class="tbl"><thead><tr><th>Fold</th><th class="r">OOS return</th><th class="r">WR</th><th class="r">PF</th><th class="r">Trades</th><th class="r">Max DD</th><th class="r">Tuned</th></tr></thead>
+        <tbody id="wf-body"></tbody></table>
+      </div>
+    </div>
+
     <div class="tab-page" data-page="optimizer">
       <p class="foot-note" style="margin-top:0">Random search over strategy + exit params, trained on the first 70% and ranked on the held-out 30% so overfit sets fall away. This is what the Auto-Tuner runs automatically in the background — here you can drive it by hand and apply a winner.</p>
       <div class="form-row">
@@ -201,6 +225,24 @@
         <div style="overflow:auto"><table class="tbl"><thead><tr>
           <th>#</th><th class="r">Fit (valid)</th><th class="r">WR</th><th class="r">PF</th><th class="r">Trades</th><th class="r">Fit (train)</th><th>Params</th><th></th>
         </tr></thead><tbody id="op-body"></tbody></table></div>
+      </div>
+    </div>
+
+    <div class="tab-page" data-page="analytics">
+      <p class="foot-note" style="margin-top:0">Where the edge actually is — every closed paper/live trade, sliced by the context it was taken in. This is journal-backed and survives restarts, so a multi-day run turns into "we win with the 1h trend and bleed fading ranges at hour 14," not a vibe.</p>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+        <button class="btn sm" id="an-refresh">Refresh</button>
+        <select class="btn sm" id="an-mode"><option value="">all modes</option><option value="paper">paper</option><option value="live">live</option></select>
+        <span class="foot-note" id="an-count" style="margin:0"></span>
+      </div>
+      <div class="cards" id="an-cards"></div>
+      <div class="an-grid">
+        <div><div class="subt">By higher-TF alignment</div><table class="tbl"><thead><tr><th>Bucket</th><th class="r">N</th><th class="r">WR</th><th class="r">PnL</th></tr></thead><tbody id="an-align"></tbody></table></div>
+        <div><div class="subt">By regime</div><table class="tbl"><thead><tr><th>Regime</th><th class="r">N</th><th class="r">WR</th><th class="r">PnL</th></tr></thead><tbody id="an-regime"></tbody></table></div>
+        <div><div class="subt">By dominant desk</div><table class="tbl"><thead><tr><th>Desk</th><th class="r">N</th><th class="r">WR</th><th class="r">PnL</th></tr></thead><tbody id="an-desk"></tbody></table></div>
+        <div><div class="subt">By exit reason</div><table class="tbl"><thead><tr><th>Exit</th><th class="r">N</th><th class="r">WR</th><th class="r">PnL</th></tr></thead><tbody id="an-exit"></tbody></table></div>
+        <div><div class="subt">By hour (UTC)</div><table class="tbl"><thead><tr><th>Hour</th><th class="r">N</th><th class="r">WR</th><th class="r">PnL</th></tr></thead><tbody id="an-hour"></tbody></table></div>
+        <div><div class="subt">By side</div><table class="tbl"><thead><tr><th>Side</th><th class="r">N</th><th class="r">WR</th><th class="r">PnL</th></tr></thead><tbody id="an-side"></tbody></table></div>
       </div>
     </div>
 

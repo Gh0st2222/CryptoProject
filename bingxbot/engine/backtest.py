@@ -414,6 +414,102 @@ def run_portfolio_backtest(
     }
 
 
+# ------------------------------------------------------- walk-forward (honest)
+
+def run_walkforward(
+    candles: list[Candle],
+    symbol: str,
+    interval: str,
+    strat: StrategyConfig,
+    risk_cfg: RiskConfig,
+    spec: ContractSpec | None = None,
+    starting_balance: float = 10_000.0,
+    taker_fee: float = 0.0005,
+    slippage_bps: float = 1.5,
+    folds: int = 5,
+    trials: int = 20,
+    progress_cb=None,
+) -> dict:
+    """The honest test. Split history into sequential folds; for each fold, tune
+    parameters using ONLY the data before it, then trade that fold once,
+    out-of-sample, with those frozen params — chaining equity fold to fold. The
+    result is what you'd actually have earned walking the strategy forward through
+    time, params and all, with no peeking. In-sample backtests flatter; this does
+    not."""
+    spec = spec or ContractSpec(symbol)
+    n = len(candles)
+    if n < folds * 1200:
+        return {"error": f"walk-forward needs ~{folds * 1200}+ bars, got {n}"}
+    fold_size = n // folds
+    equity = starting_balance
+    curve: list = []
+    per_fold: list[dict] = []
+    all_trades: list[dict] = []
+    steps = folds - 1
+
+    for i in range(1, folds):
+        train = candles[: i * fold_size]
+        lo = i * fold_size
+        hi = n if i == folds - 1 else (i + 1) * fold_size
+        test = candles[lo:hi]
+        # choose params from the PAST only (train/valid split lives inside)
+        opt = run_optimizer(train, symbol, interval, strat, risk_cfg, spec,
+                            taker_fee, slippage_bps, n_trials=trials)
+        best = opt.get("best")
+        if best and best.get("params"):
+            s, r = _apply_params(strat, risk_cfg, best["params"])
+            params_used = best["params"]
+        else:
+            s, r, params_used = strat, risk_cfg, {}
+        prev_equity = equity
+        res = run_backtest(test, symbol, interval, s, r, spec, starting_balance=prev_equity,
+                           taker_fee=taker_fee, slippage_bps=slippage_bps, collect_series=True)
+        st = res.get("stats", {})
+        equity = st.get("equity", prev_equity)
+        curve.extend(res.get("equity_curve", []))
+        all_trades.extend(res.get("trades", []))
+        per_fold.append({
+            "fold": i, "train_bars": len(train), "test_bars": len(test),
+            "start_ts": res.get("start_ts"), "end_ts": res.get("end_ts"),
+            "trades": st.get("trades", 0), "win_rate": st.get("win_rate", 0.0),
+            "profit_factor": st.get("profit_factor", 0.0),
+            "return_pct": round((equity / prev_equity - 1) * 100, 2) if prev_equity > 0 else 0.0,
+            "max_drawdown": st.get("max_drawdown", 0.0),
+            "tuned": bool(params_used),
+        })
+        if progress_cb:
+            progress_cb(i / steps)
+
+    if len(curve) > 2000:
+        step = len(curve) / 2000.0
+        curve = [curve[int(k * step)] for k in range(2000)] + [curve[-1]]
+    wins = sum(1 for t in all_trades if t["pnl"] > 0)
+    gross_w = sum(t["pnl"] for t in all_trades if t["pnl"] > 0)
+    gross_l = -sum(t["pnl"] for t in all_trades if t["pnl"] <= 0)
+    ntr = len(all_trades)
+    curve_vals = [e for _, e in curve] or [starting_balance]
+    peak, max_dd = curve_vals[0], 0.0
+    for e in curve_vals:
+        peak = max(peak, e)
+        if peak > 0:
+            max_dd = max(max_dd, (peak - e) / peak)
+    return {
+        "symbol": symbol,
+        "interval": interval,
+        "folds": folds,
+        "starting_balance": starting_balance,
+        "final_equity": round(equity, 4),
+        "oos_return_pct": round((equity / starting_balance - 1) * 100, 2),
+        "oos_trades": ntr,
+        "oos_win_rate": round(wins / ntr, 4) if ntr else 0.0,
+        "oos_profit_factor": round(gross_w / gross_l, 3) if gross_l > 0 else (999.0 if gross_w > 0 else 0.0),
+        "oos_max_drawdown": round(max_dd, 4),
+        "equity_curve": curve,
+        "per_fold": per_fold,
+        "note": "out-of-sample: every fold traded with params tuned only on prior data",
+    }
+
+
 # --------------------------------------------------------------- optimizer
 
 # The full auto-owned parameter space the tuner searches. User-owned settings
