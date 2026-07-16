@@ -189,6 +189,31 @@ sin of a trend system, shorting into an uptrend (or buying a downtrend). It is a
 structural gate, not a tuned parameter, so the auto-tuner can never optimize it
 away, and range-fading is no longer in the tuner's search space at all.
 
+## Evidence & capital protection
+
+Features don't make an unproven strategy profitable — evidence and discipline do,
+so a whole layer exists to expose the real edge and defend the account:
+
+- **Persistent trade journal.** Every closed trade is written to disk with the
+  context it was taken under (regime, the 1m/5m/15m/1h ladder, edge, P(win),
+  dominant desk, funding, exit reason, hour). It survives restarts.
+- **Analytics tab.** Slices that journal — win rate and PnL by regime, by
+  higher-TF alignment, by hour, by desk, by exit reason, by side — so the edge is
+  something you *see*, not guess.
+- **Honest walk-forward.** The Walk-Fwd tab splits real history into sequential
+  folds and trades each one **out-of-sample**, with parameters tuned only on the
+  data *before* it, equity chained fold to fold. It is deliberately unflattering.
+- **True maker entries in live.** Live now rests **post-only limit** orders
+  (maker fee ~0.02%) instead of taking (~0.05%); if a fill doesn't come in the
+  window it abandons the entry rather than chase — matching what the backtest
+  models, so live fees stop silently eating the edge.
+- **Funding-aware** entries (a marginal edge into adverse funding is skipped) and
+  **exposure control** (correlation haircut + a net directional cap so it can't
+  double the same bet across symbols).
+- **Divergence monitor + optional alerts.** Live win rate / profit factor are
+  compared to the backtest expectation and flagged when they drift; set
+  `BOT_ALERT_WEBHOOK` to get a push on kill-switch, daily summary, or divergence.
+
 ## Data intake ("not a bit escapes it")
 
 Live mode ingests klines (a true 1m/5m/15m/1h indicator ladder), the full trade
@@ -279,9 +304,10 @@ bingxbot/
 │   ├── portfolio.py        accounting + stats
 │   ├── brokers.py          PaperBroker / LiveBroker (one interface)
 │   ├── trader.py           realtime decision loop + execution pipeline
-│   ├── backtest.py         event-driven per-symbol simulator + portfolio (shared account) + optimizer
+│   ├── backtest.py         per-symbol simulator + portfolio + optimizer + honest walk-forward
+│   ├── journal.py          persistent trade journal (JSONL + decision context) -> analytics
 │   └── autotuner.py        background self-tuning research desk (runs in the process pool)
-└── server/                 FastAPI + split WebSocket + process pool + the terminal (vendored charts)
+└── server/                 FastAPI + split WebSocket + process pool + alerts + the terminal
 ```
 
 ## Configuration

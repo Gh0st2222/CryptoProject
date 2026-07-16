@@ -243,6 +243,8 @@ input.field { width: 100%; font-family: var(--mono); }
 @media (max-width: 900px) { #bt-charts { grid-template-columns: 1fr; } }
 #chart-bt-equity, #chart-bt-alloc { height: 220px; }
 #chart-pf-equity { height: 240px; }
+#chart-wf-equity { height: 240px; }
+.an-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; margin-top: 10px; }
 
 /* multi-timeframe ladder strip */
 .mtf-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin: 2px 0 4px; }

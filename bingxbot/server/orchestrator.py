@@ -15,8 +15,9 @@ from ..config import (ROOT, BotConfig, FEED_SYNTHETIC, MODE_IDLE, MODE_LIVE, MOD
                       config_public_dict, load_config, save_config, update_config)
 from ..data.feed import BaseFeed, LiveFeed, SyntheticFeed
 from ..data.history import HistoryStore, synthetic_candles
-from ..engine.backtest import run_backtest, run_optimizer, run_portfolio_backtest
+from ..engine.backtest import run_backtest, run_optimizer, run_portfolio_backtest, run_walkforward
 from ..engine.brokers import LiveBroker, PaperBroker
+from ..engine.journal import TradeJournal
 from ..engine.portfolio import Portfolio
 from ..engine.trader import TraderEngine
 from ..exchange.errors import BingXError
@@ -51,6 +52,58 @@ def _clean_symbol(raw) -> str:
     return lst[0] if lst else ""
 
 
+class Alerter:
+    """Optional push alerts to a webhook (Slack/Discord/Telegram-bridge/etc.).
+    URL comes from BOT_ALERT_WEBHOOK; with none set every method is a no-op, so
+    this never adds a dependency or a failure mode to trading."""
+
+    def __init__(self) -> None:
+        self.url = os.getenv("BOT_ALERT_WEBHOOK", "").strip()
+        self._killed = False
+        self._daily_key = ""
+        self._diverged = False
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.url)
+
+    async def _post(self, text: str) -> None:
+        if not self.url:
+            return
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as s:
+                await s.post(self.url, json={"text": text},
+                             timeout=aiohttp.ClientTimeout(total=8))
+        except Exception as e:  # noqa: BLE001 - alerts must never break the bot
+            log.debug("alert post failed: %s", e)
+
+    async def check(self, mode: str, engine, divergence: dict | None) -> None:
+        if engine is None:
+            return
+        killed = bool(engine.risk.state.killed)
+        if killed and not self._killed:
+            await self._post(f"⛔ KILL SWITCH engaged ({engine.risk.state.kill_reason or 'daily loss'}). "
+                             f"Positions flattened, entries halted.")
+        self._killed = killed
+        if divergence and divergence.get("diverged") and not self._diverged:
+            await self._post(f"⚠️ Live diverging from backtest: win rate "
+                             f"{divergence.get('live_win_rate', 0):.0%} vs expected "
+                             f"{divergence.get('expected_win_rate', 0):.0%} over "
+                             f"{divergence.get('live_trades', 0)} trades.")
+        self._diverged = bool(divergence and divergence.get("diverged"))
+        # once-a-day summary
+        import datetime
+        key = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+        if key != self._daily_key:
+            if self._daily_key:  # skip the very first (startup) tick
+                st = engine.portfolio.stats()
+                await self._post(f"📊 Daily [{mode}] equity {st.get('equity', 0):,.2f} · "
+                                 f"{st.get('trades', 0)} trades · WR {st.get('win_rate', 0):.0%} · "
+                                 f"PF {st.get('profit_factor', 0):.2f}")
+            self._daily_key = key
+
+
 class Job:
     def __init__(self, kind: str):
         self.id = uuid.uuid4().hex[:12]
@@ -83,6 +136,9 @@ class Orchestrator:
         self.pool = None            # ProcessPoolExecutor, created lazily
         self._pool_tried = False
         self.champions: list[dict] = self._load_champions()
+        self.journal = TradeJournal()
+        self.alerter = Alerter()
+        self._alert_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------- CPU offload
 
@@ -143,6 +199,40 @@ class Orchestrator:
             CHAMPIONS_PATH.write_text(json.dumps(self.champions, indent=2))
         except OSError as e:
             log.warning("could not save champions: %s", e)
+
+    # ------------------------------------------------- divergence & alerts
+
+    def _divergence(self) -> dict | None:
+        """Compare live realized performance with the backtest expectation (the
+        best champion's stats). Flags when live materially underperforms — the
+        early-warning that the edge has stopped working, not just a bad day."""
+        if self.engine is None:
+            return None
+        live = self.engine.portfolio.stats()
+        d: dict = {"live_win_rate": live.get("win_rate", 0.0),
+                   "live_profit_factor": live.get("profit_factor", 0.0),
+                   "live_trades": live.get("trades", 0)}
+        ref = self.champions[0] if self.champions else None
+        if ref:
+            d["expected_win_rate"] = ref.get("win_rate", 0.0)
+            d["expected_profit_factor"] = ref.get("profit_factor", 0.0)
+            d["win_rate_gap"] = round(live.get("win_rate", 0.0) - ref.get("win_rate", 0.0), 3)
+        if live.get("trades", 0) < 12:
+            d["status"] = "gathering"
+            d["diverged"] = False
+        else:
+            d["status"] = "tracking"
+            d["diverged"] = bool(live.get("profit_factor", 0.0) < 0.9
+                                 or (ref and d.get("win_rate_gap", 0.0) < -0.15))
+        return d
+
+    async def _alert_loop(self) -> None:
+        while self.engine is not None:
+            try:
+                await self.alerter.check(self.mode, self.engine, self._divergence())
+            except Exception as e:  # noqa: BLE001
+                log.debug("alert check failed: %s", e)
+            await asyncio.sleep(30)
 
     # ---------------------------------------------------------------- events
 
@@ -261,14 +351,23 @@ class Orchestrator:
         async def on_update(kind: str) -> None:
             await self._notify(kind)
 
-        self.engine = TraderEngine(self.cfg, feed, broker, portfolio, risk, self.specs, on_update)
+        self.engine = TraderEngine(self.cfg, feed, broker, portfolio, risk, self.specs,
+                                   on_update, journal=self.journal)
         await self.engine.start()
 
         from ..engine.autotuner import AutoTuner
         self.autotuner = AutoTuner(self)
         self.autotuner.start()
+        self._alert_task = asyncio.create_task(self._alert_loop(), name="alert-loop")
 
     async def _stop_engine(self) -> None:
+        if self._alert_task is not None:
+            self._alert_task.cancel()
+            try:
+                await self._alert_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._alert_task = None
         if self.autotuner is not None:
             await self.autotuner.stop()
             self.autotuner = None
@@ -394,6 +493,36 @@ class Orchestrator:
         asyncio.get_running_loop().create_task(runner())
         return job
 
+    def start_walkforward(self, symbol: str, interval: str, days: float,
+                          folds: int = 5, trials: int = 20, synthetic: bool = False) -> Job:
+        symbol = _clean_symbol(symbol) or "BTC-USDT"
+        job = Job("walkforward")
+        self.jobs[job.id] = job
+
+        async def runner() -> None:
+            try:
+                candles = await self._get_backtest_candles(symbol, interval, days, synthetic, job)
+                if len(candles) < folds * 1200:
+                    raise ValueError(f"walk-forward needs ~{folds * 1200}+ bars, got {len(candles)}")
+                job.progress = 0.4
+                await self._notify("job")
+                spec = self.specs.get(symbol, ContractSpec(symbol))
+                result = await self.run_cpu(
+                    run_walkforward, candles, symbol, interval,
+                    self.cfg.strategy, self.cfg.risk, spec,
+                    self.cfg.paper.starting_balance, spec.taker_fee,
+                    self.cfg.paper.slippage_bps, folds, trials, None,
+                )
+                job.result = result
+                job.progress = 1.0
+            except Exception as e:  # noqa: BLE001
+                log.exception("walk-forward job failed")
+                job.error = str(e)
+            await self._notify("job")
+
+        asyncio.get_running_loop().create_task(runner())
+        return job
+
     def start_portfolio_backtest(self, symbols: list[str], interval: str, days: float,
                                  synthetic: bool = False) -> Job:
         """Backtest several symbols on ONE shared account (diversified sizing,
@@ -459,6 +588,9 @@ class Orchestrator:
             d["autotuner"] = self.autotuner.snapshot()
         if self.champions:
             d["champions"] = self.champions[:CHAMPIONS_KEEP]
+        if self.engine is not None:
+            d["divergence"] = self._divergence()
+            d["alerts_on"] = self.alerter.enabled
         return d
 
     def hot(self) -> dict:

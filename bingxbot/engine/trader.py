@@ -47,6 +47,9 @@ class SymbolCtx:
         self.stage_ts = 0
         self.eval_ms = 0.0
         self.react_ts = 0             # last reactive intra-bar scan (ms)
+        self.react_dir = 0            # sign of the last reactive signal (confirmation)
+        self.react_confirm = 0        # consecutive scans agreeing on direction
+        self.entry_ctx: dict = {}     # decision context captured at the open (for the journal)
         self.busy = False  # guards against overlapping broker calls
 
     def set_stage(self, stage: str) -> None:
@@ -56,7 +59,7 @@ class SymbolCtx:
 
 class TraderEngine:
     def __init__(self, cfg: BotConfig, feed: BaseFeed, broker: Broker, portfolio: Portfolio,
-                 risk: RiskManager, specs: dict[str, ContractSpec], on_update=None):
+                 risk: RiskManager, specs: dict[str, ContractSpec], on_update=None, journal=None):
         self.cfg = cfg
         self.feed = feed
         self.broker = broker
@@ -65,6 +68,7 @@ class TraderEngine:
         self.specs = specs
         self.exits = AdaptiveExitManager(cfg.risk)
         self.on_update = on_update  # async callback(kind: str) -> None
+        self.journal = journal      # TradeJournal (records closed trades + context)
         s = cfg.strategy
         bars_per_hour = 3_600_000 / max(1, self._interval_ms())
         self.ctx: dict[str, SymbolCtx] = {
@@ -183,6 +187,7 @@ class TraderEngine:
         row = ff.row(-1)
         micro = st.micro_snapshot()
         data_ctx = st.context_snapshot()
+        row["funding_rate"] = data_ctx.get("funding_rate") or 0.0
         ev = ctx.brain.evaluate(row, micro, data_ctx)
         ctx.eval_ms = (time.perf_counter() - t0) * 1000.0
         ctx.last_row = row
@@ -252,10 +257,22 @@ class TraderEngine:
             return
         kelly = ctx.brain.kelly_size_mult(p_win, self.risk.payoff_ratio(style)) if self.cfg.strategy.use_kelly else 1.0
         size_mult = kelly * self.risk.health.scalar
+        # correlation haircut: shrink a same-direction add across symbols (BTC/ETH
+        # move together — don't quietly double the same directional bet).
+        side_d = 1 if side == LONG else -1
+        others = [p for s, p in self.portfolio.positions.items() if s != symbol]
+        if any(p.direction() == side_d for p in others):
+            size_mult *= self.cfg.risk.correlation_haircut
         ctx.set_stage("SIZE")
         sized = self.risk.size_entry(equity, price, bracket.init_risk, side, spec, size_mult)
         if sized is None:
             ctx.last_entry_block = "size below exchange minimum"
+            return
+        # net directional exposure cap across the whole account
+        same_dir_notional = sum(p.qty * (marks.get(p.symbol, p.entry_price) or p.entry_price)
+                                for p in others if p.direction() == side_d)
+        if equity > 0 and (same_dir_notional + sized.qty * price) > equity * self.cfg.risk.max_net_exposure:
+            ctx.last_entry_block = "net exposure cap"
             return
         sized.stop_price = bracket.stop
         sized.take_profit = bracket.take_profit
@@ -268,10 +285,29 @@ class TraderEngine:
             if pos is not None:
                 pos.style = style
                 self.exits.attach(pos, row.get("atr", 0.0), bracket.init_risk)
+            ctx.entry_ctx = self._entry_context(ctx, ev, row)
             self._push_tape(symbol, "OPEN", side, res.filled_price,
                             {"p_win": round(p_win, 3), "edge": round(edge, 3)})
             if self.on_update:
                 await self.on_update("trade")
+
+    @staticmethod
+    def _entry_context(ctx: SymbolCtx, ev: dict, row: dict) -> dict:
+        """Snapshot the decision context at the open, for the trade journal."""
+        alloc = ev.get("alloc", {})
+        desk_sig = ev.get("desk_sig", {})
+        # dominant desk = biggest signed contribution to the fused edge
+        desk = max(alloc, key=lambda d: abs(alloc.get(d, 0.0) * desk_sig.get(d, 0.0)), default="")
+        return {
+            "regime": ev.get("regime", ""),
+            "edge": round(ev.get("edge", 0.0), 4),
+            "p_win": round(ev.get("p_win", 0.0), 4),
+            "mtf_align": round(row.get("mtf_align", 0.0), 4),
+            "mtf_bias": round(row.get("mtf_bias", 0.0), 4),
+            "mtf": dict(ctx.mtf),
+            "desk": desk,
+            "funding_rate": round(row.get("funding_rate", 0.0), 6),
+        }
 
     @staticmethod
     def _block_reason(brain, edge, p_win, row, ev, fees_rt, spread, slip) -> str:
@@ -331,11 +367,29 @@ class TraderEngine:
         t0 = time.perf_counter()
         ff = FeatureFrame(st.candles.arrays_live(min(n + 1, FEATURE_TAIL)), interval=self.cfg.strategy.interval)
         row = ff.row(-1)
+        data_ctx = st.context_snapshot()
+        row["funding_rate"] = data_ctx.get("funding_rate") or 0.0
         micro = st.micro_snapshot()
-        ev = ctx.brain.score(row, micro, st.context_snapshot())   # score only, no learning
+        ev = ctx.brain.score(row, micro, data_ctx)   # score only, no learning
         ctx.eval_ms = (time.perf_counter() - t0) * 1000.0
         ctx.last_row, ctx.last_eval = row, ev
         ctx.mtf = mtf_from_row(row, ff.ladder)
+
+        # confirmation buffer: an intra-bar signal must persist in the same
+        # direction across a few scans before we act, so a transient tick that
+        # crosses threshold and immediately reverses can't trigger a whipsaw entry.
+        edge, thr = ev["edge"], ev.get("threshold", 0.3)
+        sig_dir = (1 if edge > 0 else -1) if abs(edge) >= thr else 0
+        if sig_dir != 0 and sig_dir == ctx.react_dir:
+            ctx.react_confirm += 1
+        else:
+            ctx.react_dir = sig_dir
+            ctx.react_confirm = 1 if sig_dir != 0 else 0
+        if sig_dir == 0 or ctx.react_confirm < max(1, self.cfg.strategy.entry_confirm_scans):
+            if sig_dir != 0:
+                ctx.last_entry_block = f"confirming {ctx.react_confirm}/{self.cfg.strategy.entry_confirm_scans}"
+            return
+
         ctx.busy = True
         try:
             await self._try_enter(ctx, st, row, ev)
@@ -355,10 +409,36 @@ class TraderEngine:
                 t = trades[-1]
                 self._push_tape(symbol, "CLOSE", t.side, t.exit_price,
                                 {"pnl": round(t.pnl, 4), "reason": reason})
+                self._journal_trade(t, ctx.entry_ctx if ctx else {}, ctx.bars_held if ctx else 0)
             if ctx:
                 ctx.bars_held = 0
+                ctx.entry_ctx = {}
             if self.on_update:
                 await self.on_update("trade")
+
+    def _journal_trade(self, t, entry_ctx: dict, bars_held: int) -> None:
+        if self.journal is None:
+            return
+        import datetime
+        try:
+            hour = datetime.datetime.utcfromtimestamp(t.entry_ts / 1000).hour
+        except (OverflowError, OSError, ValueError):
+            hour = -1
+        row = {
+            "ts": t.exit_ts, "symbol": t.symbol, "side": t.side, "qty": t.qty,
+            "entry": t.entry_price, "exit": t.exit_price, "pnl": round(t.pnl, 6),
+            "r": t.r_multiple, "fees": round(t.fees, 6), "bars_held": bars_held,
+            "reason_open": t.reason_open, "reason_close": t.reason_close, "mode": t.mode,
+            "hour": hour,
+            "regime": entry_ctx.get("regime", ""), "edge": entry_ctx.get("edge", 0.0),
+            "p_win": entry_ctx.get("p_win", 0.0), "mtf_align": entry_ctx.get("mtf_align", 0.0),
+            "mtf_bias": entry_ctx.get("mtf_bias", 0.0), "desk": entry_ctx.get("desk", ""),
+            "funding_rate": entry_ctx.get("funding_rate", 0.0), "mtf": entry_ctx.get("mtf", {}),
+        }
+        try:
+            self.journal.record(row)
+        except Exception as e:  # noqa: BLE001 - journaling must never break trading
+            log.warning("journal record failed: %s", e)
 
     # ------------------------------------------------------------ snapshots
 

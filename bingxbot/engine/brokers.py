@@ -158,17 +158,31 @@ class LiveBroker(Broker):
         await self.prepare_symbol(symbol)
         await self._ensure_leverage(symbol, side, sized.leverage)
         spec = self.specs.get(symbol, ContractSpec(symbol))
+        if self.cfg.strategy.entry_mode == "maker":
+            # rest a post-only limit to pay the maker fee (~0.02%) instead of taker
+            # (~0.05%) — on a fast strategy that halved round-trip cost is often the
+            # difference between a live edge and a loss. If it doesn't fill in the
+            # window we abort and let the next scan re-decide (no taker chasing).
+            r = await self._open_maker(symbol, side, sized, reason, bar_ts, spec)
+            if r is not None:
+                return r
+        return await self._open_taker(symbol, side, sized, reason, bar_ts, spec)
+
+    def _sl_tp(self, sized: SizedOrder) -> tuple[dict, dict | None]:
         wt = "MARK_PRICE"
+        sl = {"type": "STOP_MARKET", "stopPrice": sized.stop_price, "workingType": wt}
+        tp = ({"type": "TAKE_PROFIT_MARKET", "stopPrice": sized.take_profit, "workingType": wt}
+              if sized.take_profit > 0 else None)
+        return sl, tp
+
+    async def _open_taker(self, symbol: str, side: str, sized: SizedOrder,
+                          reason: str, bar_ts: int, spec: ContractSpec) -> OrderResult:
+        sl, tp = self._sl_tp(sized)
         try:
             resp = await self.rest.place_order(
-                symbol=symbol,
-                side=BUY if side == LONG else SELL,
-                position_side=side,
-                order_type="MARKET",
-                quantity=sized.qty,
-                client_order_id=f"bxb{uuid.uuid4().hex[:12]}",
-                stop_loss={"type": "STOP_MARKET", "stopPrice": sized.stop_price, "workingType": wt},
-                take_profit={"type": "TAKE_PROFIT_MARKET", "stopPrice": sized.take_profit, "workingType": wt},
+                symbol=symbol, side=BUY if side == LONG else SELL, position_side=side,
+                order_type="MARKET", quantity=sized.qty,
+                client_order_id=f"bxb{uuid.uuid4().hex[:12]}", stop_loss=sl, take_profit=tp,
             )
         except (BingXAPIError, BingXError) as e:
             log.error("live OPEN %s %s failed: %s", side, symbol, e)
@@ -184,10 +198,84 @@ class LiveBroker(Broker):
             entry_fee=fee, entry_reason=reason, entry_bar_ts=bar_ts,
         )
         self.portfolio.open_position(pos, fee)
-        log.info("[LIVE] OPEN %s %s qty=%.6g @ %.6g sl=%.6g tp=%.6g id=%s (%s)",
+        log.info("[LIVE] TAKER OPEN %s %s qty=%.6g @ %.6g sl=%.6g tp=%.6g id=%s (%s)",
                  side, symbol, sized.qty, fill_px, sized.stop_price, sized.take_profit, order_id, reason)
         return OrderResult(ok=True, order_id=order_id, filled_price=fill_px,
                            filled_qty=sized.qty, fee=fee, raw=resp if isinstance(resp, dict) else {})
+
+    async def _open_maker(self, symbol: str, side: str, sized: SizedOrder,
+                          reason: str, bar_ts: int, spec: ContractSpec) -> OrderResult | None:
+        """Place a post-only limit inside the touch and wait for a fill. Returns
+        an OrderResult on fill/hard-error, or None to signal 'unfilled — caller
+        may fall through' (we abort rather than chase)."""
+        ref = sized.notional / max(sized.qty, 1e-12)
+        off = self.cfg.strategy.maker_offset_bps / 10_000.0
+        d = 1 if side == LONG else -1
+        limit = round_step(ref * (1 - d * off), spec.price_precision)   # below for a buy, above for a sell
+        qty = round_step(sized.qty, spec.qty_precision)
+        if limit <= 0 or qty <= 0:
+            return None
+        sl, tp = self._sl_tp(sized)
+        try:
+            resp = await self.rest.place_order(
+                symbol=symbol, side=BUY if side == LONG else SELL, position_side=side,
+                order_type="LIMIT", quantity=qty, price=limit, time_in_force="PostOnly",
+                client_order_id=f"bxm{uuid.uuid4().hex[:11]}", stop_loss=sl, take_profit=tp,
+            )
+        except (BingXAPIError, BingXError) as e:
+            log.warning("live MAKER place %s %s failed (%s) — will try taker", side, symbol, e)
+            return None
+        order_id = str(resp.get("orderId", ""))
+        fill_px, filled_qty, fee = await self._await_limit_fill(symbol, order_id)
+        if filled_qty <= 0:
+            try:
+                await self.rest.cancel_order(symbol, order_id)
+            except BingXError:
+                pass
+            log.info("[LIVE] maker %s %s unfilled @ %.6g — aborting entry", side, symbol, limit)
+            return OrderResult(ok=False, error="maker unfilled")
+        if fee <= 0:
+            fee = filled_qty * fill_px * spec.maker_fee
+        pos = Position(
+            symbol=symbol, side=side, qty=filled_qty, entry_price=fill_px,
+            opened_ts=now_ms(), leverage=sized.leverage,
+            stop_price=sized.stop_price, take_profit=sized.take_profit,
+            entry_fee=fee, entry_reason=reason, entry_bar_ts=bar_ts,
+        )
+        self.portfolio.open_position(pos, fee)
+        log.info("[LIVE] MAKER OPEN %s %s qty=%.6g @ %.6g (limit %.6g) id=%s (%s)",
+                 side, symbol, filled_qty, fill_px, limit, order_id, reason)
+        return OrderResult(ok=True, order_id=order_id, filled_price=fill_px,
+                           filled_qty=filled_qty, fee=fee, raw=resp if isinstance(resp, dict) else {})
+
+    async def _await_limit_fill(self, symbol: str, order_id: str) -> tuple[float, float, float]:
+        """Poll a resting maker order for a fill within the wait window. Returns
+        (avg_price, filled_qty, fee); filled_qty 0 => never filled."""
+        polls = max(2, self.cfg.strategy.maker_wait_bars * 4)   # ~1.5s each
+        for _ in range(polls):
+            await asyncio.sleep(1.5)
+            try:
+                o = await self.rest.get_order(symbol, order_id)
+            except BingXError as e:
+                log.warning("maker fill poll %s: %s", order_id, e)
+                continue
+            status = str(o.get("status", "")).upper()
+            exec_qty = safe_float(o.get("executedQty") or o.get("cumQty"))
+            if status == "FILLED":
+                ap = safe_float(o.get("avgPrice") or o.get("averagePrice"))
+                return ap, exec_qty, abs(safe_float(o.get("commission") or o.get("fee")))
+            if status in ("CANCELED", "EXPIRED", "REJECTED"):
+                return 0.0, 0.0, 0.0
+        # window elapsed — take any partial fill, cancel the remainder
+        try:
+            o = await self.rest.get_order(symbol, order_id)
+            exec_qty = safe_float(o.get("executedQty") or o.get("cumQty"))
+            if exec_qty > 0:
+                await self.rest.cancel_order(symbol, order_id)
+                return safe_float(o.get("avgPrice")), exec_qty, abs(safe_float(o.get("commission")))
+        except BingXError:
+            pass
+        return 0.0, 0.0, 0.0
 
     async def close_position(self, symbol: str, reason: str) -> OrderResult:
         pos = self.portfolio.positions.get(symbol)

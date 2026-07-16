@@ -30,16 +30,23 @@ REGIME_EXIT_MULT: dict[str, dict[str, float]] = {
 
 
 def detect_regime(row: dict[str, float]) -> tuple[str, float]:
-    """Return (regime, confidence in [0,1]) from ADX, EMA stack, trend quality
-    (Kaufman efficiency ratio), multi-timeframe alignment and ATR percentile."""
+    """Return (regime, confidence in [0,1]) — now genuinely multi-timeframe.
+
+    A trend is only declared when the base momentum AND the higher-timeframe
+    consensus (15m/1h, via `mtf_bias`) agree, and the trend's DIRECTION is taken
+    from that stable higher-TF consensus — so a shallow pullback on the base bar
+    no longer flips the regime (which used to un-mute mean-reversion and let the
+    account fade an uptrend). A strong higher-TF bias also keeps the regime
+    'trending' through a base wobble."""
     adx = row.get("adx", 0.0)
     slope = row.get("ema21_slope", 0.0)
     atr_pctile = row.get("atr_pctile", 0.5)
     er = row.get("eff_ratio", 0.0)
     align = row.get("mtf_align", 0.0)
+    bias = row.get("mtf_bias", 0.0)          # 15m/1h consensus (stable backdrop)
     e8, e21, e55 = row.get("ema_8", 0.0), row.get("ema_21", 0.0), row.get("ema_55", 0.0)
 
-    if not all(map(math.isfinite, (adx, slope, atr_pctile, er, align, e8, e21, e55))):
+    if not all(map(math.isfinite, (adx, slope, atr_pctile, er, align, bias, e8, e21, e55))):
         return RANGE, 0.0
 
     if atr_pctile > 0.90:
@@ -47,12 +54,19 @@ def detect_regime(row: dict[str, float]) -> tuple[str, float]:
 
     stacked_up = e8 > e21 > e55
     stacked_dn = e8 < e21 < e55
-    # A real trend: ADX up, clean efficiency ratio, and MTF agreement.
     trend_strength = (clamp01((adx - 18) / 22) + clamp01(er / 0.45) + clamp01(abs(align))) / 3.0
-    trending = trend_strength > 0.42 and adx > 18
+    # higher timeframes must lean the same way for a trend to count...
+    htf_agree = abs(bias) >= 0.25
+    # ...but a strong higher-TF bias sustains the regime through a base wobble.
+    trending = adx > 16 and htf_agree and (trend_strength > 0.42 or abs(bias) >= 0.45)
 
-    if trending and (stacked_up or stacked_dn or abs(align) > 0.35):
-        up = stacked_up or (align > 0 and not stacked_dn)
+    if trending:
+        # direction from the higher-TF consensus (stable), falling back to the
+        # base EMA stack only when the higher-TF read is weak.
+        if abs(bias) >= 0.2:
+            up = bias > 0
+        else:
+            up = stacked_up or (align > 0 and not stacked_dn)
         return (TREND_UP if up else TREND_DOWN), min(1.0, trend_strength + 0.25)
 
     conf = clamp01((0.42 - trend_strength) / 0.42 + 0.2)

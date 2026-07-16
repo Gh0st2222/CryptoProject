@@ -31,12 +31,13 @@ class DeskPerf:
 
 class MetaAllocator:
     def __init__(self, desks: list[str], eta: float = 0.6, floor: float = 0.05,
-                 ew_alpha: float = 0.03, disable_after: int = 120):
+                 ew_alpha: float = 0.05, disable_after: int = 120, max_weight: float = 0.40):
         self.desks = list(desks)
         self.eta = eta
         self.floor = floor
-        self.ew_alpha = ew_alpha
+        self.ew_alpha = ew_alpha            # faster forgetting -> adapts to regime shifts
         self.disable_after = disable_after
+        self.max_weight = max_weight        # no single desk may dominate the book
         n = len(self.desks)
         self.perf: dict[str, DeskPerf] = {d: DeskPerf(weight=1.0 / n) for d in self.desks}
         self._log_w: dict[str, float] = {d: 0.0 for d in self.desks}  # unnormalized log-weights
@@ -74,9 +75,24 @@ class MetaAllocator:
         free = 1.0 - n * self.floor
         for d in self.desks:
             self.perf[d].weight = self.floor + free * raw[d] / tot
+        # ceiling: cap any runaway desk and redistribute the overflow to the rest,
+        # so the CIO can't over-commit the whole book to one desk (it over-weighted
+        # mean-reversion into an uptrend before). A few passes handle cascades.
+        ceil = max(self.max_weight, 1.0 / n)
+        for _ in range(3):
+            over = {d: self.perf[d].weight - ceil for d in self.desks if self.perf[d].weight > ceil + 1e-9}
+            if not over:
+                break
+            spill = sum(over.values())
+            under = [d for d in self.desks if self.perf[d].weight < ceil - 1e-9]
+            base = sum(self.perf[d].weight for d in under) or 1.0
+            for d in over:
+                self.perf[d].weight = ceil
+            for d in under:
+                self.perf[d].weight += spill * self.perf[d].weight / base
         # gentle decay of log-weights toward 0 keeps adaptation reversible
         for d in self.desks:
-            self._log_w[d] *= 0.999
+            self._log_w[d] *= 0.995
 
     def snapshot(self) -> dict:
         return {

@@ -63,6 +63,11 @@ class PortfolioReq(BaseModel):
     synthetic: bool = False
 
 
+class WalkforwardReq(BacktestReq):
+    folds: int = Field(default=5, ge=3, le=10)
+    trials: int = Field(default=20, ge=5, le=120)
+
+
 class ApplyParamsReq(BaseModel):
     params: dict
 
@@ -132,6 +137,18 @@ async def optimize(req: OptimizeReq):
 async def portfolio_backtest(req: PortfolioReq):
     job = orch.start_portfolio_backtest(req.symbols, req.interval, req.days, req.synthetic)
     return {"job_id": job.id}
+
+
+@app.post("/api/walkforward")
+async def walkforward(req: WalkforwardReq):
+    job = orch.start_walkforward(req.symbol.upper(), req.interval, req.days,
+                                 req.folds, req.trials, req.synthetic)
+    return {"job_id": job.id}
+
+
+@app.get("/api/journal")
+async def journal(mode: str | None = None, limit: int = 300):
+    return {"summary": orch.journal.summary(mode), "recent": orch.journal.recent(limit)}
 
 
 @app.get("/api/jobs/{job_id}")
