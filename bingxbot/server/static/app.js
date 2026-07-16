@@ -250,10 +250,14 @@ function renderAutotuner(){
   const lc=at.last_cycle;
   row.innerHTML=[
     ["Status",at.enabled?(at.running?"● RESEARCHING":"ON"):"OFF"],
+    ["DE generation",at.generation??"—"],
+    ["Population",at.population??"—"],
+    ["Research cores",at.research_cores??"—"],
     ["Cycles run",at.cycles],
     ["Improvements",at.improvements],
     ["Champion fitness",at.champion_fitness??"—"],
     ["Last challenger",lc?`${lc.best_fitness} (${lc.promoted?"adopted":"kept"})`:"—"],
+    ["Diversity",lc?.diversity??"—"],
     ["Next cycle",next],
   ].map(([k,v])=>`<div class="at-badge"><div class="k">${k}</div><div class="v">${esc(String(v))}</div></div>`).join("");
   const H=at.history||[];

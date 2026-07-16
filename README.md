@@ -113,20 +113,29 @@ payoff shape that survives fees:
 
 ## Continuous self-tuning (you never touch settings)
 
-The auto-tuner is an **always-on research desk**. Every couple of minutes it
-evolves the current champion parameters (gaussian perturbations) plus fresh
-random explorers across the **entire** strategy + risk/exit space (~22
-parameters), and **hot-swaps a challenger into the live brains only when it
-clearly beats the running champion** — otherwise it changes nothing. Promotions
-persist and show up on the Auto-Tuner tab with their fitness jump and the params
-adopted.
+The auto-tuner is an **always-on research desk**, and it's a real optimizer, not
+random poking. A **persistent Differential-Evolution population** (it remembers
+what worked across cycles *and* survives restarts, saved to disk) proposes trials
+over the whole strategy + risk/exit space; each candidate is scored across
+several time folds **in parallel on a dedicated pool of research cores** — with
+each fold's indicators built **once** and reused for every candidate, which is
+what makes a cycle fast. The population's best is then **validated out-of-sample**
+on the most recent held-out window (with an overfit penalty for any train→OOS
+drop) and **hot-swapped into the live brains only when it clearly beats the
+running champion there** — otherwise nothing changes.
 
-Candidates are scored with **robust multi-window fitness**: every parameter set
-is run across several disjoint time windows and ranked on *median minus
-variance* (plus a worst-window penalty). A config that only prints in one lucky
-window scores poorly, so the tuner prefers parameters that hold up across
-different market conditions — the main defense against overfitting, which is the
-number-one reason retail bots that "backtest great" die in production.
+The objective is **risk-adjusted profit**, not trade count: total R earned
+(net of fees) tempered by drawdown and quality, recency-weighted so recent market
+behavior matters more. That means it rewards higher frequency *only* when the
+extra trades actually make risk-adjusted money — the honest fix for "trade more"
+that can't regress into the fee-bleeding over-trading it used to reward.
+
+**Cores are allocated to the host.** On startup it reads the CPU's logical core
+count and splits it: one core for the event loop, a small slice for on-demand
+jobs you launch (backtests/optimizer/walk-forward), and the rest as a dedicated
+research pool — so the tuner runs several-wide in parallel without ever starving
+the UI or a backtest you just started. More cores → more folds per cycle and more
+generations per hour, automatically.
 
 **Exit style is regime-conditional.** Trend setups ride the chandelier trail
 (let winners run). Range setups (opt-in, `trade_range`) are *scalped*: enter
@@ -306,8 +315,9 @@ bingxbot/
 │   ├── trader.py           realtime decision loop + execution pipeline
 │   ├── backtest.py         per-symbol simulator + portfolio + optimizer + honest walk-forward
 │   ├── journal.py          persistent trade journal (JSONL + decision context) -> analytics
-│   └── autotuner.py        background self-tuning research desk (runs in the process pool)
-└── server/                 FastAPI + split WebSocket + process pool + alerts + the terminal
+│   ├── search.py           parallel fold-scoring (indicator reuse) + Differential Evolution
+│   └── autotuner.py        research desk: DE population + OOS validation on the research pool
+└── server/                 FastAPI + split WebSocket + dual process pools + alerts + the terminal
 ```
 
 ## Configuration

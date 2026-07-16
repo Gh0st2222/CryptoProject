@@ -47,7 +47,7 @@ class StrategyConfig:
     weight_floor: float = 0.05      # no alpha is ever fully muted
     base_threshold: float = 0.30    # |fused edge| needed to consider a trade
     threshold_adapt: bool = True    # auto-tune threshold toward target trade rate
-    target_trades_per_hour: float = 1.5
+    target_trades_per_hour: float = 2.5
     cost_multiple: float = 2.0      # predicted move must exceed round-trip cost x this
     micro_confirm: bool = True      # order-flow agreement gate at entry (live/paper)
     entry_confirm_scans: int = 2    # reactive intra-bar signal must persist this many scans
@@ -121,7 +121,7 @@ class ServerConfig:
 # override values persisted by an older build. On load, a config written by an
 # older version keeps only the user-owned settings; the tuner-owned params are
 # reset to current defaults (then the auto-tuner evolves from there).
-CONFIG_VERSION = 3
+CONFIG_VERSION = 4
 
 # Top-level settings the user owns — everything else is auto-managed by the
 # tuner and reset to code defaults when migrating an older config.

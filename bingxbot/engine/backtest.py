@@ -99,11 +99,21 @@ class _SymSim:
         self.spec = spec
         self.risk_cfg = risk_cfg
         self.collect = collect_series
-        arrays = candles_to_arrays(candles)
-        self.o, self.h, self.l = arrays["open"], arrays["high"], arrays["low"]
-        self.c, self.ts = arrays["close"], arrays["ts"]
-        self.n = len(self.c)
-        self.ff = ff if ff is not None else FeatureFrame(arrays, interval=interval)   # reusable across candidates
+        if ff is not None:
+            # reuse a precomputed FeatureFrame AND its OHLC arrays — this is what
+            # lets the tuner score dozens of candidates on one fold without
+            # rebuilding indicators (or even the arrays) each time.
+            self.ff = ff
+            f = ff.f
+            self.o, self.h, self.l = f["open"], f["high"], f["low"]
+            self.c, self.ts = f["close"], f["ts"]
+            self.n = ff.n
+        else:
+            arrays = candles_to_arrays(candles)
+            self.o, self.h, self.l = arrays["open"], arrays["high"], arrays["low"]
+            self.c, self.ts = arrays["close"], arrays["ts"]
+            self.n = len(self.c)
+            self.ff = FeatureFrame(arrays, interval=interval)
         bph = 3_600_000 / interval_ms(interval)
         self.brain = TradingBrain(
             eta=strat.hedge_eta, weight_floor=strat.weight_floor, horizon_bars=strat.horizon_bars,
@@ -517,8 +527,8 @@ def run_walkforward(
 # starting balance) are deliberately excluded. (lo, hi, target, kind)
 TUNABLES: dict[str, tuple] = {
     # strategy
-    "base_threshold":         (0.20, 0.46, "strategy", "float"),
-    "target_trades_per_hour": (0.4, 3.0, "strategy", "float"),
+    "base_threshold":         (0.18, 0.46, "strategy", "float"),
+    "target_trades_per_hour": (0.5, 6.0, "strategy", "float"),
     "cost_multiple":          (1.2, 3.2, "strategy", "float"),
     "hedge_eta":              (0.15, 0.60, "strategy", "float"),
     "horizon_bars":           (5, 16, "strategy", "int"),
@@ -574,19 +584,26 @@ def _apply_params(strat: StrategyConfig, risk: RiskConfig, p: dict) -> tuple[Str
 
 
 def _fitness(stats: dict) -> float:
+    """Risk-adjusted PROFIT, not trade count. The objective is total R earned
+    (avg R per trade × trades — net of fees, since r_multiple is net), tempered by
+    drawdown and quality. This rewards higher frequency ONLY when the extra trades
+    actually add risk-adjusted money: churn drags avg_r toward zero and the score
+    collapses, while a genuine high-frequency edge scores above a lazy low-frequency
+    one. A losing or evidence-poor set is never a champion."""
     t = stats.get("trades", 0)
     if t < 15:                       # need real evidence, not a lucky handful
         return -1.0
     pf = stats.get("profit_factor", 0.0)
     if pf < 1.0:                     # a losing set is never a champion, full stop
         return -1.0
-    pf_capped = min(pf, 3.5)
+    total_r = stats.get("avg_r", 0.0) * t          # total risk-adjusted profit (R units)
+    if total_r <= 0:
+        return -1.0
     dd = stats.get("max_drawdown", 1.0)
     wr = stats.get("win_rate", 0.0)
-    # trade-count credit SATURATES at ~40 so the tuner can't win by over-trading
-    # (that is exactly what bled the live account); quality (PF, low DD, WR) leads.
-    trade_factor = math.sqrt(min(t, 40))
-    return pf_capped * trade_factor * (1.0 - clamp(dd * 2.5, 0.0, 0.9)) * (0.5 + wr)
+    dd_pen = 1.0 - clamp(dd * 2.0, 0.0, 0.85)      # drawdown haircut
+    quality = clamp(min(pf, 3.0) / 1.5, 0.5, 2.0) * (0.6 + 0.4 * clamp(wr / 0.5, 0.0, 1.0))
+    return total_r * dd_pen * quality
 
 
 def robust_fitness(candles, symbol, interval, strat, risk_cfg, spec,
