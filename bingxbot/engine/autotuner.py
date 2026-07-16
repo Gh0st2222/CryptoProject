@@ -36,7 +36,7 @@ log = logging.getLogger("autotuner")
 
 POP_SIZE = 28
 IMPROVE_MARGIN = 1.06       # OOS challenger must beat champion OOS x this
-MIN_ABS_FITNESS = 1.0       # ...and clear this absolute floor (risk-adjusted units)
+MIN_ABS_FITNESS = 0.3       # ...and be clearly profitable (positive risk-adjusted score)
 OVERFIT_LAMBDA = 0.5        # penalty weight on the in-sample -> OOS drop
 LOOKBACK_DAYS = 60.0
 DATA_TTL_S = 1800

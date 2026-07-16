@@ -584,26 +584,29 @@ def _apply_params(strat: StrategyConfig, risk: RiskConfig, p: dict) -> tuple[Str
 
 
 def _fitness(stats: dict) -> float:
-    """Risk-adjusted PROFIT, not trade count. The objective is total R earned
-    (avg R per trade × trades — net of fees, since r_multiple is net), tempered by
-    drawdown and quality. This rewards higher frequency ONLY when the extra trades
-    actually add risk-adjusted money: churn drags avg_r toward zero and the score
-    collapses, while a genuine high-frequency edge scores above a lazy low-frequency
-    one. A losing or evidence-poor set is never a champion."""
+    """Risk-adjusted PROFIT as a SMOOTH, ordered objective — this is what the
+    optimizer climbs, so it must never flatten into a plateau. A losing set scores
+    negative (and *less* losing scores higher), a profitable set scores positive
+    and grows with risk-adjusted money made; there are no hard cliffs that would
+    make every candidate tie at the same value and kill Differential Evolution's
+    gradient. Promotion is gated separately (must be clearly positive), so a smooth
+    search space here does not mean losers get promoted."""
     t = stats.get("trades", 0)
-    if t < 15:                       # need real evidence, not a lucky handful
-        return -1.0
-    pf = stats.get("profit_factor", 0.0)
-    if pf < 1.0:                     # a losing set is never a champion, full stop
-        return -1.0
-    total_r = stats.get("avg_r", 0.0) * t          # total risk-adjusted profit (R units)
-    if total_r <= 0:
-        return -1.0
+    if t < 5:
+        # too little evidence to judge — a gentle ramp so the search is pulled
+        # toward configs that at least trade, instead of a flat dead zone.
+        return -2.0 + 0.2 * t
+    avg_r = stats.get("avg_r", 0.0)
+    total_r = avg_r * t                            # total risk-adjusted profit (R units), net of fees
     dd = stats.get("max_drawdown", 1.0)
+    pf = stats.get("profit_factor", 0.0)
     wr = stats.get("win_rate", 0.0)
     dd_pen = 1.0 - clamp(dd * 2.0, 0.0, 0.85)      # drawdown haircut
-    quality = clamp(min(pf, 3.0) / 1.5, 0.5, 2.0) * (0.6 + 0.4 * clamp(wr / 0.5, 0.0, 1.0))
-    return total_r * dd_pen * quality
+    quality = clamp(min(pf, 3.0) / 1.5, 0.25, 2.0) * (0.5 + 0.5 * clamp(wr / 0.5, 0.0, 1.2))
+    score = total_r * dd_pen * quality             # negative for losers (ordered), positive for winners
+    if score > 0:                                  # among winners, mild preference for more evidence
+        score *= clamp(0.7 + 0.3 * (t / 40.0), 0.7, 1.3)
+    return score
 
 
 def robust_fitness(candles, symbol, interval, strat, risk_cfg, spec,
