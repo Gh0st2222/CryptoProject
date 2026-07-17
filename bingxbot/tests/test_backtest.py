@@ -10,9 +10,11 @@ def test_backtest_runs_and_accounts_consistently():
     assert "error" not in res
     stats = res["stats"]
     assert stats["trades"] > 0, "expected at least one trade on 8000 synthetic bars"
-    # equity bookkeeping: final equity == start + sum(trade pnl)
+    # equity bookkeeping: final equity == start + sum(trade pnl) - funding drag
+    # (the sim charges assumed funding at every 8h boundary while holding)
     total_pnl = sum(t["pnl"] for t in res["trades"])
-    assert abs((10_000.0 + total_pnl) - stats["equity"]) < 1e-4
+    assert stats["funding_paid"] >= 0.0
+    assert abs((10_000.0 + total_pnl - stats["funding_paid"]) - stats["equity"]) < 1e-4
     assert 0.0 <= stats["win_rate"] <= 1.0
     assert res["equity_curve"], "equity curve missing"
     assert res["markers"], "trade markers missing"

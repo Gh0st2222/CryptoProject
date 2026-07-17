@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random
 import time
 
@@ -36,6 +37,10 @@ log = logging.getLogger("autotuner")
 
 POP_SIZE = 28
 IMPROVE_MARGIN = 1.06       # OOS challenger must beat champion OOS x this
+DEFLATE_K = 0.03            # margin inflation per decade of candidates tried on this
+                            # OOS window — multiple-testing honesty: after thousands
+                            # of shots at the same gate, a marginal "win" is luck
+DEFLATE_CAP = 0.10          # never demand more than +10% extra margin
 MIN_ABS_FITNESS = 0.3       # ...and be clearly profitable (positive risk-adjusted score)
 OVERFIT_LAMBDA = 0.5        # penalty weight on the in-sample -> OOS drop
 TOP_K_VALIDATE = 5          # validate this many training-best members OOS, keep the best generalizer
@@ -76,6 +81,7 @@ class AutoTuner:
         self.cycles = 0
         self.improvements = 0
         self._since_improve = 0
+        self._tested_oos = 0        # candidates tried against the current OOS window
         self.next_run_ts = 0.0
         self.champion_fitness = 0.0
         self.last_cycle: dict | None = None
@@ -151,6 +157,8 @@ class AutoTuner:
         # fitness carries forward on the same folds and we score just the trials —
         # halving the work and roughly doubling generations-per-hour in steady state.
         need_members = (self._scored_ts != self._data_ts) or any(f <= -1e8 for f in self.de.fitness)
+        if self._scored_ts != self._data_ts:
+            self._tested_oos = 0    # fresh OOS window -> the multiple-testing meter resets
         self._scored_ts = self._data_ts
         candidates = (list(self.de.pop) + trials) if need_members else list(trials)
         args = [(fold, symbol, interval, spec, taker, slip, strat, risk, candidates) for fold in folds]
@@ -202,10 +210,16 @@ class AutoTuner:
         promoted = False
         best_params = best["params"] if best else {}
         different = bool(best) and any(abs(best_params.get(k, 0) - champ.get(k, 0)) > 1e-9 for k in champ)
-        if different and best_adj > max(champ_fit * IMPROVE_MARGIN, MIN_ABS_FITNESS):
+        # deflated margin: the more candidates have taken a shot at THIS OOS
+        # window, the more a challenger must win by — a marginal beat after
+        # thousands of tries is selection bias, not signal.
+        self._tested_oos += len(cands)
+        margin = IMPROVE_MARGIN + min(DEFLATE_CAP, DEFLATE_K * math.log10(1 + self._tested_oos / 10))
+        if different and best_adj > max(champ_fit * margin, MIN_ABS_FITNESS):
             self.orch.apply_params(best_params)
             self.improvements += 1
             promoted = True
+            self._tested_oos = 0    # a promotion resets the bias meter
             vs = best_stats
             # tag the champion now driving live trades: reuse the vault entry if
             # the winner came from the vault, otherwise mint a new one.

@@ -258,6 +258,48 @@ function renderTrades(){
     <td class="r ${pnlCls(t.pnl)}">${fmt.signed(t.pnl,2)}</td><td class="r ${pnlCls(t.r_multiple)}">${fmt.signed(t.r_multiple,2)}</td>
     <td style="color:var(--muted)">${esc(t.reason_open)}</td><td style="color:var(--muted)">${esc(t.reason_close)}</td></tr>`).join("");
 }
+/* ------------------------- market radar + funding-carry desk ------------- */
+function fmtVol(v){ if(v==null||isNaN(v)) return "—";
+  if(v>=1e9) return (v/1e9).toFixed(1)+"B"; if(v>=1e6) return (v/1e6).toFixed(1)+"M";
+  if(v>=1e3) return (v/1e3).toFixed(0)+"K"; return v.toFixed(0); }
+function renderRadar(){
+  const R=S?.radar, C_=S?.carry;
+  const cards=$("carry-cards"), cbody=$("carry-body"), rbody=$("radar-body"); if(!cards) return;
+  if(C_){
+    const pos=C_.positions||[];
+    cards.innerHTML=[
+      ["Desk",C_.enabled?"● HARVESTING":"OFF",C_.enabled?"pnl-pos":""],
+      ["Open carry",pos.length],
+      ["Funding collected",fmt.signed(C_.funding_collected,4),pnlCls(C_.funding_collected)],
+      ["Entries",C_.entries],["Exits",C_.exits],
+      ["Last check",C_.last_reason||"—"],
+    ].map(([k,v,cls])=>`<div class="card"><div class="k">${k}</div><div class="v ${cls??""}" style="font-size:13px">${esc(String(v))}</div></div>`).join("");
+    cbody.innerHTML=pos.length?pos.map(p=>`<tr><td>${esc(p.symbol)}</td><td class="${sideCls(p.side)}">${p.side}</td>
+      <td class="r">${p.qty}</td><td class="r">${fmt.px(p.entry)}</td><td class="r">${fmt.px(p.mark)}</td>
+      <td class="r">${fmt.px(p.stop)}</td><td class="r ${p.apr>=0?'pnl-pos':'pnl-neg'}">${(p.apr*100).toFixed(0)}%</td>
+      <td class="r ${pnlCls(p.upnl)}">${fmt.signed(p.upnl,2)}</td><td class="r">${p.held_h}h</td>
+      <td>${p.next_funding_ts?fmt.time(p.next_funding_ts):"—"}</td></tr>`).join("")
+      :`<tr><td colspan="10" class="empty">No carry positions — the desk waits for genuinely extreme funding</td></tr>`;
+  }
+  if(R&&rbody){
+    $("radar-meta").textContent=R.ts?`· scan ${fmt.time(R.ts)}${R.demo?" · DEMO BOARD (synthetic feed)":""}${R.error?` · ⚠ ${R.error}`:""}`:"";
+    const rows=R.rows||[];
+    rbody.innerHTML=rows.length?rows.map((r,i)=>{
+      const kindCls=r.kind==="carry"?"pnl-pos":(r.kind==="trend"?"sc-pos":"");
+      const dir=r.dir_4h>0?"▲":(r.dir_4h<0?"▼":"·");
+      const dirCls=r.dir_4h>0?"pnl-pos":(r.dir_4h<0?"pnl-neg":"");
+      return `<tr><td style="color:var(--muted)">${i+1}</td><td><b>${esc(r.symbol)}</b></td>
+        <td class="${kindCls}">${esc(r.kind)}</td>
+        <td class="r ${Math.abs(r.funding_apr)>=0.2?'pnl-pos':''}">${(r.funding_apr*100).toFixed(0)}%</td>
+        <td class="r ${sideCls(r.carry_side)}">${r.carry_side}</td>
+        <td class="r">${fmtVol(r.quote_volume)}</td>
+        <td class="r ${pnlCls(r.change_24h)}">${fmt.signed(r.change_24h,1)}%</td>
+        <td class="r">${(r.er_4h||0).toFixed(2)}</td><td class="r ${dirCls}">${dir}</td>
+        <td class="r">${(r.score||0).toFixed(2)}</td></tr>`;
+    }).join(""):`<tr><td colspan="10" class="empty">Radar warming up…</td></tr>`;
+  }
+}
+
 function renderAutotuner(){
   const at=S.autotuner; const row=$("at-row"), hist=$("at-history");
   if(!at){ row.innerHTML=`<div class="empty">Auto-tuner idle (engine not running)</div>`; return; }
@@ -299,6 +341,7 @@ function renderSettings(){
   $("cfg-levmin").value=c.risk.min_leverage; $("cfg-levmax").value=c.risk.max_leverage;
   $("cfg-dayloss").value=c.risk.max_daily_loss_pct; $("cfg-hardrisk").value=c.risk.max_risk_hard_pct;
   $("cfg-autotune").checked=c.strategy.auto_tune; $("cfg-allowlive").checked=c.allow_live;
+  if(c.carry){ $("cfg-carry").checked=c.carry.enabled; $("cfg-carrymax").value=c.carry.max_positions; }
   $("cfg-keys").textContent=c.has_keys?"configured ✓":"not set (paper/backtest only)"; $("cfg-keys").style.color=c.has_keys?"var(--good)":"";
   $("auto-params").innerHTML=AUTO_PARAMS.map(([k,lab,grp])=>{
     const v=(grp==="s"?c.strategy:c.risk)[k];
@@ -311,7 +354,7 @@ function renderAll(){
   renderTop(); renderSymTabs(); renderTape();
   if(S.engine){ renderPipeline(); renderBrain(); renderEquity(); renderPositions(); renderTrades();
     const tc=S.engine.portfolio.stats.trades; refreshCandles(false).then(()=>{lastTradeCount=tc;}); }
-  renderAutotuner(); renderChampions(); renderSettings();
+  renderAutotuner(); renderChampions(); renderRadar(); renderSettings();
 }
 
 /* ------- fast 'hot' channel: patch the live numbers between full pushes ----- */
@@ -393,6 +436,7 @@ $("cfg-save").onclick=async()=>{
     risk:{ min_leverage:parseInt($("cfg-levmin").value,10), max_leverage:parseInt($("cfg-levmax").value,10),
       max_daily_loss_pct:parseFloat($("cfg-dayloss").value), max_risk_hard_pct:parseFloat($("cfg-hardrisk").value),
       max_open_positions:parseInt($("cfg-maxpos").value,10) },
+    carry:{ enabled:$("cfg-carry").checked, max_positions:parseInt($("cfg-carrymax").value,10) },
     paper:{ starting_balance:parseFloat($("cfg-balance").value) } };
   try{ const r=await api("/api/config",{patch}); settingsDirty=false;
     toast(r.needs_restart?"Saved — switch to Idle and back to apply":"Settings saved","good"); }catch(e){ toast(e.message,"bad"); }

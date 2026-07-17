@@ -164,6 +164,8 @@ class Orchestrator:
         self.journal = TradeJournal()
         self.alerter = Alerter()
         self._alert_task: asyncio.Task | None = None
+        self.scanner = None         # MarketScanner (universe radar), set on engine start
+        self.carry = None           # CarryDesk (funding harvest), set on engine start
 
     # ------------------------------------------------------------- CPU offload
 
@@ -520,6 +522,12 @@ class Orchestrator:
         from ..engine.autotuner import AutoTuner
         self.autotuner = AutoTuner(self)
         self.autotuner.start()
+        from ..engine.carry import CarryDesk
+        from ..engine.scanner import MarketScanner
+        self.scanner = MarketScanner(self)
+        self.scanner.start()
+        self.carry = CarryDesk(self)
+        self.carry.start()
         self._alert_task = asyncio.create_task(self._alert_loop(), name="alert-loop")
 
     async def _stop_engine(self) -> None:
@@ -530,6 +538,12 @@ class Orchestrator:
             except (asyncio.CancelledError, Exception):
                 pass
             self._alert_task = None
+        if self.carry is not None:
+            await self.carry.stop()
+            self.carry = None
+        if self.scanner is not None:
+            await self.scanner.stop()
+            self.scanner = None
         if self.autotuner is not None:
             await self.autotuner.stop()
             self.autotuner = None
@@ -767,6 +781,10 @@ class Orchestrator:
         if self.engine is not None:
             d["divergence"] = self._divergence()
             d["alerts_on"] = self.alerter.enabled
+        if self.scanner is not None:
+            d["radar"] = self.scanner.snapshot()
+        if self.carry is not None:
+            d["carry"] = self.carry.snapshot()
         return d
 
     def hot(self) -> dict:

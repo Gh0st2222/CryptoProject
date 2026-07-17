@@ -101,7 +101,7 @@
       </section>
 
       <section class="panel">
-        <div class="phead"><h2>Alpha floor · 18 signals</h2><span class="right">● firing ○ dormant</span></div>
+        <div class="phead"><h2>Alpha floor · 19 signals</h2><span class="right">● firing ○ dormant</span></div>
         <div class="pbody"><div class="alpha-desks" id="alpha-desks"></div></div>
       </section>
     </div>
@@ -116,6 +116,7 @@
       <button class="tab" data-tab="portfolio">Portfolio</button>
       <button class="tab" data-tab="walkforward">Walk-Fwd</button>
       <button class="tab" data-tab="optimizer">Optimizer</button>
+      <button class="tab" data-tab="radar">Radar</button>
       <button class="tab" data-tab="analytics">Analytics</button>
       <button class="tab" data-tab="autotuner">Auto-Tuner</button>
       <button class="tab" data-tab="settings">Settings</button>
@@ -263,6 +264,23 @@
       </tr></thead><tbody id="champ-body"><tr><td colspan="9" class="empty">No champions saved yet — the vault fills as the tuner promotes winners</td></tr></tbody></table></div>
     </div>
 
+    <div class="tab-page" data-page="radar">
+      <p class="foot-note" style="margin-top:0">The <b>market radar</b> scans the whole BingX perp board every few minutes and ranks it by the two edges a retail-latency bot can actually collect: <b>extreme funding</b> (a mechanical payment to whoever takes the unpopular side — no prediction required) and <b>4h trend quality</b>. The <b>carry desk</b> harvests the funding automatically: receiving side only, never against a strong 4h trend, small size, low leverage, always stopped, out when the funding normalizes.</p>
+      <div class="subt">Funding-carry desk</div>
+      <div class="cards" id="carry-cards"><div class="empty" style="grid-column:1/-1">Carry desk idle (engine not running)</div></div>
+      <div style="overflow:auto"><table class="tbl"><thead><tr>
+        <th>Symbol</th><th>Side</th><th class="r">Qty</th><th class="r">Entry</th><th class="r">Mark</th><th class="r">Stop</th>
+        <th class="r" title="funding APR being received right now">APR</th><th class="r">uPnL</th><th class="r">Held</th><th>Next funding</th>
+      </tr></thead><tbody id="carry-body"><tr><td colspan="10" class="empty">No carry positions — the desk waits for genuinely extreme funding</td></tr></tbody></table></div>
+
+      <div class="subt" style="margin-top:16px">Universe board — ranked by harvestable edge <span style="color:var(--muted)" id="radar-meta"></span></div>
+      <div style="overflow:auto"><table class="tbl"><thead><tr>
+        <th>#</th><th>Symbol</th><th>Kind</th><th class="r" title="last funding print, annualized (3 windows/day)">Funding APR</th>
+        <th class="r" title="the side the funding pays">Receives</th><th class="r">24h volume</th><th class="r">24h Δ</th>
+        <th class="r" title="Kaufman efficiency ratio on 4h bars">4h ER</th><th class="r">4h trend</th><th class="r">Score</th>
+      </tr></thead><tbody id="radar-body"><tr><td colspan="10" class="empty">Radar warming up…</td></tr></tbody></table></div>
+    </div>
+
     <div class="tab-page" data-page="settings">
       <p class="foot-note" style="margin-top:0"><b>You own these.</b> Everything else — thresholds, exits, sizing, Kelly, all of it — is owned and continuously optimized by the auto-tuner; its current live values are shown below, read-only.</p>
       <div class="settings-grid">
@@ -282,7 +300,9 @@
           <div class="ff"><label>Max daily loss (fraction)</label><input class="field" id="cfg-dayloss" type="number" step="0.005"></div>
           <div class="ff"><label>Hard per-trade risk cap (fraction)</label><input class="field" id="cfg-hardrisk" type="number" step="0.005"></div>
           <label class="check"><input type="checkbox" id="cfg-autotune"> auto-tuner running</label>
-          <div class="hint">The bot auto-adapts leverage <i>within</i> your band based on volatility &amp; conviction.</div>
+          <label class="check"><input type="checkbox" id="cfg-carry"> funding-carry desk</label>
+          <div class="ff"><label>Max carry positions</label><input class="field" id="cfg-carrymax" type="number" step="1" min="0" max="4"></div>
+          <div class="hint">The bot auto-adapts leverage <i>within</i> your band based on volatility &amp; conviction. Carry positions count toward the global position cap.</div>
         </div>
         <div class="sgroup">
           <h3 style="color:var(--accent-2)">Auto-managed <span style="color:var(--muted)">· live values</span></h3>
@@ -300,8 +320,9 @@
   </section>
 
   <p class="foot-note">
-    18 alphas across 5 desks · online Hedge weights · meta-allocator backs live winners · regime gating · calibrated P(win) · fractional-Kelly sizing ·
-    health-governed auto-correction · background walk-forward self-tuning · tick-level exits · exchange-side SL/TP in live mode · daily-loss kill switch.
+    19 alphas across 5 desks · funding-carry desk + whole-board radar · online Hedge weights · meta-allocator backs live winners · regime gating · calibrated P(win) ·
+    fractional-Kelly sizing · liquidation-distance leverage guard · log-wealth tuner objective (fees + funding charged) · health-governed auto-correction ·
+    background self-tuning · tick-level exits · exchange-side SL/TP in live mode · daily-loss kill switch.
     Paper &amp; backtest need no API keys. Not financial advice — leveraged futures can lose money fast.
   </p>
 </div>

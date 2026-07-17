@@ -3,12 +3,41 @@
 A self-adapting, multi-strategy trading machine for **BingX USDT-M perpetual
 futures** with **volatility-targeted 2–7× leverage**, three execution modes, and
 a dense realtime web terminal. It runs like a small trading firm: an analyst
-floor of 18 alpha signals across five specialist **desks**, a **meta-allocator**
+floor of 19 alpha signals across five specialist **desks**, a **meta-allocator**
 (the CIO) that shifts capital toward whatever is actually working, **calibrated
 win probabilities** driving **fractional-Kelly** sizing, a **health governor**
 that throttles risk when it's cold, and a **continuous evolutionary auto-tuner**
 that optimizes the entire parameter space around the clock so you never tune a
 setting yourself.
+
+## Where the money comes from (the honest map)
+
+Retail latency cannot out-race anyone, so the system is pointed only at edges a
+REST/WS bot can actually collect:
+
+1. **Funding carry (the flagship).** When perp funding gets extreme, the
+   exchange mechanically pays the unpopular side every 8h — a public,
+   predictable payment, no forecasting required. The **market radar** scans the
+   whole BingX perp board every few minutes (all-symbol funding + volume in two
+   calls, 4h trend probes on the interesting few) and the **carry desk**
+   harvests it: receiving side only, never against a strong 4h trend, small
+   size, fixed low leverage, always stopped, out when the funding normalizes.
+2. **Higher-timeframe trend.** The signal brain runs on **15m bars by default**
+   (1m is demoted to *execution*: the reactive intra-bar scanner times entries
+   inside the forming bar). On 15m–4h, momentum has decades of evidence and the
+   move is large relative to fees; on 1m it isn't — the old tuner kept proving
+   that by refusing to trade.
+3. **Liquidation-cascade reversion.** A violent, high-volume bar whose extreme
+   wick gets reclaimed by the close is forced selling exhausting itself; the
+   `capitulation` alpha fades it — the one *fast* edge that doesn't require
+   winning a race, because it enters after the race ends.
+
+Honesty guardrails to match: the backtester now **charges funding at every 8h
+boundary held**, the tuner optimizes **log-wealth growth with a convex drawdown
+penalty** (what compounding actually maximizes), promotion demands a margin that
+**grows with how many candidates have been tried** on the same validation window
+(multiple-testing bias), and a **liquidation-distance guard** caps leverage so
+the stop always fires before isolated-margin liquidation can.
 
 - **Live trading** — real orders on BingX, exchange-side stop-loss/take-profit
   on every entry, kill switch, reconciliation against exchange state.

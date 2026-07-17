@@ -31,6 +31,9 @@ NO_MICRO = {"obi": 0.0, "flow": 0.0, "cvd_slope": 0.0, "spread_bps": 0.0, "ticks
 NO_CTX: dict = {}
 ASSUMED_SPREAD_BPS = 1.0
 TREND_REGIMES = {"TREND_UP", "TREND_DOWN"}
+FUNDING_MS = 8 * 3600 * 1000        # perp funding settles every 8h
+ASSUMED_FUNDING_8H = 0.0001         # 0.01%/8h baseline, charged as a COST while
+                                    # holding (conservative: assume the paying side)
 
 
 def gate_mtf_veto(strat, edge: float, row: dict) -> tuple[bool, str]:
@@ -224,6 +227,11 @@ class _SymSim:
                 elif i >= p["expires_bar"]:
                     self.pending = None
             pos = pf.positions.get(sym)
+
+        # funding drag: crossing an 8h settlement while holding costs the assumed
+        # rate on notional — long holds must EARN their carry, exactly as live.
+        if pos is not None and i > 0 and (self.ts[i] // FUNDING_MS) != (self.ts[i - 1] // FUNDING_MS):
+            pf.charge_funding(pos.qty * c[i] * ASSUMED_FUNDING_8H)
 
         # 2) intrabar exits: stop taker, scalp target passive maker
         if pos is not None:
@@ -614,28 +622,32 @@ def _apply_params(strat: StrategyConfig, risk: RiskConfig, p: dict) -> tuple[Str
 
 
 def _fitness(stats: dict) -> float:
-    """Risk-adjusted PROFIT as a SMOOTH, ordered objective — this is what the
-    optimizer climbs, so it must never flatten into a plateau. A losing set scores
-    negative (and *less* losing scores higher), a profitable set scores positive
-    and grows with risk-adjusted money made; there are no hard cliffs that would
-    make every candidate tie at the same value and kill Differential Evolution's
-    gradient. Promotion is gated separately (must be clearly positive), so a smooth
-    search space here does not mean losers get promoted."""
+    """LOG-WEALTH growth as a SMOOTH, ordered objective — what compounding
+    actually maximizes (Kelly-consistent), net of fees AND funding drag, with a
+    CONVEX drawdown penalty (at leverage, variance is not a nuisance, it's the
+    thing that ends accounts). Scaled x100 so scores stay in a familiar range
+    (+10% window growth ~ +9.5 before penalties). Still smooth and strictly
+    ordered — a losing set scores negative and less-losing scores higher, so
+    Differential Evolution always has a gradient; promotion is gated separately."""
     t = stats.get("trades", 0)
     if t < 5:
         # too little evidence to judge — a gentle ramp so the search is pulled
         # toward configs that at least trade, instead of a flat dead zone.
         return -2.0 + 0.2 * t
-    avg_r = stats.get("avg_r", 0.0)
-    total_r = avg_r * t                            # total risk-adjusted profit (R units), net of fees
+    ret = clamp(stats.get("total_return", 0.0), -0.95, 20.0)
+    growth = 100.0 * math.log1p(ret)               # log-wealth, %-like scale
     dd = stats.get("max_drawdown", 1.0)
+    dd_pen = 1.0 / (1.0 + (dd / 0.08) ** 2)        # convex: 4% dd -> x0.80, 8% -> x0.50, 16% -> x0.20
     pf = stats.get("profit_factor", 0.0)
-    wr = stats.get("win_rate", 0.0)
-    dd_pen = 1.0 - clamp(dd * 2.0, 0.0, 0.85)      # drawdown haircut
-    quality = clamp(min(pf, 3.0) / 1.5, 0.25, 2.0) * (0.5 + 0.5 * clamp(wr / 0.5, 0.0, 1.2))
-    score = total_r * dd_pen * quality             # negative for losers (ordered), positive for winners
-    if score > 0:                                  # among winners, mild preference for more evidence
-        score *= clamp(0.7 + 0.3 * (t / 40.0), 0.7, 1.3)
+    if growth > 0:
+        quality = clamp(min(pf, 3.0) / 1.5, 0.3, 2.0)   # stability of the earning, capped
+        score = growth * dd_pen * quality
+        # among winners, mild preference for more evidence
+        score *= clamp(0.8 + 0.2 * (t / 30.0), 0.8, 1.4)
+    else:
+        # losers: junkier losing (low pf) must score MORE negative, never less —
+        # multiplying a negative by a small "quality" would invert the ordering.
+        score = growth * (1.0 + (1.0 - clamp(pf, 0.0, 1.0)))
     return score
 
 
