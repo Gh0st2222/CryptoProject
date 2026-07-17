@@ -38,6 +38,8 @@ POP_SIZE = 28
 IMPROVE_MARGIN = 1.06       # OOS challenger must beat champion OOS x this
 MIN_ABS_FITNESS = 0.3       # ...and be clearly profitable (positive risk-adjusted score)
 OVERFIT_LAMBDA = 0.5        # penalty weight on the in-sample -> OOS drop
+TOP_K_VALIDATE = 5          # validate this many training-best members OOS, keep the best generalizer
+STALL_REINJECT = 20         # cycles without a promotion before a diversity restart
 LOOKBACK_DAYS = 60.0
 DATA_TTL_S = 1800
 GAP_FAST = 20               # cadence right after a promotion (keep hammering)
@@ -72,6 +74,7 @@ class AutoTuner:
         self._scored_ts = -1.0      # data window the population was last fully scored on
         self.cycles = 0
         self.improvements = 0
+        self._since_improve = 0
         self.next_run_ts = 0.0
         self.champion_fitness = 0.0
         self.last_cycle: dict | None = None
@@ -164,17 +167,19 @@ class AutoTuner:
         self.de.select(trials, trial_fit, member_fit)
         self.de.save()
 
-        best_params, best_train = self.de.best()
-
-        # out-of-sample validation of the challenger and the current champion
-        best_oos = await self.orch.run_cpu(validate_params, best_params, valid, symbol, interval,
-                                           spec, taker, slip, strat, risk, research=True)
-        champ_oos = await self.orch.run_cpu(validate_params, champ, valid, symbol, interval,
-                                            spec, taker, slip, strat, risk, research=True)
-        oos_fit = best_oos["fitness"]
-        # overfit penalty: dock the challenger for any drop from train to OOS
-        oos_adj = oos_fit - OVERFIT_LAMBDA * max(0.0, best_train - oos_fit)
-        champ_fit = champ_oos["fitness"]
+        # Validate the top-K training members OOS (in parallel) and keep the best
+        # GENERALIZER, not just the training-best — the single best is often an
+        # overfit that fails out-of-sample while a lower-ranked member holds up.
+        topk = self.de.top_k(TOP_K_VALIDATE)
+        val_args = [(p, valid, symbol, interval, spec, taker, slip, strat, risk) for p, _ in topk]
+        val_args.append((champ, valid, symbol, interval, spec, taker, slip, strat, risk))
+        val_res = await self.orch.map_cpu(validate_params, val_args, research=True)
+        champ_fit = val_res[-1]["fitness"]
+        best_params, oos_adj, best_stats = {}, -1e18, {}
+        for (p, tfit), res in zip(topk, val_res[:-1]):
+            adj = res["fitness"] - OVERFIT_LAMBDA * max(0.0, tfit - res["fitness"])  # overfit-adjust
+            if adj > oos_adj:
+                best_params, oos_adj, best_stats = p, adj, res["stats"]
 
         self.cycles += 1
         self.champion_fitness = round(champ_fit, 3)
@@ -184,7 +189,7 @@ class AutoTuner:
             self.orch.apply_params(best_params)
             self.improvements += 1
             promoted = True
-            vs = best_oos["stats"]
+            vs = best_stats
             self.history.append({
                 "ts": int(time.time() * 1000),
                 "from_fitness": round(champ_fit, 3), "to_fitness": round(oos_adj, 3),
@@ -196,6 +201,15 @@ class AutoTuner:
             self.history = self.history[-25:]
             self.orch.record_champion(best_params, oos_adj, vs)
             log.info("auto-tune PROMOTED (gen %d): OOS %.2f -> %.2f", self.de.generation, champ_fit, oos_adj)
+
+        # diversity restart: if the population has converged without finding a
+        # champion for a long time, it's stuck in an overfit basin — re-inject
+        # fresh explorers so it keeps searching instead of grinding the same region.
+        self._since_improve = 0 if promoted else self._since_improve + 1
+        if self.de.diversity() < 0.25 and self._since_improve >= STALL_REINJECT:
+            k = self.de.reinject(0.4)
+            self._since_improve = 0
+            log.info("auto-tune: converged without a champion -> re-injected %d explorers", k)
 
         if self.cycles % VAULT_REVAL_EVERY == 0:
             await self._revalidate_vault(valid, symbol, interval, spec, taker, slip, strat, risk)
