@@ -174,6 +174,24 @@ class DEOptimizer:
         i = max(range(len(self.pop)), key=lambda j: self.fitness[j])
         return dict(self.pop[i]), self.fitness[i]
 
+    def top_k(self, k: int) -> list[tuple[dict, float]]:
+        """The k best members by training fitness — validated OOS by the caller so
+        an overfit training-best can't hide a member that actually generalizes."""
+        order = sorted(range(len(self.pop)), key=lambda j: self.fitness[j], reverse=True)
+        return [(dict(self.pop[j]), self.fitness[j]) for j in order[:max(1, k)]]
+
+    def reinject(self, frac: float = 0.4) -> int:
+        """Replace the worst `frac` of the population with fresh random vectors to
+        escape a converged (overfit) basin — a diversity restart. Returns how many
+        were replaced; they're marked unscored so they're re-evaluated next cycle."""
+        n = len(self.pop)
+        k = max(1, int(n * frac))
+        order = sorted(range(n), key=lambda j: self.fitness[j])   # worst first
+        for j in order[:k]:
+            self.pop[j] = self._rand_vec()
+            self.fitness[j] = -1e9
+        return k
+
     def diversity(self) -> float:
         """Mean normalized spread across genes — a health signal (near 0 = the
         population has collapsed and should be re-seeded)."""
