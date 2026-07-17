@@ -156,7 +156,11 @@ class Orchestrator:
         self._pools_ready = False
         self.cores = _plan_cores()  # (interactive_workers, research_workers)
         self.champions: list[dict] = self._load_champions()
-        self.active_champion_id: str | None = None  # the champion currently driving live trading
+        # restore which champion was driving trading before the restart (most
+        # recently used) so journal tagging + the LIVE badge survive restarts.
+        used = [c for c in self.champions if c.get("last_used_ts", 0) > 0]
+        self.active_champion_id: str | None = (
+            max(used, key=lambda c: c["last_used_ts"])["id"] if used else None)
         self.journal = TradeJournal()
         self.alerter = Alerter()
         self._alert_task: asyncio.Task | None = None
@@ -510,6 +514,7 @@ class Orchestrator:
 
         self.engine = TraderEngine(self.cfg, feed, broker, portfolio, risk, self.specs,
                                    on_update, journal=self.journal)
+        self.engine.active_champion_id = self.active_champion_id
         await self.engine.start()
 
         from ..engine.autotuner import AutoTuner

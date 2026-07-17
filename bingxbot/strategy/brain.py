@@ -248,6 +248,24 @@ class TradingBrain:
             return False, f"edge {predicted*100:.3f}% < cost x{self.cost_multiple:.1f}"
         return True, "ok"
 
+    def entry_report(self, edge: float, p_win: float, row: dict, fees_roundtrip: float,
+                     spread_bps: float, slippage_bps: float) -> list[dict]:
+        """Itemized version of entry_ok — every quality gate with its live numbers,
+        pass or fail, for the UI's entry-gate X-ray. Same math, no early exit."""
+        out = [{"n": "edge", "ok": abs(edge) >= self.threshold,
+                "d": f"{edge:+.2f} vs thr {self.threshold:.2f}"},
+               {"n": "p(win)", "ok": p_win >= self.min_p_win,
+                "d": f"{p_win:.0%} vs min {self.min_p_win:.0%}"}]
+        atr_pct = row.get("atr_pct", 0.0)
+        if not math.isfinite(atr_pct) or atr_pct <= 0:
+            out.append({"n": "cost", "ok": False, "d": "no volatility estimate"})
+            return out
+        predicted = self.beta * abs(edge) * atr_pct * math.sqrt(self.horizon)
+        cost = (fees_roundtrip + (spread_bps + 2 * slippage_bps) / 10_000.0) * self.cost_multiple
+        out.append({"n": "cost", "ok": predicted >= cost,
+                    "d": f"move {predicted*100:.3f}% vs cost {cost*100:.3f}%"})
+        return out
+
     def kelly_size_mult(self, p_win: float, payoff_ratio: float) -> float:
         """Fractional-Kelly multiplier on the base risk budget, from calibrated
         P(win) and the trade's reward:risk. Clamped so a hot streak can't run

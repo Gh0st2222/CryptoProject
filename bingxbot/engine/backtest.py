@@ -33,46 +33,70 @@ ASSUMED_SPREAD_BPS = 1.0
 TREND_REGIMES = {"TREND_UP", "TREND_DOWN"}
 
 
-def _entry_signal_ok(brain, strat, edge: float, p_win: float, row: dict, ev: dict,
-                     fees_rt: float, slippage_bps: float) -> bool:
-    """Regime-appropriate entry filter. The single biggest fix for fee-drag:
-    only trade where an edge actually exists — ride confirmed, efficient,
-    multi-timeframe-aligned trends, fade only the tails of a range, and sit out
-    choppy/volatile regimes entirely (that's where accounts quietly bleed)."""
-    ok, _ = brain.entry_ok(edge, p_win, row, fees_rt, ASSUMED_SPREAD_BPS, slippage_bps)
-    if not ok:
-        return False
-    # HARD higher-timeframe trend filter — never fight a decided 15m/1h trend, in
-    # ANY regime. mtf_bias is the consensus of the rungs above the base; if it is
-    # clearly directional, a trade opposing it is refused outright. This is the
-    # rule that stops the account shorting into an uptrend.
+def gate_mtf_veto(strat, edge: float, row: dict) -> tuple[bool, str]:
+    """HARD higher-timeframe trend filter — never fight a decided 15m/1h trend, in
+    ANY regime. mtf_bias is the consensus of the rungs above the base; if it is
+    clearly directional, a trade opposing it is refused outright. This is the
+    rule that stops the account shorting into an uptrend."""
     bias = row.get("mtf_bias", 0.0)
     if strat.mtf_veto > 0 and abs(bias) >= strat.mtf_veto and bias * edge < 0:
-        return False
-    # funding awareness: if we'd pay meaningful funding to hold this side and the
-    # edge is only marginal, skip — the carry quietly eats a thin edge. (Funding is
-    # 0 in the backtester's synthetic/historical klines, so this is live-only.)
+        return False, f"15m/1h bias {bias:+.2f} vetoes edge {edge:+.2f}"
+    return True, f"bias {bias:+.2f} · edge {edge:+.2f}"
+
+
+def gate_funding(strat, edge: float, row: dict) -> tuple[bool, str]:
+    """Funding awareness: if we'd pay meaningful funding to hold this side and the
+    edge is only marginal, skip — the carry quietly eats a thin edge. (Funding is
+    0 in the backtester's synthetic/historical klines, so this is live-only.)"""
     funding = row.get("funding_rate", 0.0) or 0.0
     if abs(funding) >= 0.0003 and (1 if edge > 0 else -1) * funding > 0 and abs(edge) < strat.base_threshold * 1.3:
-        return False
-    regime = ev["regime"]
+        return False, f"funding {funding*100:+.4f}% vs thin edge {edge:+.2f}"
+    return True, f"funding {funding*100:+.4f}%"
+
+
+def gate_regime(strat, edge: float, row: dict, regime: str) -> tuple[bool, str]:
+    """Regime-appropriate entry filter: ride confirmed, efficient, multi-timeframe-
+    aligned trends, fade only the tails of a range, sit out chop entirely."""
     if not strat.discipline:
         if strat.trend_align_gate and regime in TREND_REGIMES:
             align = row.get("mtf_align", 0.0)
             if align * edge < 0 and abs(align) > 0.15:
-                return False
-        return True
+                return False, f"MTF align {align:+.2f} opposes edge"
+        return True, "discipline off"
     if regime in TREND_REGIMES:
         er = row.get("eff_ratio", 0.0)
         align = row.get("mtf_align", 0.0)
-        return er >= strat.min_efficiency and align * edge > 0
+        if er < strat.min_efficiency:
+            return False, f"trend ER {er:.2f} < {strat.min_efficiency:.2f}"
+        if align * edge <= 0:
+            return False, f"MTF align {align:+.2f} vs edge {edge:+.2f}"
+        return True, f"ER {er:.2f} · align {align:+.2f}"
     if regime == "RANGE":
         if not strat.trade_range:
-            return False
+            return False, "range scalps off (tuner)"
         pctb = row.get("bb_pctb", 0.5)
         b = strat.range_band_edge
-        return (pctb < b and edge > 0) or (pctb > 1 - b and edge < 0)
-    return strat.trade_volatile
+        if (pctb < b and edge > 0) or (pctb > 1 - b and edge < 0):
+            return True, f"%B {pctb:.2f} at band"
+        return False, f"%B {pctb:.2f} not at band ≤{b:.2f}"
+    if strat.trade_volatile:
+        return True, "volatile allowed"
+    return False, "volatile chop (sitting out)"
+
+
+def _entry_signal_ok(brain, strat, edge: float, p_win: float, row: dict, ev: dict,
+                     fees_rt: float, slippage_bps: float) -> bool:
+    """The full entry filter chain — brain quality gates, the hard MTF veto,
+    funding awareness, then the regime branch. The single biggest fix for
+    fee-drag: only trade where an edge actually exists."""
+    ok, _ = brain.entry_ok(edge, p_win, row, fees_rt, ASSUMED_SPREAD_BPS, slippage_bps)
+    if not ok:
+        return False
+    if not gate_mtf_veto(strat, edge, row)[0]:
+        return False
+    if not gate_funding(strat, edge, row)[0]:
+        return False
+    return gate_regime(strat, edge, row, ev["regime"])[0]
 
 
 def candles_to_arrays(candles: list[Candle]) -> dict[str, np.ndarray]:
@@ -526,14 +550,17 @@ def run_walkforward(
 # (symbols, feed, interval, warmup, leverage band, daily-loss, max positions,
 # starting balance) are deliberately excluded. (lo, hi, target, kind)
 TUNABLES: dict[str, tuple] = {
-    # strategy
-    "base_threshold":         (0.18, 0.46, "strategy", "float"),
-    "target_trades_per_hour": (0.5, 6.0, "strategy", "float"),
+    # strategy — floors widened after live evidence: on real 1m data the DE pinned
+    # base_threshold, target rate AND min_efficiency at their old floors (it wanted
+    # to explore looser gates but the box stopped it). Wider floors let OOS
+    # validation decide what actually pays instead of the box deciding a priori.
+    "base_threshold":         (0.12, 0.46, "strategy", "float"),
+    "target_trades_per_hour": (0.2, 6.0, "strategy", "float"),
     "cost_multiple":          (1.2, 3.2, "strategy", "float"),
     "hedge_eta":              (0.15, 0.60, "strategy", "float"),
     "horizon_bars":           (5, 16, "strategy", "int"),
-    "min_efficiency":         (0.25, 0.50, "strategy", "float"),
-    "min_p_win":              (0.44, 0.60, "strategy", "float"),
+    "min_efficiency":         (0.10, 0.50, "strategy", "float"),
+    "min_p_win":              (0.40, 0.60, "strategy", "float"),
     "kelly_fraction":         (0.15, 0.60, "strategy", "float"),
     "maker_offset_bps":       (0.0, 3.0, "strategy", "float"),
     # range scalping is a tuner OPTION again (it was banned after it faded uptrends):
