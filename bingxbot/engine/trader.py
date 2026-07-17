@@ -69,6 +69,7 @@ class TraderEngine:
         self.exits = AdaptiveExitManager(cfg.risk)
         self.on_update = on_update  # async callback(kind: str) -> None
         self.journal = journal      # TradeJournal (records closed trades + context)
+        self.active_champion_id: str | None = None  # vault champion currently driving trades (journal tag)
         s = cfg.strategy
         bars_per_hour = 3_600_000 / max(1, self._interval_ms())
         self.ctx: dict[str, SymbolCtx] = {
@@ -434,6 +435,7 @@ class TraderEngine:
             "p_win": entry_ctx.get("p_win", 0.0), "mtf_align": entry_ctx.get("mtf_align", 0.0),
             "mtf_bias": entry_ctx.get("mtf_bias", 0.0), "desk": entry_ctx.get("desk", ""),
             "funding_rate": entry_ctx.get("funding_rate", 0.0), "mtf": entry_ctx.get("mtf", {}),
+            "champion_id": self.active_champion_id,  # which vault champion took this trade
         }
         try:
             self.journal.record(row)

@@ -70,6 +70,7 @@ class WalkforwardReq(BacktestReq):
 
 class ApplyParamsReq(BaseModel):
     params: dict
+    champion_id: str | None = None   # if applying a vault champion, tag it active
 
 
 @app.get("/api/status")
@@ -162,6 +163,8 @@ async def job_status(job_id: str):
 @app.post("/api/apply_params")
 async def apply_params(req: ApplyParamsReq):
     orch.apply_params(req.params)
+    if req.champion_id:
+        orch.mark_champion_used(req.champion_id)
     return {"ok": True, "config": orch.status()["config"]}
 
 

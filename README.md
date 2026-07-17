@@ -149,12 +149,21 @@ balance, max open positions, the leverage band, and the daily-loss limit. On the
 Settings tab those are the only editable fields; everything else is displayed
 read-only as the live values the tuner has chosen.
 
-**Champion vault (auto-save / auto-prune).** Every promotion is written to a
-persistent store (`data_cache/champions.json`), ranked by validation fitness, and
-**pruned to the best 12** — the worst/old sets are deleted automatically. The
-Auto-Tuner tab shows the vault, and any champion can be re-applied to the live
-brains with one click. The tuner also **hunts faster right after a promotion**
-(tight cadence while it's clearly improving, relaxed cadence when stable).
+**Champion vault — a live candidate pool, not a graveyard.** Every promotion is
+written to a persistent store (`data_cache/champions.json`). Crucially, the vault
+isn't just a history log: **every cycle the tuner re-validates its top sets against
+the *current* market** alongside the freshly-evolved DE candidates and the running
+champion, and runs whichever wins — so the best available set drives trading no
+matter when it was born. Each record keeps **both** its birth evaluation (score
+when generated) **and** its current evaluation (re-scored against today), and — once
+it's driven live trades — its **real executed track record** (trades + realized PnL,
+tagged per champion in the journal). The vault holds the best & most-used **100**;
+the **most-used are protected** from pruning (proven, not merely high-scoring) and
+never-used sets **age out weekly**. The Auto-Tuner tab shows all of this — birth→now
+fitness, live PnL, use count, a 🔥 badge on the top-10 most-used and a **LIVE** badge
+on whichever is currently trading — and any champion can be re-applied with one click.
+The tuner also **hunts faster right after a promotion** (tight cadence while it's
+clearly improving, relaxed when stable).
 
 **It runs on other cores.** The heavy scoring — the continuous tuner and every
 Backtest / Optimizer / Portfolio job — runs in a **process pool** (spawn workers,

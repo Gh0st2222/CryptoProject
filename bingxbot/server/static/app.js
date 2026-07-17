@@ -504,23 +504,37 @@ function renderPortfolio(res){
   const s=res.stats; toast(`Portfolio: ${res.symbols.length} symbols · ${s.trades} trades · WR ${fmt.pct(s.win_rate)} · PF ${s.profit_factor.toFixed(2)}`,s.total_pnl>=0?"good":"warn");
 }
 
-/* champion vault — auto-saved / auto-pruned best parameter sets */
+/* champion vault — the tuner's live candidate pool: each set shown at BIRTH vs
+   re-validated against TODAY, with its real executed track record and use count */
 const CHAMP_KEYS=["base_threshold","risk_per_trade","sl_atr_min","trail_atr_max","giveback_rr","target_trades_per_hour"];
 let champStore=[];
 function renderChampions(){
   champStore=S?.champions||[];
   const body=$("champ-body"); if(!body) return;
-  if(!champStore.length){ body.innerHTML=`<tr><td colspan="6" class="empty">No champions saved yet — the vault fills as the tuner promotes winners</td></tr>`; return; }
+  if(!champStore.length){ body.innerHTML=`<tr><td colspan="9" class="empty">No champions saved yet — the vault fills as the tuner promotes winners</td></tr>`; return; }
   body.innerHTML=champStore.map((c,i)=>{
     const params=CHAMP_KEYS.filter(k=>c.params&&c.params[k]!=null).map(k=>`${k}=${c.params[k]}`).join("  ");
-    return `<tr><td>${fmt.dt(c.ts)}</td><td class="r pnl-pos">${(c.fitness??0).toFixed(2)}</td>
-      <td class="r">${fmt.pct(c.win_rate,0)}</td><td class="r">${(c.profit_factor||0).toFixed(2)}</td>
-      <td style="color:var(--muted);max-width:420px">${esc(params)}</td>
+    const bf=c.birth_fitness??c.fitness??0, cf=c.fitness??0;
+    const arrow=cf>bf+1e-9?"▲":(cf<bf-1e-9?"▼":"·");
+    const lv=c.live||{trades:0,pnl:0};
+    const liveCell=lv.trades?`${lv.trades} · <span class="${pnlCls(lv.pnl)}">${fmt.signed(lv.pnl,2)}</span>`
+                            :`<span style="color:var(--muted)">—</span>`;
+    const badges=(c.active?`<span class="champ-live" title="Currently driving live trading">LIVE</span> `:"")
+                +(c.top_used?`<span title="Top-10 most used — protected from pruning">🔥</span> `:"");
+    return `<tr class="${c.active?'champ-active':''}">
+      <td>${badges}${fmt.dt(c.born_ts)}</td>
+      <td class="r"><span style="color:var(--muted)">${bf.toFixed(2)}</span> ${arrow} <span class="${cf>=0?'pnl-pos':'pnl-neg'}">${cf.toFixed(2)}</span></td>
+      <td class="r">${fmt.pct(c.win_rate,0)}</td>
+      <td class="r">${(c.profit_factor||0).toFixed(2)}</td>
+      <td class="r" style="color:var(--muted)">${c.cur_trades??0}</td>
+      <td class="r">${liveCell}</td>
+      <td class="r">${c.uses??0}</td>
+      <td style="color:var(--muted);max-width:340px">${esc(params)}</td>
       <td><button class="btn sm primary" onclick="applyChampion(${i})">Apply</button></td></tr>`;
   }).join("");
 }
 window.applyChampion=async(i)=>{ const c=champStore[i]; if(!c?.params) return;
-  try{ await api("/api/apply_params",{params:c.params}); toast("Champion parameters applied to running brains","good"); }catch(e){ toast(e.message,"bad"); } };
+  try{ await api("/api/apply_params",{params:c.params,champion_id:c.id}); toast("Champion applied — now driving live trades","good"); }catch(e){ toast(e.message,"bad"); } };
 
 /* ---------------------------------------------------------------- walk-forward */
 function ensureWfChart(){

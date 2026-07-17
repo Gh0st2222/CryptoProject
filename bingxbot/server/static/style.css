@@ -217,6 +217,9 @@ input.field { width: 100%; font-family: var(--mono); }
 .tbl .r { text-align: right; }
 .pnl-pos { color: var(--good); } .pnl-neg { color: var(--bad); }
 .side-long { color: #7db4ee; font-weight: 700; } .side-short { color: #ff9b9b; font-weight: 700; }
+.champ-active td { background: rgba(57,135,229,0.07); }
+.champ-live { display:inline-block; font:700 9.5px/1.4 var(--mono); letter-spacing:.06em; color:var(--accent);
+  border:1px solid var(--accent); border-radius:4px; padding:1px 4px; vertical-align:middle; }
 .empty { color: var(--muted); padding: 24px; text-align: center; font-family: var(--mono); }
 
 /* stat cards */
