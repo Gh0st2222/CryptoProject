@@ -30,7 +30,9 @@ log = logging.getLogger("orchestrator")
 
 LIVE_CONFIRM_PHRASE = "TRADE LIVE"
 CHAMPIONS_PATH = ROOT / "data_cache" / "champions.json"
-CHAMPIONS_KEEP = 12   # keep the top-N champions; prune the worst/old
+CHAMPIONS_KEEP = 100         # vault capacity
+CHAMPIONS_PROTECT_USED = 15  # the most-used champions are never pruned (proven, not just high-scoring)
+CHAMPION_STALE_DAYS = 7      # never-used champions age out of the vault after a week
 
 
 def _split_symbols(raw) -> list[str]:
@@ -154,6 +156,7 @@ class Orchestrator:
         self._pools_ready = False
         self.cores = _plan_cores()  # (interactive_workers, research_workers)
         self.champions: list[dict] = self._load_champions()
+        self.active_champion_id: str | None = None  # the champion currently driving live trading
         self.journal = TradeJournal()
         self.alerter = Alerter()
         self._alert_task: asyncio.Task | None = None
@@ -218,25 +221,131 @@ class Orchestrator:
 
     def _load_champions(self) -> list[dict]:
         try:
-            return json.loads(CHAMPIONS_PATH.read_text())
+            raw = json.loads(CHAMPIONS_PATH.read_text())
         except (OSError, json.JSONDecodeError):
             return []
+        return [self._migrate_champion(c) for c in raw] if isinstance(raw, list) else []
 
-    def record_champion(self, params: dict, fitness: float, stats: dict) -> None:
-        """Save a promoted champion, keep the best CHAMPIONS_KEEP, prune the rest."""
+    @staticmethod
+    def _migrate_champion(c: dict) -> dict:
+        """Bring an old-schema record up to the enriched schema so a vault written
+        by an earlier build still loads — the birth eval defaults to the current
+        eval (they were the same thing before we split them)."""
+        c.setdefault("id", uuid.uuid4().hex[:8])
+        c.setdefault("born_ts", c.get("ts", now_ms()))
+        c.setdefault("cur_trades", 0)
+        c.setdefault("cur_ts", c.get("ts", c["born_ts"]))
+        c.setdefault("birth_fitness", c.get("fitness", 0.0))
+        c.setdefault("birth_wr", c.get("win_rate", 0.0))
+        c.setdefault("birth_pf", c.get("profit_factor", 0.0))
+        c.setdefault("birth_trades", c.get("cur_trades", 0))
+        c.setdefault("uses", 0)
+        c.setdefault("last_used_ts", 0)
+        c.setdefault("params", {})
+        return c
+
+    @staticmethod
+    def _params_match(a: dict, b: dict) -> bool:
+        keys = set(a) | set(b)
+        return bool(keys) and all(abs(float(a.get(k, 0.0)) - float(b.get(k, 0.0))) <= 1e-9 for k in keys)
+
+    def find_champion(self, cid: str | None) -> dict | None:
+        return next((c for c in self.champions if c.get("id") == cid), None) if cid else None
+
+    def record_champion(self, params: dict, fitness: float, stats: dict) -> str:
+        """Save a freshly promoted set as a vault champion and return its id.
+        Stores BOTH the birth evaluation (now, at generation time) and the current
+        evaluation (identical at birth; they diverge as the set is re-validated
+        against a moving market). An all-but-identical set is refreshed in place
+        rather than duplicated."""
+        existing = next((c for c in self.champions if self._params_match(c.get("params", {}), params)), None)
+        if existing is not None:
+            self.set_champion_current(existing["id"], fitness, stats)
+            self.save_champions()
+            return existing["id"]
+        cid = uuid.uuid4().hex[:8]
+        fit = round(float(fitness), 3)
+        wr = round(stats.get("win_rate", 0.0), 4)
+        pf = round(stats.get("profit_factor", 0.0), 3)
+        tr = int(stats.get("trades", 0))
         self.champions.append({
-            "ts": now_ms(), "fitness": round(float(fitness), 3),
-            "win_rate": round(stats.get("win_rate", 0.0), 4),
-            "profit_factor": round(stats.get("profit_factor", 0.0), 3),
-            "params": params,
+            "id": cid, "born_ts": now_ms(),
+            "birth_fitness": fit, "birth_wr": wr, "birth_pf": pf, "birth_trades": tr,
+            "fitness": fit, "win_rate": wr, "profit_factor": pf, "cur_trades": tr,
+            "cur_ts": now_ms(), "uses": 0, "last_used_ts": 0, "params": dict(params),
         })
-        # keep the top-N by fitness (auto-delete the worst/old)
-        self.champions.sort(key=lambda x: x["fitness"], reverse=True)
-        self.champions = self.champions[:CHAMPIONS_KEEP]
+        self.prune_champions()
+        return cid
+
+    def set_champion_current(self, cid: str, fitness: float, stats: dict) -> None:
+        """Update a champion's CURRENT (re-validated-against-today) evaluation,
+        leaving the birth evaluation untouched — the vault shows both side by side.
+        Does not persist; callers batch a save after updating many."""
+        c = self.find_champion(cid)
+        if c is None:
+            return
+        c["fitness"] = round(float(fitness), 3)
+        c["win_rate"] = round(stats.get("win_rate", c.get("win_rate", 0.0)), 4)
+        c["profit_factor"] = round(stats.get("profit_factor", c.get("profit_factor", 0.0)), 3)
+        c["cur_trades"] = int(stats.get("trades", c.get("cur_trades", 0)))
+        c["cur_ts"] = now_ms()
+
+    def mark_champion_used(self, cid: str) -> None:
+        """Record that a champion is now the one driving trading: bump its use
+        count, timestamp it, and tag it active so live trades journal under its id
+        — that's how the vault later shows a champion's REAL trades and PnL."""
+        c = self.find_champion(cid)
+        if c is None:
+            return
+        c["uses"] = int(c.get("uses", 0)) + 1
+        c["last_used_ts"] = now_ms()
+        self.active_champion_id = cid
+        if self.engine is not None:
+            self.engine.active_champion_id = cid
         self.save_champions()
 
+    def prune_champions(self) -> None:
+        """Cap the vault at CHAMPIONS_KEEP while protecting what's PROVEN, not just
+        what scores high right now: the most-used sets (top CHAMPIONS_PROTECT_USED
+        by uses) and the currently-active set are always kept; never-used sets past
+        CHAMPION_STALE_DAYS age out (the weekly cleanup); the rest of the room goes
+        to the best remaining by CURRENT fitness."""
+        champs = self.champions
+        protected = {self.active_champion_id} if self.active_champion_id else set()
+        used = sorted((c for c in champs if c.get("uses", 0) > 0),
+                      key=lambda x: (x.get("uses", 0), x.get("last_used_ts", 0)), reverse=True)
+        protected.update(c["id"] for c in used[:CHAMPIONS_PROTECT_USED])
+
+        now = now_ms()
+        stale_ms = CHAMPION_STALE_DAYS * 86_400_000
+        survivors = [c for c in champs
+                     if c.get("id") in protected
+                     or not (c.get("uses", 0) == 0 and (now - c.get("born_ts", now)) > stale_ms)]
+        # protected first, then by current fitness; cap. (Protected always fit:
+        # PROTECT_USED + 1 active << KEEP.)
+        survivors.sort(key=lambda x: (x.get("id") in protected, x.get("fitness", 0.0)), reverse=True)
+        self.champions = survivors[:CHAMPIONS_KEEP]
+        self.save_champions()
+
+    def champion_live_stats(self) -> dict:
+        """Aggregate REAL executed trades from the journal by the champion that was
+        active when each was taken -> {id: {trades, wins, pnl, win_rate}}. This is a
+        champion's actual live/paper track record, not its backtest score."""
+        out: dict[str, dict] = {}
+        for r in self.journal.rows:
+            cid = r.get("champion_id")
+            if not cid:
+                continue
+            g = out.setdefault(cid, {"trades": 0, "wins": 0, "pnl": 0.0})
+            g["trades"] += 1
+            g["wins"] += 1 if r.get("pnl", 0.0) > 0 else 0
+            g["pnl"] += float(r.get("pnl", 0.0))
+        for g in out.values():
+            g["pnl"] = round(g["pnl"], 4)
+            g["win_rate"] = round(g["wins"] / g["trades"], 3) if g["trades"] else 0.0
+        return out
+
     def save_champions(self) -> None:
-        self.champions = self.champions[:CHAMPIONS_KEEP]
         try:
             CHAMPIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
             CHAMPIONS_PATH.write_text(json.dumps(self.champions, indent=2))
@@ -255,7 +364,12 @@ class Orchestrator:
         d: dict = {"live_win_rate": live.get("win_rate", 0.0),
                    "live_profit_factor": live.get("profit_factor", 0.0),
                    "live_trades": live.get("trades", 0)}
-        ref = self.champions[0] if self.champions else None
+        # reference = what's actually trading (active champion), else the best
+        # current-fitness set in the vault — not just champions[0], which after
+        # pruning is ordered most-used-first, not best-first.
+        ref = self.find_champion(self.active_champion_id)
+        if ref is None and self.champions:
+            ref = max(self.champions, key=lambda c: c.get("fitness", 0.0))
         if ref:
             d["expected_win_rate"] = ref.get("win_rate", 0.0)
             d["expected_profit_factor"] = ref.get("profit_factor", 0.0)
@@ -633,7 +747,18 @@ class Orchestrator:
         if self.autotuner is not None:
             d["autotuner"] = self.autotuner.snapshot()
         if self.champions:
-            d["champions"] = self.champions[:CHAMPIONS_KEEP]
+            live = self.champion_live_stats()
+            top_used = {c["id"] for c in sorted(self.champions, key=lambda x: x.get("uses", 0),
+                        reverse=True)[:10] if c.get("uses", 0) > 0}
+            enriched = []
+            for c in self.champions[:CHAMPIONS_KEEP]:
+                e = dict(c)
+                e["live"] = live.get(c.get("id"), {"trades": 0, "wins": 0, "pnl": 0.0, "win_rate": 0.0})
+                e["top_used"] = c.get("id") in top_used
+                e["active"] = c.get("id") == self.active_champion_id
+                enriched.append(e)
+            d["champions"] = enriched
+            d["active_champion_id"] = self.active_champion_id
         if self.engine is not None:
             d["divergence"] = self._divergence()
             d["alerts_on"] = self.alerter.enabled

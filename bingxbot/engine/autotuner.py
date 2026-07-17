@@ -39,6 +39,7 @@ IMPROVE_MARGIN = 1.06       # OOS challenger must beat champion OOS x this
 MIN_ABS_FITNESS = 0.3       # ...and be clearly profitable (positive risk-adjusted score)
 OVERFIT_LAMBDA = 0.5        # penalty weight on the in-sample -> OOS drop
 TOP_K_VALIDATE = 5          # validate this many training-best members OOS, keep the best generalizer
+VAULT_CANDIDATES = 4        # also re-validate this many top vault champions each cycle (candidate pool, not graveyard)
 STALL_REINJECT = 20         # cycles without a promotion before a diversity restart
 LOOKBACK_DAYS = 60.0
 DATA_TTL_S = 1800
@@ -167,40 +168,63 @@ class AutoTuner:
         self.de.select(trials, trial_fit, member_fit)
         self.de.save()
 
-        # Validate the top-K training members OOS (in parallel) and keep the best
-        # GENERALIZER, not just the training-best — the single best is often an
-        # overfit that fails out-of-sample while a lower-ranked member holds up.
-        topk = self.de.top_k(TOP_K_VALIDATE)
-        val_args = [(p, valid, symbol, interval, spec, taker, slip, strat, risk) for p, _ in topk]
+        # Evaluate EVERY live candidate on the SAME current OOS window in one
+        # parallel batch and run whichever wins: a freshly-evolved DE member, a
+        # champion pulled back out of the vault that STILL fits today's market, or
+        # the incumbent. The vault is a candidate pool, not a graveyard — the best
+        # available champion drives trading, wherever it came from.
+        topk = self.de.top_k(TOP_K_VALIDATE)          # (params, train_fit)
+        vault = sorted(self.orch.champions, key=lambda c: c.get("fitness", 0.0),
+                       reverse=True)[:VAULT_CANDIDATES]
+        cands: list[dict] = [{"source": "de", "params": p, "train_fit": tfit, "cid": None}
+                             for p, tfit in topk]
+        cands += [{"source": "vault", "params": c.get("params", {}), "train_fit": None, "cid": c.get("id")}
+                  for c in vault]
+
+        val_args = [(c["params"], valid, symbol, interval, spec, taker, slip, strat, risk) for c in cands]
         val_args.append((champ, valid, symbol, interval, spec, taker, slip, strat, risk))
         val_res = await self.orch.map_cpu(validate_params, val_args, research=True)
         champ_fit = val_res[-1]["fitness"]
-        best_params, oos_adj, best_stats = {}, -1e18, {}
-        for (p, tfit), res in zip(topk, val_res[:-1]):
-            adj = res["fitness"] - OVERFIT_LAMBDA * max(0.0, tfit - res["fitness"])  # overfit-adjust
-            if adj > oos_adj:
-                best_params, oos_adj, best_stats = p, adj, res["stats"]
+
+        best, best_adj, best_stats = None, -1e18, {}
+        for c, res in zip(cands, val_res[:-1]):
+            oos = res["fitness"]
+            # DE members carry an overfit penalty (in-sample -> OOS drop); vault
+            # champions are scored raw — they've already proven out-of-sample.
+            adj = oos - (OVERFIT_LAMBDA * max(0.0, c["train_fit"] - oos) if c["train_fit"] is not None else 0.0)
+            if c["source"] == "vault" and c["cid"]:
+                self.orch.set_champion_current(c["cid"], oos, res["stats"])  # keep its CURRENT eval fresh
+            if adj > best_adj:
+                best, best_adj, best_stats = c, adj, res["stats"]
 
         self.cycles += 1
         self.champion_fitness = round(champ_fit, 3)
         promoted = False
-        different = any(abs(best_params.get(k, 0) - champ.get(k, 0)) > 1e-9 for k in champ)
-        if different and oos_adj > max(champ_fit * IMPROVE_MARGIN, MIN_ABS_FITNESS):
+        best_params = best["params"] if best else {}
+        different = bool(best) and any(abs(best_params.get(k, 0) - champ.get(k, 0)) > 1e-9 for k in champ)
+        if different and best_adj > max(champ_fit * IMPROVE_MARGIN, MIN_ABS_FITNESS):
             self.orch.apply_params(best_params)
             self.improvements += 1
             promoted = True
             vs = best_stats
+            # tag the champion now driving live trades: reuse the vault entry if
+            # the winner came from the vault, otherwise mint a new one.
+            cid = best["cid"] if (best["source"] == "vault" and best["cid"]) \
+                else self.orch.record_champion(best_params, best_adj, vs)
+            self.orch.mark_champion_used(cid)
             self.history.append({
                 "ts": int(time.time() * 1000),
-                "from_fitness": round(champ_fit, 3), "to_fitness": round(oos_adj, 3),
+                "from_fitness": round(champ_fit, 3), "to_fitness": round(best_adj, 3),
                 "valid_wr": round(vs.get("win_rate", 0), 3), "valid_pf": round(vs.get("profit_factor", 0), 3),
-                "gen": self.de.generation,
+                "gen": self.de.generation, "source": best["source"], "champion_id": cid,
                 "params": {k: best_params[k] for k in ("base_threshold", "risk_per_trade", "sl_atr_min",
                            "trail_atr_max", "giveback_rr", "target_trades_per_hour") if k in best_params},
             })
             self.history = self.history[-25:]
-            self.orch.record_champion(best_params, oos_adj, vs)
-            log.info("auto-tune PROMOTED (gen %d): OOS %.2f -> %.2f", self.de.generation, champ_fit, oos_adj)
+            log.info("auto-tune PROMOTED (gen %d, %s): OOS %.2f -> %.2f",
+                     self.de.generation, best["source"], champ_fit, best_adj)
+        else:
+            self.orch.save_champions()   # persist the refreshed vault current-evals
 
         # diversity restart: if the population has converged without finding a
         # champion for a long time, it's stuck in an overfit basin — re-inject
@@ -219,17 +243,20 @@ class AutoTuner:
             "generation": self.de.generation, "population": len(self.de.pop),
             "diversity": round(self.de.diversity(), 3), "folds": len(fold_fits),
             "research_cores": self.orch.research_workers,
-            "champion_fitness": round(champ_fit, 3), "best_fitness": round(oos_adj, 3),
+            "champion_fitness": round(champ_fit, 3), "best_fitness": round(best_adj, 3),
             "promoted": promoted, "candidates": len(candidates),
+            "vault_candidates": len(vault), "de_candidates": len(topk),
+            "champion_source": (best["source"] if best else None),
         }
         if self.orch._notify:
             await self.orch._notify("autotune")
         return promoted
 
     async def _revalidate_vault(self, valid, symbol, interval, spec, taker, slip, strat, risk) -> None:
-        """Re-score every saved champion on the freshest window and retire the
-        ones that no longer hold up — the vault tracks what still works, not what
-        once did."""
+        """Re-score every saved champion on the freshest window and refresh its
+        CURRENT evaluation (shown in the vault next to what it was born at). We
+        DON'T drop the temporarily-cold — pruning ages out the never-used, and
+        protects the most-used, so a proven champion having a bad week survives."""
         vault = self.orch.champions
         if not vault:
             return
@@ -237,18 +264,11 @@ class AutoTuner:
             validate_params,
             [(c.get("params", {}), valid, symbol, interval, spec, taker, slip, strat, risk) for c in vault],
             research=True)
-        kept = []
         for c, res in zip(vault, results):
-            fit = res.get("fitness", -1.0)
-            if fit > 0:
-                c["fitness"] = round(fit, 3)
-                c["win_rate"] = round(res.get("stats", {}).get("win_rate", c.get("win_rate", 0.0)), 4)
-                c["profit_factor"] = round(res.get("stats", {}).get("profit_factor", c.get("profit_factor", 0.0)), 3)
-                kept.append(c)
-        kept.sort(key=lambda x: x["fitness"], reverse=True)
-        self.orch.champions = kept
-        self.orch.save_champions()
-        log.info("vault revalidated: kept %d/%d on recent data", len(kept), len(vault))
+            self.orch.set_champion_current(
+                c["id"], res.get("fitness", c.get("fitness", 0.0)), res.get("stats", {}))
+        self.orch.prune_champions()
+        log.info("vault revalidated: %d champions re-scored on recent data", len(self.orch.champions))
 
     def snapshot(self) -> dict:
         return {

@@ -247,17 +247,17 @@
     </div>
 
     <div class="tab-page" data-page="autotuner">
-      <p class="foot-note" style="margin-top:0">The always-on research desk, now a real optimizer. A <b>persistent Differential-Evolution population</b> (it remembers across cycles &amp; restarts) is scored across time folds <b>in parallel on a dedicated pool of research cores</b> — indicators built once per fold, reused for every candidate — ranked by a risk-adjusted, recency-weighted robust score, then the best is <b>validated out-of-sample</b> on the most recent window (with an overfit penalty) and hot-swapped into the live brains <b>only</b> when it clearly beats what's running. The champion vault is periodically re-validated on fresh data and stale sets retired. It never touches the settings you own.</p>
+      <p class="foot-note" style="margin-top:0">The always-on research desk, now a real optimizer. A <b>persistent Differential-Evolution population</b> (it remembers across cycles &amp; restarts) is scored across time folds <b>in parallel on a dedicated pool of research cores</b> — indicators built once per fold, reused for every candidate — ranked by a risk-adjusted, recency-weighted robust score, then the best is <b>validated out-of-sample</b> on the most recent window (with an overfit penalty). Every cycle that fresh candidate is run against the <b>top vault champions re-validated on today's market</b> and the running set, and whichever wins is hot-swapped into the live brains — so the <b>best available champion drives trading, wherever it came from</b>. The vault keeps the best &amp; most-used 100 (most-used protected; never-used age out weekly). It never touches the settings you own.</p>
       <div class="at-row" id="at-row"><div class="empty">Auto-tuner idle (engine not running)</div></div>
       <div class="subt" style="margin-top:14px">Promotions — parameters it has adopted</div>
       <div style="overflow:auto"><table class="tbl"><thead><tr>
         <th>When</th><th class="r">Fitness →</th><th class="r">WR</th><th class="r">PF</th><th>Key params adopted</th>
       </tr></thead><tbody id="at-history"><tr><td colspan="5" class="empty">No promotions yet — it only swaps genuine improvements</td></tr></tbody></table></div>
 
-      <div class="subt" style="margin-top:16px">Champion vault — top parameter sets, auto-saved &amp; pruned <span style="color:var(--muted)">(keeps the best 12, deletes the rest)</span></div>
+      <div class="subt" style="margin-top:16px">Champion vault — the tuner's <b>candidate pool, not a graveyard</b> <span style="color:var(--muted)">(each cycle it re-validates the top vault sets against today's market and runs whichever beats the incumbent · keeps the best &amp; most-used 100 · <span style="color:var(--accent)">🔥 top-10 most-used are protected</span> · never-used sets age out weekly)</span></div>
       <div style="overflow:auto"><table class="tbl"><thead><tr>
-        <th>Saved</th><th class="r">Fitness</th><th class="r">WR</th><th class="r">PF</th><th>Key params</th><th></th>
-      </tr></thead><tbody id="champ-body"><tr><td colspan="6" class="empty">No champions saved yet — the vault fills as the tuner promotes winners</td></tr></tbody></table></div>
+        <th>Born</th><th class="r" title="score when generated → re-validated against today's market">Fitness (birth→now)</th><th class="r">WR</th><th class="r">PF</th><th class="r" title="backtest trades on the re-validation window">Trades</th><th class="r" title="REAL executed trades · realized PnL under this champion">Live</th><th class="r" title="times promoted to drive live trading">Used</th><th>Key params</th><th></th>
+      </tr></thead><tbody id="champ-body"><tr><td colspan="9" class="empty">No champions saved yet — the vault fills as the tuner promotes winners</td></tr></tbody></table></div>
     </div>
 
     <div class="tab-page" data-page="settings">
