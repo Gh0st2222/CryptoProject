@@ -21,7 +21,8 @@ from ..strategy.brain import TradingBrain
 from ..strategy.exits import AdaptiveExitManager
 from ..strategy.features import FeatureFrame, mtf_from_row
 from ..util import now_ms
-from .backtest import _entry_signal_ok
+from .backtest import (_entry_signal_ok, gate_funding, gate_mtf_veto,
+                       gate_regime)
 from .brokers import Broker, LiveBroker
 from .portfolio import Portfolio
 
@@ -50,6 +51,7 @@ class SymbolCtx:
         self.react_dir = 0            # sign of the last reactive signal (confirmation)
         self.react_confirm = 0        # consecutive scans agreeing on direction
         self.entry_ctx: dict = {}     # decision context captured at the open (for the journal)
+        self.gates: list[dict] = []   # live entry-gate X-ray [{n, ok, d}] for the UI
         self.busy = False  # guards against overlapping broker calls
 
     def set_stage(self, stage: str) -> None:
@@ -197,6 +199,8 @@ class TraderEngine:
         ctx.react_ts = now_ms()   # the bar-close pass counts as a fresh scan
 
         pos = self.portfolio.positions.get(symbol)
+        if pos is None:
+            self._build_gates(ctx, st, row, ev)
         ctx.busy = True
         try:
             if pos is not None:
@@ -239,8 +243,7 @@ class TraderEngine:
             ctx.last_entry_block = why
             return
         spec = self.specs.get(symbol, ContractSpec(symbol))
-        fees_rt = spec.taker_fee + (spec.maker_fee if self.cfg.strategy.entry_mode == "maker" else spec.taker_fee)
-        slip = self.cfg.paper.slippage_bps if self.portfolio.mode != "live" else 1.0
+        fees_rt, slip = self._entry_costs(symbol)
         if not _entry_signal_ok(ctx.brain, self.cfg.strategy, edge, p_win, row, ev, fees_rt, slip):
             ctx.last_entry_block = self._block_reason(ctx.brain, edge, p_win, row, ev, fees_rt, spread, slip)
             return
@@ -310,17 +313,54 @@ class TraderEngine:
             "funding_rate": round(row.get("funding_rate", 0.0), 6),
         }
 
-    @staticmethod
-    def _block_reason(brain, edge, p_win, row, ev, fees_rt, spread, slip) -> str:
+    def _block_reason(self, brain, edge, p_win, row, ev, fees_rt, spread, slip) -> str:
+        """The FIRST failing gate, with its live numbers — never a vague label.
+        'trend ER 0.14 < 0.27' tells you exactly what the machine is waiting for;
+        'awaiting aligned trend' told you nothing."""
         ok, why = brain.entry_ok(edge, p_win, row, fees_rt, spread, slip)
         if not ok:
             return why
-        r = ev["regime"]
-        if r == "RANGE":
-            return "range (discipline: trends only)"
-        if r == "VOLATILE":
-            return "volatile regime (sitting out)"
-        return "awaiting aligned trend"
+        strat = self.cfg.strategy
+        for fn in (gate_mtf_veto, gate_funding):
+            ok, d = fn(strat, edge, row)
+            if not ok:
+                return d
+        ok, d = gate_regime(strat, edge, row, ev["regime"])
+        return d if not ok else ""
+
+    def _entry_costs(self, symbol: str) -> tuple[float, float]:
+        spec = self.specs.get(symbol, ContractSpec(symbol))
+        fees_rt = spec.taker_fee + (spec.maker_fee if self.cfg.strategy.entry_mode == "maker" else spec.taker_fee)
+        slip = self.cfg.paper.slippage_bps if self.portfolio.mode != "live" else 1.0
+        return fees_rt, slip
+
+    def _build_gates(self, ctx: SymbolCtx, st: MarketState, row: dict, ev: dict) -> None:
+        """Refresh the symbol's entry-gate X-ray: EVERY rung of the entry chain
+        with its live numbers, pass or fail, no early exit — so the UI can show
+        exactly which gate is holding fire and by how much."""
+        strat = self.cfg.strategy
+        edge, p_win = ev["edge"], ev["p_win"]
+        fees_rt, slip = self._entry_costs(ctx.symbol)
+        spread = st.spread_bps.get(1.0)
+        marks = {s: s_st.mark_price() for s, s_st in self.feed.states.items()}
+        risk_ok, risk_why = self.risk.can_enter(
+            self.portfolio.equity(marks), len(self.portfolio.positions), spread)
+        gates = [{"n": "risk", "ok": risk_ok, "d": risk_why or "clear"}]
+        gates += ctx.brain.entry_report(edge, p_win, row, fees_rt, spread or 1.0, slip)
+        for name, (g_ok, d) in (("mtf veto", gate_mtf_veto(strat, edge, row)),
+                                ("funding", gate_funding(strat, edge, row))):
+            gates.append({"n": name, "ok": g_ok, "d": d})
+        r_ok, r_d = gate_regime(strat, edge, row, ev["regime"])
+        gates.append({"n": "regime", "ok": r_ok, "d": f"{ev['regime']} · {r_d}"})
+        if strat.micro_confirm:
+            micro = st.micro_snapshot()
+            lean = 0.6 * micro.get("flow", 0.0) + 0.4 * micro.get("obi", 0.0)
+            gates.append({"n": "order-flow", "ok": ctx.brain.micro_confirms(edge, micro),
+                          "d": f"lean {lean:+.2f} vs edge {edge:+.2f}"})
+        need = max(1, strat.entry_confirm_scans)
+        gates.append({"n": "confirm", "ok": ctx.react_confirm >= need,
+                      "d": f"{min(ctx.react_confirm, need)}/{need} scans agree"})
+        ctx.gates = gates
 
     # ------------------------------------------------------------ tick logic
 
@@ -375,6 +415,7 @@ class TraderEngine:
         ctx.eval_ms = (time.perf_counter() - t0) * 1000.0
         ctx.last_row, ctx.last_eval = row, ev
         ctx.mtf = mtf_from_row(row, ff.ladder)
+        self._build_gates(ctx, st, row, ev)
 
         # confirmation buffer: an intra-bar signal must persist in the same
         # direction across a few scans before we act, so a transient tick that
@@ -468,6 +509,7 @@ class TraderEngine:
                     "stage": c.stage,
                     "eval_ms": round(c.eval_ms, 2),
                     "mtf": c.mtf,
+                    "gates": c.gates,
                 }
                 for sym, c in self.ctx.items()
             },
@@ -476,6 +518,20 @@ class TraderEngine:
             "equity_curve": list(self.portfolio.equity_curve)[-600:],
             "trades": [dc_asdict(t) for t in self.portfolio.trades[-80:]],
         }
+
+    def _live_candle(self, sym: str) -> dict | None:
+        """The still-forming bar (or the last closed one) as a compact dict — rides
+        the hot channel so the chart's last candle moves tick-by-tick instead of
+        waiting for a REST poll."""
+        st = self.feed.states.get(sym)
+        if st is None:
+            return None
+        p = st.candles.partial
+        if p is None:
+            if not len(st.candles):
+                return None
+            p = st.candles.tail(1)[0]
+        return {"t": p.ts // 1000, "o": p.open, "h": p.high, "l": p.low, "c": p.close}
 
     def hot(self) -> dict:
         """Small, fast-changing snapshot for the high-cadence UI channel: live
@@ -498,6 +554,8 @@ class TraderEngine:
                     "regime": c.last_eval.get("regime", ""),
                     "bars_held": c.bars_held,
                     "mtf": c.mtf,
+                    "candle": self._live_candle(sym),
+                    "gates": c.gates,
                 }
                 for sym, c in self.ctx.items()
             },

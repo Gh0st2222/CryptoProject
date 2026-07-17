@@ -1,8 +1,11 @@
 /* PULSE terminal — vanilla JS + vendored lightweight-charts. */
 "use strict";
 
-const C = { up:"#16c060", dn:"#f0555a", accent:"#3987e5", muted:"#6b7280", grid:"#23272e", baseline:"#333a44", ink2:"#aeb4bd" };
-const DESK_COLORS = { trend:"#3987e5", meanrev:"#16c060", micro:"#d55181", vol:"#e0a52a", carry:"#9085e9" };
+/* neon-noir palette — candles are a diverging polarity pair (mint/magenta,
+   deutan ΔE 11.9 + direction as secondary encoding); desks are the validated
+   categorical set (dark band, adjacent ΔE ≥ 9). */
+const C = { up:"#00e0a0", dn:"#ff3d7f", accent:"#00d2ff", muted:"#59637a", grid:"#10141f", baseline:"#1d2436", ink2:"#a6b3c2" };
+const DESK_COLORS = { trend:"#009ec2", meanrev:"#9d6bff", micro:"#e8266d", vol:"#bd8610", carry:"#00a874" };
 const DESK_ORDER = ["trend","meanrev","micro","vol","carry"];
 const DESK_LABEL = { trend:"TREND", meanrev:"MEANREV", micro:"MICRO", vol:"VOL", carry:"CARRY" };
 const REGIME_META = {
@@ -42,7 +45,7 @@ function initCharts(){
   candleSeries=mainChart.addCandlestickSeries({upColor:C.up,downColor:C.dn,borderUpColor:C.up,borderDownColor:C.dn,wickUpColor:C.up,wickDownColor:C.dn});
   equityChart=LightweightCharts.createChart($("chart-equity"),{...baseOpts(118),
     rightPriceScale:{borderColor:C.baseline,scaleMargins:{top:0.15,bottom:0.1}},timeScale:{visible:false},handleScroll:false,handleScale:false});
-  equitySeries=equityChart.addAreaSeries({lineColor:C.accent,lineWidth:2,topColor:"rgba(57,135,229,0.25)",bottomColor:"rgba(57,135,229,0.02)",priceLineVisible:false});
+  equitySeries=equityChart.addAreaSeries({lineColor:C.accent,lineWidth:2,topColor:"rgba(0,210,255,0.22)",bottomColor:"rgba(0,210,255,0.02)",priceLineVisible:false});
   new ResizeObserver(()=>{ mainChart.applyOptions({width:$("chart-main").clientWidth}); equityChart.applyOptions({width:$("chart-equity").clientWidth}); }).observe($("chart-main"));
 }
 function tradeMarkers(markers){ return markers.slice().sort((a,b)=>a.ts-b.ts).map(m=>m.kind==="entry"?
@@ -111,6 +114,17 @@ function renderPipeline(){
     return `<div class="pstage ${cls}"><div class="n">${String(i+1).padStart(2,"0")}</div><div class="l">${s}</div></div>`;
   }).join("");
 }
+function renderGates(es){
+  // the entry-gate X-ray: every rung of the entry chain with live numbers —
+  // the failing rung is exactly why the machine is holding fire.
+  const el=$("gate-list"); if(!el) return;
+  const held=S?.engine?.portfolio?.open_positions?.[curSymbol];
+  if(held){ el.innerHTML=`<span class="mtf-empty">in position — gates re-arm on exit</span>`; return; }
+  const g=es?.gates||[];
+  if(!g.length){ el.innerHTML=`<span class="mtf-empty">warming up…</span>`; return; }
+  el.innerHTML=g.map(x=>`<div class="gate ${x.ok?'pass':'fail'}" title="${esc(x.d)}">
+    <span class="gd">${x.ok?"▮":"▯"}</span><span class="gn">${esc(x.n)}</span><span class="gv">${esc(x.d)}</span></div>`).join("");
+}
 function renderMTF(es){
   const strip=$("mtf-strip"); if(!strip) return;
   const mtf=es?.mtf||{};
@@ -133,9 +147,9 @@ function renderEdgeGauge(b, es){
   $("px-last").textContent=fmt.px(es.price);
   const edge=b.edge||0, thr=b.threshold||0.3;
   $("edge-val").textContent=fmt.signed(edge,2);
-  $("edge-val").style.color=Math.abs(edge)<thr?"var(--ink)":(edge>0?"#7db4ee":"#ff9b9b");
+  $("edge-val").style.color=Math.abs(edge)<thr?"var(--ink)":(edge>0?"#5fe8ff":"#ff86b0");
   const nd=$("edge-needle"); nd.style.left=`calc(${50+clamp(edge,-1,1)*49}% - 2px)`;
-  nd.style.background=Math.abs(edge)<thr?C.ink2:(edge>0?"#7db4ee":"#ff9b9b");
+  nd.style.background=Math.abs(edge)<thr?C.ink2:(edge>0?"#5fe8ff":"#ff86b0");
   $("edge-thr-pos").style.left=`${50+thr*49}%`; $("edge-thr-neg").style.left=`${50-thr*49}%`;
   $("edge-thr").textContent=`thr ${thr.toFixed(2)}`;
   const p=b.p_win||0.5; $("pwin-val").textContent=fmt.pct(p,0);
@@ -162,6 +176,7 @@ function renderBrain(){
   $("b-conf").textContent=`conf ${fmt.pct(b.regime_conf,0)}`;
   $("b-vol").textContent=`vol ${(micro.spread_bps).toFixed(1)}bp`;
   renderMTF(es);
+  renderGates(es);
 
   // desks
   renderDesks(b.desks);
@@ -310,6 +325,8 @@ function applyHot(h){
     const s=S.engine.symbols?.[sym]; if(!s) continue;
     s.price=hs.price; s.stage=hs.stage; s.eval_ms=hs.eval_ms; s.entry_block=hs.entry_block; s.bars_held=hs.bars_held;
     if(hs.mtf) s.mtf=hs.mtf;
+    if(hs.gates) s.gates=hs.gates;
+    if(hs.candle) s.candle=hs.candle;
     if(s.brain){ s.brain.edge=hs.edge; s.brain.p_win=hs.p_win; s.brain.regime=hs.regime; }
   }
   for(const [sym,hp] of Object.entries(he.positions||{})){
@@ -318,10 +335,21 @@ function applyHot(h){
   if(he.tape) S.engine.tape=he.tape;
   renderHot();
 }
+let lastEqT=0;
 function renderHot(){
   if(!S?.engine) return;
   renderTop(); renderPipeline(); renderPositions(); renderTape();
-  const es=engSym(); if(es&&es.brain){ renderEdgeGauge(es.brain, es); renderMTF(es); }
+  const es=engSym(); if(es&&es.brain){ renderEdgeGauge(es.brain, es); renderMTF(es); renderGates(es); }
+  // live-forming candle straight off the hot channel — the chart moves at tick
+  // cadence now instead of waiting for the next REST poll.
+  if(es?.candle&&candleSeries){
+    try{ candleSeries.update({time:es.candle.t,open:es.candle.o,high:es.candle.h,low:es.candle.l,close:es.candle.c}); }catch(e){}
+  }
+  const eq=S.engine.portfolio?.equity;
+  if(eq!=null&&equitySeries){
+    const t=Math.floor(Date.now()/1000);
+    if(t>lastEqT){ lastEqT=t; try{ equitySeries.update({time:t,value:eq}); }catch(e){} }
+  }
 }
 
 /* ---------------------------------------------------------------- ws */
@@ -380,7 +408,7 @@ async function pollJob(jobId,progressEl,onDone){
 function ensureBtCharts(){
   if(btEquityChart) return;
   btEquityChart=LightweightCharts.createChart($("chart-bt-equity"),baseOpts(220));
-  btEquitySeries=btEquityChart.addAreaSeries({lineColor:C.accent,lineWidth:2,topColor:"rgba(57,135,229,0.25)",bottomColor:"rgba(57,135,229,0.02)",priceLineVisible:false});
+  btEquitySeries=btEquityChart.addAreaSeries({lineColor:C.accent,lineWidth:2,topColor:"rgba(0,210,255,0.22)",bottomColor:"rgba(0,210,255,0.02)",priceLineVisible:false});
   btAllocChart=LightweightCharts.createChart($("chart-bt-alloc"),{...baseOpts(220),rightPriceScale:{borderColor:C.baseline,scaleMargins:{top:0.08,bottom:0.08}}});
   for(const d of DESK_ORDER) btAllocSeries[d]=btAllocChart.addLineSeries({color:DESK_COLORS[d],lineWidth:2,priceLineVisible:false,lastValueVisible:false,title:d});
   new ResizeObserver(()=>{ btEquityChart.applyOptions({width:$("chart-bt-equity").clientWidth}); btAllocChart.applyOptions({width:$("chart-bt-alloc").clientWidth}); }).observe($("chart-bt-equity"));
@@ -469,7 +497,7 @@ window.applyParams=async(i)=>{ const f=opFinalists[i]; if(!f) return;
 function ensurePfChart(){
   if(pfEquityChart) return;
   pfEquityChart=LightweightCharts.createChart($("chart-pf-equity"),baseOpts(240));
-  pfEquitySeries=pfEquityChart.addAreaSeries({lineColor:C.accent,lineWidth:2,topColor:"rgba(57,135,229,0.25)",bottomColor:"rgba(57,135,229,0.02)",priceLineVisible:false});
+  pfEquitySeries=pfEquityChart.addAreaSeries({lineColor:C.accent,lineWidth:2,topColor:"rgba(0,210,255,0.22)",bottomColor:"rgba(0,210,255,0.02)",priceLineVisible:false});
   new ResizeObserver(()=>{ pfEquityChart.applyOptions({width:$("chart-pf-equity").clientWidth}); }).observe($("chart-pf-equity"));
 }
 $("pf-run").onclick=async()=>{
@@ -540,7 +568,7 @@ window.applyChampion=async(i)=>{ const c=champStore[i]; if(!c?.params) return;
 function ensureWfChart(){
   if(wfEquityChart) return;
   wfEquityChart=LightweightCharts.createChart($("chart-wf-equity"),baseOpts(240));
-  wfEquitySeries=wfEquityChart.addAreaSeries({lineColor:C.accent,lineWidth:2,topColor:"rgba(57,135,229,0.25)",bottomColor:"rgba(57,135,229,0.02)",priceLineVisible:false});
+  wfEquitySeries=wfEquityChart.addAreaSeries({lineColor:C.accent,lineWidth:2,topColor:"rgba(0,210,255,0.22)",bottomColor:"rgba(0,210,255,0.02)",priceLineVisible:false});
   new ResizeObserver(()=>{ wfEquityChart.applyOptions({width:$("chart-wf-equity").clientWidth}); }).observe($("chart-wf-equity"));
 }
 $("wf-run").onclick=async()=>{ try{ const r=await api("/api/walkforward",{symbol:$("wf-symbol").value.trim().toUpperCase(),
@@ -600,4 +628,6 @@ function renderAnalytics(d){
 }
 
 initCharts(); connectWS();
-setInterval(()=>{ if(S?.engine) refreshCandles(false); },5000);
+// slow reconciliation only (closed bars + markers) — the live candle rides the
+// 0.4s hot channel now; skip entirely while the tab is hidden.
+setInterval(()=>{ if(S?.engine&&!document.hidden) refreshCandles(false); },10000);
