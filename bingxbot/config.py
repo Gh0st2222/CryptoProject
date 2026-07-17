@@ -48,7 +48,7 @@ class StrategyConfig:
     base_threshold: float = 0.30    # |fused edge| needed to consider a trade
     threshold_adapt: bool = True    # auto-tune threshold toward target trade rate
     target_trades_per_hour: float = 2.5
-    cost_multiple: float = 2.0      # predicted move must exceed round-trip cost x this
+    cost_multiple: float = 1.85     # predicted move must exceed round-trip cost x this
     micro_confirm: bool = True      # order-flow agreement gate at entry (live/paper)
     entry_confirm_scans: int = 2    # reactive intra-bar signal must persist this many scans
     trend_align_gate: bool = True   # in trends, only trade with multi-TF alignment
@@ -58,7 +58,8 @@ class StrategyConfig:
     trade_range: bool = False       # opt-in: scalp range extremes (maker in/out). Off by
     range_band_edge: float = 0.15   # default — range mean-reversion is a weak edge; the
     trade_volatile: bool = False    # sit out VOLATILE/chop (pure fee bleed)
-    min_p_win: float = 0.50         # refuse trades below this calibrated win prob
+    min_p_win: float = 0.48         # refuse trades below this calibrated win prob
+                                    # (trend systems profit at <50% via asymmetric R)
     use_kelly: bool = True          # size by fractional Kelly from P(win)
     kelly_fraction: float = 0.30    # fraction of full Kelly (conservative)
     entry_mode: str = "maker"       # maker (post-only, pays maker fee) | taker
@@ -121,7 +122,7 @@ class ServerConfig:
 # override values persisted by an older build. On load, a config written by an
 # older version keeps only the user-owned settings; the tuner-owned params are
 # reset to current defaults (then the auto-tuner evolves from there).
-CONFIG_VERSION = 4
+CONFIG_VERSION = 5
 
 # Top-level settings the user owns — everything else is auto-managed by the
 # tuner and reset to code defaults when migrating an older config.
