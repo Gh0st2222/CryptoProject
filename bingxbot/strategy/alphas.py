@@ -90,6 +90,39 @@ def alpha_meanrev_bb(row, micro, ctx) -> float:
     return clamp(s, -1, 1)
 
 
+def alpha_capitulation(row, micro, ctx) -> float:
+    """Liquidation-cascade reversion: a violent, huge-range bar on heavy volume
+    whose extreme wick gets RECLAIMED by the close is forced liquidation
+    exhausting itself — fade it. Pure OHLCV (fully backtestable); live funding /
+    open-interest context boosts conviction when it confirms a squeeze. One of
+    the few fast edges that survives retail latency: we are not racing anyone,
+    we provide liquidity after the race ends. [EVENT]"""
+    o, h, l, c = row.get("open", 0), row.get("high", 0), row.get("low", 0), row.get("close", 0)
+    atr_, vol_z = row.get("atr", 0), row.get("vol_z", 0)
+    if not _fin(o, h, l, c, atr_, vol_z) or atr_ <= 0:
+        return 0.0
+    rng = h - l
+    if rng < 2.2 * atr_ or vol_z < 1.5:            # needs a violent, high-volume bar
+        return 0.0
+    lower, upper = min(o, c) - l, h - max(o, c)
+    pos_in_bar = (c - l) / max(rng, 1e-12)
+    strength = clamp((rng / atr_ - 2.2) / 2.0 + 0.4, 0.0, 1.0)
+    if lower > 0.55 * rng and pos_in_bar > 0.6:    # flush down, close reclaimed -> long
+        s = strength
+    elif upper > 0.55 * rng and pos_in_bar < 0.4:  # squeeze up, close rejected -> short
+        s = -strength
+    else:
+        return 0.0
+    boost = 1.0
+    fr = ctx.get("funding_rate")
+    if fr is not None and math.isfinite(fr) and fr * s > 0 and abs(fr) > 0.0002:
+        boost *= 1.25                              # crowded side just got flushed
+    oi = ctx.get("oi_change_pct")
+    if oi is not None and math.isfinite(oi) and oi < -0.005:
+        boost *= 1.15                              # open interest actually left the market
+    return clamp(s * boost, -1, 1)
+
+
 def alpha_rsi_fade(row, micro, ctx) -> float:
     """RSI(14) exhaustion fade. [EVENT]"""
     r = row.get("rsi_14", 50)
@@ -247,6 +280,7 @@ ALPHAS: dict[str, callable] = {
     "breakout": alpha_breakout,
     "roc_accel": alpha_roc_accel,
     "meanrev_bb": alpha_meanrev_bb,
+    "capitulation": alpha_capitulation,
     "rsi_fade": alpha_rsi_fade,
     "stoch_fade": alpha_stoch_fade,
     "vwap_revert": alpha_vwap_revert,
@@ -266,7 +300,8 @@ ALPHA_META: dict[str, tuple[str, str]] = {
     "momentum": ("trend", CONT), "macd": ("trend", CONT),
     "mtf_trend": ("trend", CONT), "breakout": ("trend", EVENT),
     "roc_accel": ("trend", CONT),
-    "meanrev_bb": ("meanrev", CONT), "rsi_fade": ("meanrev", EVENT),
+    "meanrev_bb": ("meanrev", CONT), "capitulation": ("meanrev", EVENT),
+    "rsi_fade": ("meanrev", EVENT),
     "stoch_fade": ("meanrev", EVENT), "vwap_revert": ("meanrev", EVENT),
     "vwap_pullback": ("meanrev", EVENT),
     "obi": ("micro", CONT), "flow": ("micro", CONT),

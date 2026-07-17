@@ -40,7 +40,10 @@ class ExchangeConfig:
 
 @dataclass
 class StrategyConfig:
-    interval: str = "5m"            # 15m/5m recommended; 1m only with maker entries
+    interval: str = "15m"           # SIGNAL timeframe. 1m is execution-only: the
+                                    # reactive intra-bar scanner already times entries
+                                    # inside the forming bar; the signal itself needs a
+                                    # timeframe where edge/cost > 1 (15m-4h).
     warmup_bars: int = 350          # bars required before the brain may trade
     horizon_bars: int = 8           # bars over which alpha/desk calls are graded
     hedge_eta: float = 0.35         # multiplicative-weights learning rate (alphas)
@@ -107,6 +110,24 @@ class RiskConfig:
 
 
 @dataclass
+class CarryConfig:
+    """Funding-carry desk: harvest extreme perp funding as its own strategy.
+    Enters the RECEIVING side of stretched funding when the 4h trend doesn't
+    oppose it; small size, low leverage, always stopped. The one edge in this
+    codebase that does not require out-predicting anyone — the funding print
+    is public and the payment is mechanical."""
+    enabled: bool = True
+    max_positions: int = 1          # carry's own cap (also counts toward the global cap)
+    min_apr: float = 0.35           # enter when |funding| annualized >= this (35% APR)
+    exit_apr: float = 0.10          # exit once funding has normalized below this
+    risk_frac: float = 0.5          # fraction of risk_per_trade to use per carry trade
+    leverage: int = 2               # fixed low leverage — carry is a yield trade
+    stop_atr_4h: float = 2.5        # stop distance in 4h ATRs
+    max_hold_hours: int = 30        # ~3 funding windows, then out regardless
+    trend_veto_er: float = 0.35     # skip if the 4h trend opposes the side this strongly
+
+
+@dataclass
 class PaperConfig:
     starting_balance: float = 10_000.0
     slippage_bps: float = 1.0  # also stands in for order latency cost
@@ -122,7 +143,7 @@ class ServerConfig:
 # override values persisted by an older build. On load, a config written by an
 # older version keeps only the user-owned settings; the tuner-owned params are
 # reset to current defaults (then the auto-tuner evolves from there).
-CONFIG_VERSION = 5
+CONFIG_VERSION = 6
 
 # Top-level settings the user owns — everything else is auto-managed by the
 # tuner and reset to code defaults when migrating an older config.
@@ -141,6 +162,7 @@ class BotConfig:
     exchange: ExchangeConfig = field(default_factory=ExchangeConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
+    carry: CarryConfig = field(default_factory=CarryConfig)
     paper: PaperConfig = field(default_factory=PaperConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
 
@@ -190,6 +212,7 @@ _NESTED_USER_OWNED = {
     # to the current 2-7x default; it stays UI-editable afterwards.
     "risk": {"max_open_positions", "max_daily_loss_pct", "margin_mode",
              "max_spread_bps", "max_consecutive_losses", "cooldown_minutes"},
+    "carry": {"enabled", "max_positions"},
 }
 
 
@@ -217,6 +240,11 @@ def load_config(path: Path = CONFIG_PATH) -> BotConfig:
             # migrate: keep the user's settings, reset tuner-owned params to
             # current defaults, and persist the upgraded file.
             _merge_into(cfg, _filter_user_owned(raw))
+            # v6 strategic migration: 1m is no longer a SIGNAL timeframe (it's
+            # execution-only — the reactive scanner). A preserved 1m interval is
+            # upgraded once to the new 15m default; still user-editable after.
+            if raw.get("version", 0) < 6 and cfg.strategy.interval == "1m":
+                cfg.strategy.interval = "15m"
             save_config(cfg, path)
     return cfg
 

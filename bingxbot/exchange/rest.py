@@ -230,6 +230,41 @@ class BingXRest:
         row = data[0] if isinstance(data, list) and data else data
         return safe_float(row.get("openInterest"))
 
+    async def premium_index_all(self) -> list[dict]:
+        """Funding rate + mark price for EVERY perp in one call — the market
+        radar's raw feed. Omitting `symbol` returns the whole universe."""
+        data = await self._request("GET", "/openApi/swap/v2/quote/premiumIndex")
+        rows = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+        out = []
+        for row in rows:
+            sym = row.get("symbol", "")
+            if not sym:
+                continue
+            out.append({
+                "symbol": sym,
+                "mark": safe_float(row.get("markPrice")),
+                "funding_rate": safe_float(row.get("lastFundingRate")),
+                "next_funding_time": int(safe_float(row.get("nextFundingTime"))),
+            })
+        return out
+
+    async def tickers_24h(self) -> list[dict]:
+        """24h stats for every perp (volume + change) — feeds universe ranking."""
+        data = await self._request("GET", "/openApi/swap/v2/quote/ticker")
+        rows = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+        out = []
+        for row in rows:
+            sym = row.get("symbol", "")
+            if not sym:
+                continue
+            out.append({
+                "symbol": sym,
+                "last": safe_float(row.get("lastPrice")),
+                "quote_volume": safe_float(row.get("quoteVolume")),
+                "change_pct": safe_float(row.get("priceChangePercent")),
+            })
+        return out
+
     # --------------------------------------------------------------- account
 
     async def balance(self) -> dict:

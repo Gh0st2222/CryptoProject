@@ -170,7 +170,7 @@ async def apply_params(req: ApplyParamsReq):
 
 # event -> which channel it drives. "hot" is the small high-cadence payload
 # (prices, uPnL, stage); everything structural rides the heavier full state.
-FULL_EVENTS = {"state", "bar", "trade", "mode", "job", "autotune", "config", "heartbeat"}
+FULL_EVENTS = {"state", "bar", "trade", "mode", "job", "autotune", "config", "heartbeat", "radar"}
 FULL_MIN_GAP = 0.9    # seconds between heavy full-state pushes
 HOT_MIN_GAP = 0.25    # seconds between light hot pushes (≈ up to 4/s)
 

@@ -18,6 +18,9 @@ from ..util import clamp, round_step
 
 log = logging.getLogger("risk")
 
+MAINT_MARGIN_RATE = 0.005    # BingX isolated maintenance margin (~0.5% for majors)
+LIQ_STOP_HEADROOM = 0.8      # the stop must sit within this fraction of the liq distance
+
 # Local import guard: regime tables live in strategy but risk shouldn't hard-
 # depend on the strategy package import order.
 from ..strategy.regime import REGIME_EXIT_MULT  # noqa: E402
@@ -170,6 +173,13 @@ class RiskManager:
 
         implied_lev = (risk_amount / stop_dist) * price / equity   # leverage risk-sizing wants
         lev = clamp(implied_lev, lev_min, lev_max)
+        # LIQUIDATION-DISTANCE GUARD: the stop must always sit within ~80% of the
+        # distance to isolated-margin liquidation (liq_frac ~ 1/lev - maintenance
+        # margin). A wick through liquidation is the one loss you can't iterate
+        # on — cap leverage so the stop fires first, with margin to spare.
+        stop_frac = stop_dist / price
+        lev_liq_cap = 1.0 / (stop_frac / LIQ_STOP_HEADROOM + MAINT_MARGIN_RATE)
+        lev = clamp(min(lev, lev_liq_cap), 1.0, lev_max)
         qty = lev * equity / price
 
         # hard safety cap: no single trade may risk more than max_risk_hard_pct,

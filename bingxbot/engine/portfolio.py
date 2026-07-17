@@ -13,6 +13,7 @@ class Portfolio:
         self.mode = mode
         self.starting_balance = starting_balance
         self.cash = starting_balance          # realized balance (paper)
+        self.funding_paid = 0.0               # cumulative funding transfers (+paid/-received)
         self.live_equity: float | None = None  # authoritative equity in live mode
         self.positions: dict[str, Position] = {}
         self.trades: list[TradeRecord] = []
@@ -43,6 +44,13 @@ class Portfolio:
     def open_position(self, pos: Position, entry_fee: float) -> None:
         self.positions[pos.symbol] = pos
         self.cash -= entry_fee
+
+    def charge_funding(self, amount: float) -> None:
+        """Perp funding transfer while holding (+ = paid out, - = received).
+        Backtests charge an assumed rate at every 8h boundary; the carry desk
+        credits real received funding here."""
+        self.cash -= amount
+        self.funding_paid += amount
 
     def close_position(self, symbol: str, exit_price: float, exit_ts: int,
                        exit_fee: float, reason: str, planned_risk: float = 0.0) -> TradeRecord | None:
@@ -95,9 +103,12 @@ class Portfolio:
             "avg_r": round(sum(t.r_multiple for t in trades) / n, 3) if n else 0.0,
             "total_pnl": round(sum(rets), 6),
             "fees_paid": round(sum(t.fees for t in trades), 6),
+            "funding_paid": round(self.funding_paid, 6),
             "max_drawdown": round(max_dd, 4),
             "sharpe_like": round(sharpe_like, 3),
             "equity": round(curve[-1], 6),
+            "total_return": round(curve[-1] / self.starting_balance - 1.0, 6)
+            if self.starting_balance > 0 else 0.0,
         }
 
     def to_dict(self, marks: dict[str, float] | None = None) -> dict:
