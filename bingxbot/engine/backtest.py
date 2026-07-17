@@ -533,12 +533,15 @@ TUNABLES: dict[str, tuple] = {
     "hedge_eta":              (0.15, 0.60, "strategy", "float"),
     "horizon_bars":           (5, 16, "strategy", "int"),
     "min_efficiency":         (0.25, 0.50, "strategy", "float"),
-    "min_p_win":              (0.48, 0.60, "strategy", "float"),
+    "min_p_win":              (0.44, 0.60, "strategy", "float"),
     "kelly_fraction":         (0.15, 0.60, "strategy", "float"),
     "maker_offset_bps":       (0.0, 3.0, "strategy", "float"),
-    # NOTE: trade_range is deliberately NOT tunable — range-fading is a weak edge
-    # that repeatedly hurt live (it shorted range-tops inside an uptrend). It stays
-    # off unless a human turns it on.
+    # range scalping is a tuner OPTION again (it was banned after it faded uptrends):
+    # the hard MTF veto now blocks fading a decided 15m/1h trend, so an enabled range
+    # scalp only takes the with-trend side of a range (or both sides in a truly flat
+    # one). The tuner turns it on only if it survives out-of-sample.
+    "trade_range":            (0, 1, "strategy", "bool"),
+    "range_band_edge":        (0.10, 0.30, "strategy", "float"),
     # risk / exits
     "risk_per_trade":         (0.004, 0.014, "risk", "float"),
     "sl_atr_min":             (1.4, 2.6, "risk", "float"),
