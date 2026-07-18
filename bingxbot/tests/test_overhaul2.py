@@ -126,6 +126,31 @@ def test_display_series_aggregates_ticks_to_1m():
     assert st.display.partial.ts == t0 + 60_000
 
 
+# ------------------------------------------------------------- journal fix
+
+def test_alignment_bucket_is_side_relative(tmp_path):
+    """A SHORT taken while the higher-TF bias points DOWN is WITH-trend — the
+    old bucket keyed on raw bias sign and mislabeled every such trade."""
+    from bingxbot.engine.journal import TradeJournal
+    j = TradeJournal(path=tmp_path / "j.jsonl")
+    j.record({"pnl": 1.0, "side": "SHORT", "mtf_bias": -0.6, "mode": "paper"})   # with-trend short
+    j.record({"pnl": 1.0, "side": "LONG", "mtf_bias": 0.6, "mode": "paper"})     # with-trend long
+    j.record({"pnl": -1.0, "side": "LONG", "mtf_bias": -0.6, "mode": "paper"})   # counter-trend long
+    s = j.summary()
+    ali = s["by_alignment"]
+    assert ali.get("with-trend+", {}).get("n") == 2
+    assert ali.get("counter-trend+", {}).get("n") == 1
+
+
+def test_default_params_cover_all_tunables():
+    from bingxbot.engine.autotuner import _default_params
+    from bingxbot.engine.backtest import TUNABLES
+    d = _default_params()
+    assert set(d) == set(TUNABLES)
+    for k, (lo, hi, _g, _kind) in TUNABLES.items():
+        assert lo - 1e-9 <= float(d[k]) <= hi + 1e-9 or isinstance(d[k], bool), k
+
+
 # ----------------------------------------------------------------- focus
 
 def test_focus_prefers_position_then_strongest_edge():

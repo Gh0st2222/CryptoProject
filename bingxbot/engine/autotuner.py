@@ -46,6 +46,8 @@ OVERFIT_LAMBDA = 0.5        # penalty weight on the in-sample -> OOS drop
 TOP_K_VALIDATE = 5          # validate this many training-best members OOS, keep the best generalizer
 VAULT_CANDIDATES = 4        # also re-validate this many top vault champions each cycle (candidate pool, not graveyard)
 STALL_REINJECT = 20         # cycles without a promotion before a diversity restart
+DEMOTE_FLOOR = -1.0         # incumbent scoring below this on the TRADED basket is toxic...
+DEMOTE_PATIENCE = 3         # ...for this many consecutive cycles -> stand down
 LOOKBACK_DAYS = 60.0
 DATA_TTL_S = 1800
 GAP_FAST = 20               # cadence right after a promotion (keep hammering)
@@ -60,6 +62,15 @@ def _current_params(cfg) -> dict:
         src = cfg.strategy if grp == "strategy" else cfg.risk
         p[name] = getattr(src, name)
     return p
+
+
+def _default_params() -> dict:
+    """The code-default baseline for every tunable — the safe harbor the
+    stand-down falls back to when the whole vault has gone cold."""
+    from ..config import RiskConfig, StrategyConfig
+    s, r = StrategyConfig(), RiskConfig()
+    return {name: getattr(s if grp == "strategy" else r, name)
+            for name, (_lo, _hi, grp, _kind) in TUNABLES.items()}
 
 
 def _make_folds(candles: list, f: int) -> list[list]:
@@ -84,6 +95,7 @@ class AutoTuner:
         self.improvements = 0
         self._since_improve = 0
         self._tested_oos = 0        # candidates tried against the current OOS window
+        self._champ_bad_streak = 0  # consecutive cycles the incumbent scored toxic on traded symbols
         self.next_run_ts = 0.0
         self.champion_fitness = 0.0
         self.last_cycle: dict | None = None
@@ -163,6 +175,14 @@ class AutoTuner:
         val_cut = int(len(candles) * 0.75)
         return candles[max(0, val_cut - 400):]             # recent held-out (+ warmup lead-in)
 
+    def _traded_symbols(self) -> list[str]:
+        """What the engine is actually running right now — the set promotions
+        must be judged on."""
+        eng = self.orch.engine
+        if eng is not None and getattr(eng, "ctx", None):
+            return list(eng.ctx.keys())
+        return list(self.orch.cfg.symbols)
+
     async def _cycle(self) -> bool:
         cfg = self.orch.cfg
         interval = cfg.strategy.interval
@@ -179,20 +199,21 @@ class AutoTuner:
         train = candles[:val_cut]
         valid = self._valid_window(candles)
 
-        # validation BASKET: the research symbol + up to 2 more from the universe
-        # — a champion must generalize across the board, not fit one symbol.
-        basket: list[tuple[str, list]] = [(symbol, valid)]
-        for other in self._universe():
-            if len(basket) >= 3:
-                break
-            if other == symbol:
-                continue
+        # validation BASKET = the symbols the engine is ACTUALLY TRADING (user
+        # symbols + adopted). Training may rotate across the majors board for
+        # generality, but promotion answers one question only: "is this better
+        # on what we are trading right now?" — a champion brilliant on BTC and
+        # toxic on an adopted symbol must not win.
+        basket: list[tuple[str, list]] = []
+        for tsym in self._traded_symbols()[:4]:
             try:
-                oc = await self._get_candles(other)
-                if len(oc) >= MIN_BARS:
-                    basket.append((other, self._valid_window(oc)))
+                tc = await self._get_candles(tsym)
+                if len(tc) >= MIN_BARS:
+                    basket.append((tsym, self._valid_window(tc)))
             except Exception as e:  # noqa: BLE001 — basket breadth is best-effort
-                log.debug("basket data %s: %s", other, e)
+                log.debug("basket data %s: %s", tsym, e)
+        if not basket:
+            basket = [(symbol, valid)]
 
         champ = _current_params(cfg)
         if not self.de.ready():
@@ -305,6 +326,38 @@ class AutoTuner:
         else:
             self.orch.save_champions()   # persist the refreshed vault current-evals
 
+        # DEFENSIVE STAND-DOWN: the promotion gate only swaps for something
+        # BETTER — it never removed something TOXIC. If the incumbent keeps
+        # scoring clearly negative on the symbols we actually trade and nothing
+        # beats the bar, stop trading it: fall back to the best still-positive
+        # vault set, else to the code-default baseline.
+        if promoted or champ_fit >= DEMOTE_FLOOR:
+            self._champ_bad_streak = 0
+        else:
+            self._champ_bad_streak += 1
+            if self._champ_bad_streak >= DEMOTE_PATIENCE:
+                self._champ_bad_streak = 0
+                alt = max((c for c in self.orch.champions if c.get("fitness", 0.0) > 0),
+                          key=lambda c: c.get("fitness", 0.0), default=None)
+                fb_params = alt["params"] if alt else _default_params()
+                fb_name = "vault fallback" if alt else "baseline reset"
+                if any(abs(fb_params.get(k, 0) - champ.get(k, 0)) > 1e-9 for k in champ):
+                    self.orch.apply_params(fb_params)
+                    if alt:
+                        self.orch.mark_champion_used(alt["id"])
+                    self.history.append({
+                        "ts": int(time.time() * 1000),
+                        "from_fitness": round(champ_fit, 3),
+                        "to_fitness": round(alt.get("fitness", 0.0), 3) if alt else 0.0,
+                        "valid_wr": 0.0, "valid_pf": 0.0, "gen": self.de.generation,
+                        "source": f"defensive ({fb_name})",
+                        "params": {k: fb_params[k] for k in ("base_threshold", "risk_per_trade",
+                                   "target_trades_per_hour") if k in fb_params},
+                    })
+                    self.history = self.history[-25:]
+                    log.warning("auto-tune STAND-DOWN: incumbent %.2f on traded basket -> %s",
+                                champ_fit, fb_name)
+
         # diversity restart: if the population has converged without finding a
         # champion for a long time, it's stuck in an overfit basin — re-inject
         # fresh explorers so it keeps searching instead of grinding the same region.
@@ -315,7 +368,7 @@ class AutoTuner:
             log.info("auto-tune: converged without a champion -> re-injected %d explorers", k)
 
         if self.cycles % VAULT_REVAL_EVERY == 0:
-            await self._revalidate_vault(valid, symbol, interval, spec, taker, slip, strat, risk)
+            await self._revalidate_vault(basket, interval, slip, strat, risk)
 
         self.last_cycle = {
             "ts": int(time.time() * 1000), "symbol": symbol,
@@ -333,23 +386,30 @@ class AutoTuner:
             await self.orch._notify("autotune")
         return promoted
 
-    async def _revalidate_vault(self, valid, symbol, interval, spec, taker, slip, strat, risk) -> None:
-        """Re-score every saved champion on the freshest window and refresh its
-        CURRENT evaluation (shown in the vault next to what it was born at). We
-        DON'T drop the temporarily-cold — pruning ages out the never-used, and
-        protects the most-used, so a proven champion having a bad week survives."""
+    async def _revalidate_vault(self, basket, interval, slip, strat, risk) -> None:
+        """Re-score every saved champion on the TRADED basket's freshest windows
+        and refresh its CURRENT evaluation (shown next to what it was born at) —
+        so 'current fitness' always means 'on what we trade today'. We DON'T drop
+        the temporarily-cold — pruning ages out the never-used and protects the
+        most-used, so a proven champion having a bad week survives."""
         vault = self.orch.champions
-        if not vault:
+        if not vault or not basket:
             return
-        results = await self.orch.map_cpu(
-            validate_params,
-            [(c.get("params", {}), valid, symbol, interval, spec, taker, slip, strat, risk) for c in vault],
-            research=True)
-        for c, res in zip(vault, results):
-            self.orch.set_champion_current(
-                c["id"], res.get("fitness", c.get("fitness", 0.0)), res.get("stats", {}))
+        nb = len(basket)
+        args = []
+        for c in vault:
+            for bsym, bvalid in basket:
+                bspec = self.orch.specs.get(bsym, ContractSpec(bsym))
+                args.append((c.get("params", {}), bvalid, bsym, interval, bspec,
+                             bspec.taker_fee, slip, strat, risk))
+        results = await self.orch.map_cpu(validate_params, args, research=True)
+        for i, c in enumerate(vault):
+            rs = results[i * nb:(i + 1) * nb]
+            fit = sum(r.get("fitness", 0.0) for r in rs) / max(len(rs), 1)
+            self.orch.set_champion_current(c["id"], fit, rs[0].get("stats", {}))
         self.orch.prune_champions()
-        log.info("vault revalidated: %d champions re-scored on recent data", len(self.orch.champions))
+        log.info("vault revalidated on traded basket %s: %d champions",
+                 [s for s, _ in basket], len(self.orch.champions))
 
     def snapshot(self) -> dict:
         return {

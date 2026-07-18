@@ -30,6 +30,7 @@ log = logging.getLogger("trader")
 
 FEATURE_TAIL = 1400  # bars fed to FeatureFrame each close
 REACT_MS = 850       # min gap between reactive intra-bar scans, per symbol
+ADOPTED_FULL_GRADED = 30  # adopted symbols trade at reduced size until this many graded calls
 
 # Execution-cycle stages surfaced to the UI pipeline.
 STAGES = ("SCAN", "DETECT", "VALIDATE", "SIZE", "FILL", "MANAGE", "SETTLE")
@@ -314,6 +315,10 @@ class TraderEngine:
             return
         kelly = ctx.brain.kelly_size_mult(p_win, self.risk.payoff_ratio(style)) if self.cfg.strategy.use_kelly else 1.0
         size_mult = kelly * self.risk.health.scalar
+        # a freshly ADOPTED symbol trades small until its brain has real graded
+        # evidence — adoption gives it a seat, not full conviction on day one.
+        if symbol in self.adopted and getattr(ctx.brain, "graded", 0) < ADOPTED_FULL_GRADED:
+            size_mult *= 0.6
         # correlation haircut: shrink a same-direction add across symbols (BTC/ETH
         # move together — don't quietly double the same directional bet).
         side_d = 1 if side == LONG else -1
