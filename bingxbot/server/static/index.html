@@ -117,6 +117,7 @@
       <button class="tab" data-tab="walkforward">Walk-Fwd</button>
       <button class="tab" data-tab="optimizer">Optimizer</button>
       <button class="tab" data-tab="radar">Radar</button>
+      <button class="tab" data-tab="record">Record</button>
       <button class="tab" data-tab="analytics">Analytics</button>
       <button class="tab" data-tab="autotuner">Auto-Tuner</button>
       <button class="tab" data-tab="settings">Settings</button>
@@ -130,6 +131,7 @@
       <div style="margin-top:9px;display:flex;gap:7px">
         <button class="btn sm" id="btn-flatten">Flatten all</button>
         <button class="btn sm" id="btn-reset-kill">Reset kill switch</button>
+        <button class="btn sm danger" id="btn-paper-reset" title="Wipe the persisted paper session and start the account fresh">Reset paper account</button>
       </div>
     </div>
 
@@ -279,6 +281,38 @@
         <th class="r" title="the side the funding pays">Receives</th><th class="r">24h volume</th><th class="r">24h Δ</th>
         <th class="r" title="Kaufman efficiency ratio on 4h bars">4h ER</th><th class="r">4h trend</th><th class="r">Score</th>
       </tr></thead><tbody id="radar-body"><tr><td colspan="10" class="empty">Radar warming up…</td></tr></tbody></table></div>
+
+      <div class="subt" style="margin-top:16px">Carry Lab — measure the edge before trusting it <span style="color:var(--muted)">(replays the desk's exact rules over historical funding prints + 1h prices, sweeps the threshold grid)</span></div>
+      <div class="form-row">
+        <div class="ff"><label>Days</label><input class="field" id="cl-days" type="number" value="60" step="10" style="width:90px"></div>
+        <div class="ff"><label>Top perps</label><input class="field" id="cl-topn" type="number" value="6" step="1" style="width:80px"></div>
+        <button class="btn primary" id="cl-run">Run lab</button>
+        <span id="cl-note" style="color:var(--muted);font:10.5px var(--mono)"></span>
+      </div>
+      <div class="progress" id="cl-progress"><div class="bar"></div></div>
+      <div id="cl-results" style="display:none">
+        <div class="cards" id="cl-cards"></div>
+        <div style="overflow:auto"><table class="tbl"><thead><tr>
+          <th>Symbol</th><th class="r">Prints</th><th class="r">Entries</th><th class="r">Wins</th>
+          <th class="r" title="funding collected, as return on notional">Funding</th><th class="r">Price PnL</th>
+          <th class="r">Fees</th><th class="r">Net</th><th class="r">Worst</th><th class="r">Avg hold</th>
+        </tr></thead><tbody id="cl-body"></tbody></table></div>
+      </div>
+    </div>
+
+    <div class="tab-page" data-page="record">
+      <p class="foot-note" style="margin-top:0">The <b>track record</b> — one row per UTC day, appended automatically and preserved across restarts. Months of this, matching the backtests, is the asset the whole system is building: a provable live record that justifies scaling real capital.</p>
+      <div class="cards" id="rec-cards"></div>
+      <div class="mc-row">
+        <div><div class="subt">Daily equity</div><div id="chart-record"></div></div>
+        <div><div class="subt">Monthly</div><table class="tbl"><thead><tr>
+          <th>Month</th><th class="r">PnL</th><th class="r">Return</th><th class="r">Trades</th><th class="r">Win days</th>
+        </tr></thead><tbody id="rec-months"><tr><td colspan="5" class="empty">No complete months yet</td></tr></tbody></table></div>
+      </div>
+      <div class="subt" style="margin-top:12px">Daily rows <button class="btn sm" id="rec-export" style="margin-left:8px">Export CSV</button></div>
+      <div style="overflow:auto"><table class="tbl"><thead><tr>
+        <th>Date</th><th>Mode</th><th class="r">Equity</th><th class="r">PnL</th><th class="r">Trades</th><th class="r">Wins</th><th class="r">Fees</th>
+      </tr></thead><tbody id="rec-body"><tr><td colspan="7" class="empty">The first row appears after the first UTC midnight of running</td></tr></tbody></table></div>
     </div>
 
     <div class="tab-page" data-page="settings">
@@ -291,7 +325,8 @@
           <div class="ff"><label>Bar interval</label><select class="btn" id="cfg-interval"><option>1m</option><option>3m</option><option>5m</option><option>15m</option><option>30m</option></select></div>
           <div class="ff"><label>Paper starting balance</label><input class="field" id="cfg-balance" type="number" step="100"></div>
           <div class="ff"><label>Max open positions</label><input class="field" id="cfg-maxpos" type="number" step="1"></div>
-          <div class="hint">Interval / symbols / feed changes restart the engine (Idle → back).</div>
+          <div class="ff"><label>Radar may adopt (extra trending perps)</label><input class="field" id="cfg-adopt" type="number" step="1" min="0" max="3"></div>
+          <div class="hint"><b>Bar interval = the SIGNAL timeframe.</b> The brain, tuner and backtests all decide on these bars — it is not a display setting. The main chart always shows 1m regardless. Interval / symbols / feed changes restart the engine (paper session is preserved).</div>
         </div>
         <div class="sgroup">
           <h3>Leverage &amp; risk band</h3>

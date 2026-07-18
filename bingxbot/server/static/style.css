@@ -161,6 +161,10 @@ input.field { width: 100%; font-family: var(--mono); }
   border: 1px solid transparent; background: transparent; font: 600 12px/1 var(--mono); letter-spacing: 1px;
   clip-path: polygon(5px 0, 100% 0, 100% calc(100% - 5px), calc(100% - 5px) 100%, 0 100%, 0 5px); }
 .sym-tab.active { border-color: var(--border-2); background: rgba(0,210,255,.08); color: var(--accent-2); text-shadow: 0 0 10px var(--glow); }
+.sym-tab.auto { color: var(--muted); border-color: var(--border); font-size: 10px; letter-spacing: 1.5px; }
+.sym-tab.auto.on { color: var(--good); border-color: rgba(0,224,160,.5); background: rgba(0,224,160,.07); text-shadow: 0 0 9px rgba(0,224,160,.5); }
+.sym-tab.adopted { color: var(--warn); }
+#chart-record { height: 200px; }
 .price-read { margin-left: auto; display: flex; align-items: baseline; gap: 10px; }
 .price-read .px { font: 700 16px/1 var(--mono); text-shadow: 0 0 12px rgba(0,210,255,.2); }
 .price-read .meta { color: var(--muted); font: 10.5px/1 var(--mono); }

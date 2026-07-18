@@ -162,10 +162,13 @@ class Orchestrator:
         self.active_champion_id: str | None = (
             max(used, key=lambda c: c["last_used_ts"])["id"] if used else None)
         self.journal = TradeJournal()
+        from ..engine.record import TrackRecord
+        self.record = TrackRecord()  # daily performance snapshots (outlives sessions)
         self.alerter = Alerter()
         self._alert_task: asyncio.Task | None = None
         self.scanner = None         # MarketScanner (universe radar), set on engine start
         self.carry = None           # CarryDesk (funding harvest), set on engine start
+        self._adopt_miss: dict[str, int] = {}   # consecutive radar misses per adopted symbol
 
     # ------------------------------------------------------------- CPU offload
 
@@ -511,11 +514,24 @@ class Orchestrator:
                                  maker_fee=maker, entry_mode=self.cfg.strategy.entry_mode)
         risk = RiskManager(self.cfg.risk)
 
+        # a paper session SURVIVES restarts: restore positions/trades/equity/risk
+        # from the last snapshot (cleared by "Reset paper account" or a changed
+        # starting balance). Live never restores — the exchange is the truth.
+        if mode == MODE_PAPER:
+            from ..engine.carry import RestMarketState
+            from ..engine.persist import load_paper_state, restore_into
+            snap = load_paper_state(self.cfg.paper.starting_balance)
+            if snap:
+                restore_into(portfolio, risk, snap)
+                for sym, pos in portfolio.positions.items():
+                    if sym not in feed.states:   # e.g. a carry symbol outside the feed
+                        feed.states[sym] = RestMarketState(pos.entry_price)
+
         async def on_update(kind: str) -> None:
             await self._notify(kind)
 
         self.engine = TraderEngine(self.cfg, feed, broker, portfolio, risk, self.specs,
-                                   on_update, journal=self.journal)
+                                   on_update, journal=self.journal, record=self.record)
         self.engine.active_champion_id = self.active_champion_id
         await self.engine.start()
 
@@ -740,6 +756,110 @@ class Orchestrator:
 
         asyncio.get_running_loop().create_task(runner())
         return job
+
+    def start_carry_lab(self, days: float = 60.0, top_n: int = 6) -> Job:
+        """Measure the carry desk on history: replay its exact rules over real
+        funding prints + 1h prices for the top-volume perps (synthetic stand-ins
+        offline), sweep the threshold grid, and recommend evidence-based
+        min_apr / exit_apr."""
+        job = Job("carrylab")
+        self.jobs[job.id] = job
+
+        async def runner():
+            from ..data.history import synthetic_candles
+            from ..engine.carrylab import grid_search, recommend, replay_carry, synthetic_funding
+            try:
+                days_i = int(clamp_days := max(14.0, min(days, 120.0)))
+                symbols: list[str] = []
+                if self.rest is not None:
+                    try:
+                        ticks = await self.rest.tickers_24h()
+                        ticks.sort(key=lambda t: t.get("quote_volume", 0.0), reverse=True)
+                        symbols = [t["symbol"] for t in ticks[:top_n]]
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("carry lab tickers failed: %s", e)
+                if not symbols:
+                    symbols = ["PEPE-USDT", "WIF-USDT", "SOL-USDT", "DOGE-USDT", "BTC-USDT", "ETH-USDT"][:top_n]
+
+                per_symbol, grids = [], []
+                for k, sym in enumerate(symbols):
+                    if self.rest is not None:
+                        funding = await self.rest.funding_rate_history(sym, limit=days_i * 3 + 10)
+                        candles = await self._get_backtest_candles(sym, "1h", clamp_days, False, job)
+                    else:
+                        candles = synthetic_candles(sym, "1h", days_i * 24, seed=hash(sym) & 0xFFFF)
+                        funding = synthetic_funding(days_i, seed=hash(sym) & 0xFFFF,
+                                                    start_ts=candles[0].ts)
+                    live = replay_carry(funding, candles,
+                                        self.cfg.carry.min_apr, self.cfg.carry.exit_apr)
+                    grid = grid_search(funding, candles)
+                    grids.append(grid)
+                    best = max(grid, key=lambda r: r["net"] + r["worst"]) if grid else None
+                    per_symbol.append({"symbol": sym, "prints": len(funding),
+                                       "current": live, "best": best})
+                    job.progress = (k + 1) / len(symbols)
+                rec = recommend(grids)
+                job.result = {"symbols": per_symbol, "recommend": rec,
+                              "days": days_i, "demo": self.rest is None,
+                              "current": {"min_apr": self.cfg.carry.min_apr,
+                                          "exit_apr": self.cfg.carry.exit_apr}}
+            except Exception as e:  # noqa: BLE001
+                log.exception("carry lab failed")
+                job.error = str(e)
+            await self._notify("job")
+
+        asyncio.get_running_loop().create_task(runner())
+        return job
+
+    async def maybe_adopt(self) -> None:
+        """Radar-driven universe: adopt the strongest liquid 4h trends beyond the
+        user's symbols (up to strategy.adopt_symbols), drop adopted ones the radar
+        stopped liking for two consecutive scans — never with an open position."""
+        eng = self.engine
+        if eng is None or self.scanner is None:
+            return
+        cap = max(0, int(getattr(self.cfg.strategy, "adopt_symbols", 0)))
+        user = set(self.cfg.symbols)
+        good = [r for r in self.scanner.rows
+                if r["symbol"] not in user and r.get("kind") == "trend"
+                and r.get("er_4h", 0.0) >= 0.4 and r.get("dir_4h", 0) != 0]
+        want = [r["symbol"] for r in good[:cap]]
+        for sym in list(eng.adopted):
+            if sym in want:
+                self._adopt_miss.pop(sym, None)
+                continue
+            self._adopt_miss[sym] = self._adopt_miss.get(sym, 0) + 1
+            if self._adopt_miss[sym] >= 2 and await eng.drop_symbol(sym):
+                self._adopt_miss.pop(sym, None)
+        for sym in want:
+            if len(eng.adopted) >= cap:
+                break
+            if sym not in eng.ctx:
+                try:
+                    await eng.adopt_symbol(sym)
+                except Exception as e:  # noqa: BLE001 — adoption is best-effort
+                    log.warning("adopt %s failed: %s", sym, e)
+
+    def reset_paper(self) -> dict:
+        """Fresh paper account: wipe the persisted snapshot and, if a paper
+        engine is running, reset its portfolio and risk state in place."""
+        from ..engine.persist import clear_paper_state
+        clear_paper_state()
+        eng = self.engine
+        if eng is not None and eng.portfolio.mode == "paper":
+            pf = eng.portfolio
+            pf.positions.clear()
+            pf.trades.clear()
+            pf.equity_curve.clear()
+            pf.starting_balance = self.cfg.paper.starting_balance
+            pf.cash = pf.starting_balance
+            pf.funding_paid = 0.0
+            eng.risk.state = type(eng.risk.state)()
+            eng.risk.health.__init__()
+            if self.carry is not None:
+                self.carry.meta.clear()
+            log.info("paper account reset to %.2f", pf.cash)
+        return {"ok": True}
 
     def apply_params(self, params: dict) -> None:
         """Promote tuned parameters into the running config (in place, so the

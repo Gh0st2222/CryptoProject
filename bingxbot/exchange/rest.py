@@ -248,6 +248,18 @@ class BingXRest:
             })
         return out
 
+    async def funding_rate_history(self, symbol: str, limit: int = 1000) -> list[dict]:
+        """Historical funding prints (rate + settlement time), oldest first —
+        the raw material for measuring the carry edge instead of assuming it."""
+        data = await self._request("GET", "/openApi/swap/v2/quote/fundingRate",
+                                   {"symbol": symbol, "limit": min(limit, 1000)})
+        rows = data if isinstance(data, list) else []
+        out = [{"ts": int(safe_float(r.get("fundingTime"))),
+                "rate": safe_float(r.get("fundingRate"))}
+               for r in rows if r.get("fundingTime") is not None]
+        out.sort(key=lambda r: r["ts"])
+        return out
+
     async def tickers_24h(self) -> list[dict]:
         """24h stats for every perp (volume + change) — feeds universe ranking."""
         data = await self._request("GET", "/openApi/swap/v2/quote/ticker")

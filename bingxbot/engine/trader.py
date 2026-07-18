@@ -61,7 +61,8 @@ class SymbolCtx:
 
 class TraderEngine:
     def __init__(self, cfg: BotConfig, feed: BaseFeed, broker: Broker, portfolio: Portfolio,
-                 risk: RiskManager, specs: dict[str, ContractSpec], on_update=None, journal=None):
+                 risk: RiskManager, specs: dict[str, ContractSpec], on_update=None, journal=None,
+                 record=None):
         self.cfg = cfg
         self.feed = feed
         self.broker = broker
@@ -71,19 +72,10 @@ class TraderEngine:
         self.exits = AdaptiveExitManager(cfg.risk)
         self.on_update = on_update  # async callback(kind: str) -> None
         self.journal = journal      # TradeJournal (records closed trades + context)
+        self.record = record        # TrackRecord (daily performance snapshots)
         self.active_champion_id: str | None = None  # vault champion currently driving trades (journal tag)
-        s = cfg.strategy
-        bars_per_hour = 3_600_000 / max(1, self._interval_ms())
-        self.ctx: dict[str, SymbolCtx] = {
-            sym: SymbolCtx(sym, TradingBrain(
-                eta=s.hedge_eta, weight_floor=s.weight_floor, horizon_bars=s.horizon_bars,
-                base_threshold=s.base_threshold, threshold_adapt=s.threshold_adapt,
-                target_trades_per_hour=s.target_trades_per_hour,
-                bars_per_hour=bars_per_hour, cost_multiple=s.cost_multiple,
-                min_p_win=s.min_p_win, kelly_fraction=s.kelly_fraction,
-            ))
-            for sym in cfg.symbols
-        }
+        self.ctx: dict[str, SymbolCtx] = {sym: self._make_ctx(sym) for sym in cfg.symbols}
+        self.adopted: set[str] = set()   # radar-adopted symbols (beyond the user's list)
         self._task: asyncio.Task | None = None
         self._housekeeper: asyncio.Task | None = None
         self._fast_pusher: asyncio.Task | None = None
@@ -120,6 +112,9 @@ class TraderEngine:
         self._task = self._housekeeper = self._fast_pusher = None
         if flatten:
             await self.broker.flatten_all("engine stop")
+        if self.portfolio.mode == "paper":
+            from .persist import save_paper_state
+            save_paper_state(self.portfolio, self.risk.state)   # the session survives
         await self.feed.stop()
         log.info("trader stopped")
 
@@ -151,6 +146,14 @@ class TraderEngine:
                 await self.broker.reconcile(self.cfg.symbols)
             if self.risk.state.killed and self.portfolio.positions:
                 await self.broker.flatten_all("kill switch")
+            if self.record is not None:
+                try:
+                    self.record.maybe_roll(self.portfolio, self.portfolio.mode)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("track record roll failed: %s", e)
+            if self.portfolio.mode == "paper" and beat % 6 == 0:   # every 30s
+                from .persist import save_paper_state
+                save_paper_state(self.portfolio, self.risk.state)
             if self.on_update:
                 await self.on_update("state")
 
@@ -165,6 +168,56 @@ class TraderEngine:
                     await self.on_update("hot")
                 except Exception:  # noqa: BLE001
                     pass
+
+    def _make_ctx(self, sym: str) -> SymbolCtx:
+        s = self.cfg.strategy
+        bars_per_hour = 3_600_000 / max(1, self._interval_ms())
+        return SymbolCtx(sym, TradingBrain(
+            eta=s.hedge_eta, weight_floor=s.weight_floor, horizon_bars=s.horizon_bars,
+            base_threshold=s.base_threshold, threshold_adapt=s.threshold_adapt,
+            target_trades_per_hour=s.target_trades_per_hour,
+            bars_per_hour=bars_per_hour, cost_multiple=s.cost_multiple,
+            min_p_win=s.min_p_win, kelly_fraction=s.kelly_fraction,
+        ))
+
+    async def adopt_symbol(self, sym: str) -> bool:
+        """Radar adoption: attach the feed at runtime and give the symbol its own
+        brain — it trades through the exact same gate chain as everyone else."""
+        if sym in self.ctx:
+            return True
+        add = getattr(self.feed, "add_symbol", None)
+        if add is None or not await add(sym):
+            return False
+        self.ctx[sym] = self._make_ctx(sym)
+        self.adopted.add(sym)
+        log.info("ADOPTED %s (radar trend pick)", sym)
+        return True
+
+    async def drop_symbol(self, sym: str) -> bool:
+        """Release an adopted symbol (never with an open position)."""
+        if sym not in self.adopted or self.portfolio.positions.get(sym) is not None:
+            return False
+        self.ctx.pop(sym, None)
+        self.adopted.discard(sym)
+        rm = getattr(self.feed, "remove_symbol", None)
+        if rm is not None:
+            await rm(sym)
+        log.info("DROPPED %s (trend gone)", sym)
+        return True
+
+    def focus_symbol(self) -> str:
+        """The symbol the machine is 'looking at' right now: an open position
+        wins; otherwise whichever is closest to firing (edge vs threshold)."""
+        for sym in self.ctx:
+            if self.portfolio.positions.get(sym) is not None:
+                return sym
+        best, best_v = "", -1.0
+        for sym, c in self.ctx.items():
+            thr = max(c.last_eval.get("threshold", 0.3), 1e-6) if c.last_eval else 0.3
+            v = abs(c.last_eval.get("edge", 0.0)) / thr if c.last_eval else 0.0
+            if v > best_v:
+                best, best_v = sym, v
+        return best or (next(iter(self.ctx), ""))
 
     def _push_tape(self, symbol: str, kind: str, side: str, price: float, extra: dict | None = None) -> None:
         row = {"ts": now_ms(), "symbol": symbol, "kind": kind, "side": side, "price": price}
@@ -494,6 +547,8 @@ class TraderEngine:
             "feed_healthy": self.feed.healthy(),
             "started_ts": self.started_ts,
             "interval": self.cfg.strategy.interval,
+            "focus": self.focus_symbol(),
+            "adopted": sorted(self.adopted),
             "stages": list(STAGES),
             "tape": self.tape[-40:],
             "symbols": {
@@ -520,17 +575,22 @@ class TraderEngine:
         }
 
     def _live_candle(self, sym: str) -> dict | None:
-        """The still-forming bar (or the last closed one) as a compact dict — rides
-        the hot channel so the chart's last candle moves tick-by-tick instead of
-        waiting for a REST poll."""
+        """The still-forming 1m DISPLAY bar (falls back to the signal bar) as a
+        compact dict — rides the hot channel so the chart's last candle moves
+        tick-by-tick instead of waiting for a REST poll."""
         st = self.feed.states.get(sym)
         if st is None:
             return None
-        p = st.candles.partial
+        disp = getattr(st, "display", None)
+        p = disp.partial if disp is not None else None
+        if p is None and disp is not None and len(disp):
+            p = disp.tail(1)[0]
         if p is None:
-            if not len(st.candles):
-                return None
-            p = st.candles.tail(1)[0]
+            p = st.candles.partial
+            if p is None:
+                if not len(st.candles):
+                    return None
+                p = st.candles.tail(1)[0]
         return {"t": p.ts // 1000, "o": p.open, "h": p.high, "l": p.low, "c": p.close}
 
     def hot(self) -> dict:
@@ -543,6 +603,8 @@ class TraderEngine:
             "feed_healthy": self.feed.healthy(),
             "equity": round(self.portfolio.equity(marks), 4),
             "killed": self.risk.state.killed,
+            "focus": self.focus_symbol(),
+            "adopted": sorted(self.adopted),
             "symbols": {
                 sym: {
                     "price": marks.get(sym, 0.0),

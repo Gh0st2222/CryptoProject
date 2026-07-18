@@ -75,7 +75,9 @@ class AutoTuner:
         self.running = False
         self.rng = random.Random()
         self.de = DEOptimizer(pop_size=POP_SIZE, seed=self.rng.randint(0, 2**31))
-        self._candles: list = []
+        self._cache: dict[str, tuple[list, float]] = {}   # symbol -> (candles, fetched_ts)
+        self._rot_idx = -1
+        self.research_symbol = ""   # rotates across the top-volume board each window
         self._data_ts = 0.0
         self._scored_ts = -1.0      # data window the population was last fully scored on
         self.cycles = 0
@@ -116,20 +118,57 @@ class AutoTuner:
             self.next_run_ts = time.time() + gap
             await asyncio.sleep(gap)
 
-    async def _ensure_data(self):
-        if self._candles and time.time() - self._data_ts < DATA_TTL_S:
-            return self._candles
+    def _universe(self) -> list[str]:
+        """The research universe: top-10 perps by 24h volume from the radar (so
+        the tuner learns the whole board, not just BTC's microstructure), plus
+        the user's own symbols. Falls back to the configured symbols offline."""
+        sc = getattr(self.orch, "scanner", None)
+        rows = sc.rows if sc is not None else []
+        by_vol = sorted(rows, key=lambda r: r.get("quote_volume", 0.0), reverse=True)
+        uni = [r["symbol"] for r in by_vol[:10]]
+        for s in self.orch.cfg.symbols:
+            if s not in uni:
+                uni.append(s)
+        return uni or list(self.orch.cfg.symbols)
+
+    async def _get_candles(self, symbol: str) -> list:
+        hit = self._cache.get(symbol)
+        if hit and time.time() - hit[1] < DATA_TTL_S:
+            return hit[0]
         cfg = self.orch.cfg
-        symbol, interval = cfg.symbols[0], cfg.strategy.interval
-        synthetic = cfg.feed == "synthetic"
-        self._candles = await self.orch._get_backtest_candles(symbol, interval, LOOKBACK_DAYS, synthetic, _NullJob())
-        self._data_ts = time.time()
-        return self._candles
+        candles = await self.orch._get_backtest_candles(
+            symbol, cfg.strategy.interval, LOOKBACK_DAYS, cfg.feed == "synthetic", _NullJob())
+        self._cache[symbol] = (candles, time.time())
+        if len(self._cache) > 6:   # bound the cache to the working set
+            oldest = min(self._cache, key=lambda s: self._cache[s][1])
+            if oldest != symbol:
+                self._cache.pop(oldest, None)
+        return candles
+
+    async def _ensure_data(self) -> list:
+        """Rotate the research symbol across the universe each data window: every
+        ~30 min the DE trains against a different top-volume perp, so surviving
+        parameters must work on the BOARD, not on one symbol's quirks."""
+        uni = self._universe()
+        rotate = (not self.research_symbol
+                  or self.research_symbol not in uni
+                  or time.time() - self._data_ts >= DATA_TTL_S)
+        if rotate:
+            self._rot_idx = (self._rot_idx + 1) % len(uni)
+            self.research_symbol = uni[self._rot_idx]
+        candles = await self._get_candles(self.research_symbol)
+        self._data_ts = self._cache[self.research_symbol][1]
+        return candles
+
+    def _valid_window(self, candles: list) -> list:
+        val_cut = int(len(candles) * 0.75)
+        return candles[max(0, val_cut - 400):]             # recent held-out (+ warmup lead-in)
 
     async def _cycle(self) -> bool:
         cfg = self.orch.cfg
-        symbol, interval = cfg.symbols[0], cfg.strategy.interval
+        interval = cfg.strategy.interval
         candles = await self._ensure_data()
+        symbol = self.research_symbol
         if len(candles) < MIN_BARS:
             return False
         spec = self.orch.specs.get(symbol, ContractSpec(symbol))
@@ -139,7 +178,22 @@ class AutoTuner:
         n = len(candles)
         val_cut = int(n * 0.75)
         train = candles[:val_cut]
-        valid = candles[max(0, val_cut - 400):]            # recent held-out (+ warmup lead-in)
+        valid = self._valid_window(candles)
+
+        # validation BASKET: the research symbol + up to 2 more from the universe
+        # — a champion must generalize across the board, not fit one symbol.
+        basket: list[tuple[str, list]] = [(symbol, valid)]
+        for other in self._universe():
+            if len(basket) >= 3:
+                break
+            if other == symbol:
+                continue
+            try:
+                oc = await self._get_candles(other)
+                if len(oc) >= MIN_BARS:
+                    basket.append((other, self._valid_window(oc)))
+            except Exception as e:  # noqa: BLE001 — basket breadth is best-effort
+                log.debug("basket data %s: %s", other, e)
 
         champ = _current_params(cfg)
         if not self.de.ready():
@@ -189,21 +243,33 @@ class AutoTuner:
         cands += [{"source": "vault", "params": c.get("params", {}), "train_fit": None, "cid": c.get("id")}
                   for c in vault]
 
-        val_args = [(c["params"], valid, symbol, interval, spec, taker, slip, strat, risk) for c in cands]
-        val_args.append((champ, valid, symbol, interval, spec, taker, slip, strat, risk))
+        # every candidate × every basket symbol, one parallel batch; a candidate's
+        # OOS fitness is its MEAN across the basket (must earn on the board).
+        nb = len(basket)
+        val_args = []
+        for c in cands + [{"params": champ}]:
+            for bsym, bvalid in basket:
+                bspec = self.orch.specs.get(bsym, ContractSpec(bsym))
+                val_args.append((c["params"], bvalid, bsym, interval, bspec,
+                                 bspec.taker_fee, slip, strat, risk))
         val_res = await self.orch.map_cpu(validate_params, val_args, research=True)
-        champ_fit = val_res[-1]["fitness"]
 
+        def basket_fit(idx: int) -> tuple[float, dict]:
+            rs = val_res[idx * nb:(idx + 1) * nb]
+            fit = sum(r["fitness"] for r in rs) / max(len(rs), 1)
+            return fit, rs[0]["stats"]          # stats shown from the research symbol
+
+        champ_fit, _ = basket_fit(len(cands))
         best, best_adj, best_stats = None, -1e18, {}
-        for c, res in zip(cands, val_res[:-1]):
-            oos = res["fitness"]
+        for i, c in enumerate(cands):
+            oos, stats0 = basket_fit(i)
             # DE members carry an overfit penalty (in-sample -> OOS drop); vault
             # champions are scored raw — they've already proven out-of-sample.
             adj = oos - (OVERFIT_LAMBDA * max(0.0, c["train_fit"] - oos) if c["train_fit"] is not None else 0.0)
             if c["source"] == "vault" and c["cid"]:
-                self.orch.set_champion_current(c["cid"], oos, res["stats"])  # keep its CURRENT eval fresh
+                self.orch.set_champion_current(c["cid"], oos, stats0)  # keep its CURRENT eval fresh
             if adj > best_adj:
-                best, best_adj, best_stats = c, adj, res["stats"]
+                best, best_adj, best_stats = c, adj, stats0
 
         self.cycles += 1
         self.champion_fitness = round(champ_fit, 3)
@@ -261,6 +327,8 @@ class AutoTuner:
             "promoted": promoted, "candidates": len(candidates),
             "vault_candidates": len(vault), "de_candidates": len(topk),
             "champion_source": (best["source"] if best else None),
+            "research_symbol": symbol,
+            "basket": [s for s, _ in basket],
         }
         if self.orch._notify:
             await self.orch._notify("autotune")
@@ -294,6 +362,7 @@ class AutoTuner:
             "generation": self.de.generation,
             "population": len(self.de.pop),
             "research_cores": self.orch.research_workers,
+            "research_symbol": self.research_symbol,
             "next_run_ts": int(self.next_run_ts * 1000),
             "last_cycle": self.last_cycle,
             "history": self.history[-12:][::-1],

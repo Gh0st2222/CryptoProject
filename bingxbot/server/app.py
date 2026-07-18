@@ -96,17 +96,25 @@ async def patch_config(req: ConfigPatch):
 
 
 @app.get("/api/candles")
-async def candles(symbol: str, limit: int = 400):
+async def candles(symbol: str, limit: int = 400, tf: str = "1m"):
+    """Chart data. tf='1m' (default) serves the tick-aggregated DISPLAY series —
+    the chart always shows 1m regardless of the signal timeframe; tf='signal'
+    serves the bars the brain actually trades on."""
     eng = orch.engine
     if eng is None or symbol not in eng.feed.states:
         return {"candles": [], "markers": []}
     st = eng.feed.states[symbol]
+    series = st.candles
+    if tf == "1m":
+        disp = getattr(st, "display", None)
+        if disp is not None and (len(disp) or disp.partial is not None):
+            series = disp
     out = [
         {"time": c.ts // 1000, "open": c.open, "high": c.high, "low": c.low, "close": c.close}
-        for c in st.candles.tail(min(limit, 1200))
+        for c in series.tail(min(limit, 1200))
     ]
-    if st.candles.partial is not None:
-        p = st.candles.partial
+    if series.partial is not None:
+        p = series.partial
         out.append({"time": p.ts // 1000, "open": p.open, "high": p.high,
                     "low": p.low, "close": p.close})
     markers = []
@@ -158,6 +166,29 @@ async def job_status(job_id: str):
     if job is None:
         return JSONResponse({"error": "no such job"}, status_code=404)
     return job.to_dict()
+
+
+class CarryLabReq(BaseModel):
+    days: float = 60.0
+    top_n: int = 6
+
+
+@app.post("/api/carrylab")
+async def carrylab(req: CarryLabReq):
+    job = orch.start_carry_lab(req.days, req.top_n)
+    return {"job_id": job.id}
+
+
+@app.get("/api/record")
+async def record():
+    eng = orch.engine
+    pf = eng.portfolio if eng else None
+    return orch.record.snapshot(pf, pf.mode if pf else "paper")
+
+
+@app.post("/api/paper_reset")
+async def paper_reset():
+    return orch.reset_paper()
 
 
 @app.post("/api/apply_params")
