@@ -71,6 +71,7 @@ class AdaptiveExitManager:
         pos.atr_ref = atr
         pos.init_risk = init_risk
         pos.peak_price = pos.entry_price
+        pos.trough_price = pos.entry_price
 
     # ------------------------------------------------------------- per-bar
 
@@ -86,12 +87,17 @@ class AdaptiveExitManager:
         if risk <= 0:
             return False, None
 
-        # track best excursion (chandelier anchor)
+        # track best excursion (chandelier anchor) AND worst (MAE anchor)
         fav = high if d > 0 else low
+        adv = low if d > 0 else high
         if pos.peak_price == 0:
             pos.peak_price = pos.entry_price
         if (fav - pos.peak_price) * d > 0:
             pos.peak_price = fav
+        if pos.trough_price == 0:
+            pos.trough_price = pos.entry_price
+        if (adv - pos.trough_price) * d < 0:
+            pos.trough_price = adv
 
         gain = (price - pos.entry_price) * d
         rr = gain / risk

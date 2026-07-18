@@ -62,6 +62,16 @@ class Portfolio:
         pnl = gross - exit_fee  # entry fee already deducted from cash at open
         self.cash += pnl
         net = gross - fees
+        # excursions in R: how far it went against us (MAE) and the best it
+        # ever looked (MFE) — the raw material for tuning stops and exits.
+        d = pos.direction()
+        risk = pos.init_risk if pos.init_risk > 0 else planned_risk
+        mae_r = mfe_r = 0.0
+        if risk > 0:
+            if pos.trough_price > 0:
+                mae_r = max(0.0, (pos.entry_price - pos.trough_price) * d / risk)
+            if pos.peak_price > 0:
+                mfe_r = max(0.0, (pos.peak_price - pos.entry_price) * d / risk)
         tr = TradeRecord(
             symbol=symbol, side=pos.side, qty=pos.qty,
             entry_price=pos.entry_price, exit_price=exit_price,
@@ -70,6 +80,7 @@ class Portfolio:
             reason_open=pos.entry_reason, reason_close=reason,
             r_multiple=round(net / planned_risk, 3) if planned_risk > 0 else 0.0,
             mode=self.mode,
+            mae_r=round(mae_r, 3), mfe_r=round(mfe_r, 3),
         )
         self.trades.append(tr)
         return tr

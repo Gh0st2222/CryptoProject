@@ -97,10 +97,20 @@ class TradeJournal:
             d = 1.0 if r.get("side") == "LONG" else -1.0
             return r.get("mtf_bias", 0.0) * d
 
+        # excursion analytics: how much heat trades take (MAE), how much they
+        # ever showed (MFE), and what fraction of the shown profit exits capture.
+        exc = [r for r in rows if r.get("mfe_r") is not None]
+        avg_mae = sum(r.get("mae_r", 0.0) for r in exc) / len(exc) if exc else 0.0
+        avg_mfe = sum(r.get("mfe_r", 0.0) for r in exc) / len(exc) if exc else 0.0
+        rs = sum(r.get("r", 0.0) for r in exc)
+        mfes = sum(r.get("mfe_r", 0.0) for r in exc)
         return {
             "trades": len(rows),
             "win_rate": round(wins / len(rows), 4),
             "pnl": round(sum(r.get("pnl", 0.0) for r in rows), 4),
+            "avg_mae_r": round(avg_mae, 3),
+            "avg_mfe_r": round(avg_mfe, 3),
+            "mfe_capture": round(rs / mfes, 3) if mfes > 0 else 0.0,
             "profit_factor": round(gross_w / gross_l, 3) if gross_l > 0 else (999.0 if gross_w > 0 else 0.0),
             "by_regime": agg(lambda r: r.get("regime")),
             "by_alignment": agg(lambda r: _bucket_align(signed_align(r))),

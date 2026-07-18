@@ -75,6 +75,7 @@ class TraderEngine:
         self.journal = journal      # TradeJournal (records closed trades + context)
         self.record = record        # TrackRecord (daily performance snapshots)
         self.active_champion_id: str | None = None  # vault champion currently driving trades (journal tag)
+        self.overlays: dict[str, dict] = {}   # per-symbol brain-scalar overlays (tuner-owned)
         self.ctx: dict[str, SymbolCtx] = {sym: self._make_ctx(sym) for sym in cfg.symbols}
         self.adopted: set[str] = set()   # radar-adopted symbols (beyond the user's list)
         self._task: asyncio.Task | None = None
@@ -190,6 +191,8 @@ class TraderEngine:
         if add is None or not await add(sym):
             return False
         self.ctx[sym] = self._make_ctx(sym)
+        if sym in self.overlays:   # a stored overlay follows the symbol back in
+            self._apply_brain_params(self.ctx[sym].brain, self.cfg.strategy, self.overlays[sym])
         self.adopted.add(sym)
         log.info("ADOPTED %s (radar trend pick)", sym)
         return True
@@ -457,7 +460,11 @@ class TraderEngine:
         one-per-closed-bar (score() only, never observe()) so the online weights
         are untouched."""
         now = now_ms()
-        if now - ctx.react_ts < REACT_MS:
+        # adaptive throttle: the reactive scanner's CPU grows with the book —
+        # widen the per-symbol gap as adoption adds symbols (3 symbols = 0.85s,
+        # 6 symbols = 1.7s) so the event loop stays cool.
+        gap = REACT_MS * max(1.0, len(self.ctx) / 3.0)
+        if now - ctx.react_ts < gap:
             return
         ctx.react_ts = now
         n = len(st.candles)
@@ -527,7 +534,8 @@ class TraderEngine:
         row = {
             "ts": t.exit_ts, "symbol": t.symbol, "side": t.side, "qty": t.qty,
             "entry": t.entry_price, "exit": t.exit_price, "pnl": round(t.pnl, 6),
-            "r": t.r_multiple, "fees": round(t.fees, 6), "bars_held": bars_held,
+            "r": t.r_multiple, "mae_r": t.mae_r, "mfe_r": t.mfe_r,
+            "fees": round(t.fees, 6), "bars_held": bars_held,
             "reason_open": t.reason_open, "reason_close": t.reason_close, "mode": t.mode,
             "hour": hour,
             "regime": entry_ctx.get("regime", ""), "edge": entry_ctx.get("edge", 0.0),
@@ -570,6 +578,7 @@ class TraderEngine:
                     "eval_ms": round(c.eval_ms, 2),
                     "mtf": c.mtf,
                     "gates": c.gates,
+                    "overlay": sym in self.overlays,
                 }
                 for sym, c in self.ctx.items()
             },
@@ -637,17 +646,35 @@ class TraderEngine:
             "tape": self.tape[-10:],
         }
 
+    def _apply_brain_params(self, brain, strat, ov: dict | None) -> None:
+        """Push brain scalars from the global strategy config, overridden by the
+        symbol's overlay where one exists."""
+        g = (lambda k, d: ov.get(k, d)) if ov else (lambda k, d: d)
+        brain.base_threshold = g("base_threshold", strat.base_threshold)
+        brain.cost_multiple = g("cost_multiple", strat.cost_multiple)
+        brain.eta = g("hedge_eta", strat.hedge_eta)
+        brain.horizon = max(1, int(g("horizon_bars", strat.horizon_bars)))
+        brain.kelly_fraction = g("kelly_fraction", strat.kelly_fraction)
+        brain.min_p_win = g("min_p_win", strat.min_p_win)
+        brain.target_rate = max(0.1, g("target_trades_per_hour", strat.target_trades_per_hour))
+        brain.threshold_adapt = strat.threshold_adapt
+
+    def set_overlay(self, sym: str, params: dict | None) -> None:
+        """Per-symbol brain overlay from the tuner: apply now if the symbol is
+        live, keep it stored so adoption/restarts pick it up. None clears back
+        to the global set."""
+        if params:
+            self.overlays[sym] = dict(params)
+        else:
+            self.overlays.pop(sym, None)
+        c = self.ctx.get(sym)
+        if c is not None:
+            self._apply_brain_params(c.brain, self.cfg.strategy, self.overlays.get(sym))
+
     def hot_swap_params(self, strat) -> None:
         """Live-apply tuned strategy params to every symbol's brain (auto-tuner).
         Risk/exit params are read live from the shared cfg by reference, so only
-        the brain's cached scalars need pushing here."""
-        for c in self.ctx.values():
-            b = c.brain
-            b.base_threshold = strat.base_threshold
-            b.cost_multiple = strat.cost_multiple
-            b.eta = strat.hedge_eta
-            b.horizon = max(1, strat.horizon_bars)
-            b.kelly_fraction = strat.kelly_fraction
-            b.min_p_win = strat.min_p_win
-            b.target_rate = max(0.1, strat.target_trades_per_hour)
-            b.threshold_adapt = strat.threshold_adapt
+        the brain's cached scalars need pushing here. Per-symbol overlays are
+        re-applied on top so a global promotion never wipes them."""
+        for sym, c in self.ctx.items():
+            self._apply_brain_params(c.brain, strat, self.overlays.get(sym))

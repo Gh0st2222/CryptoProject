@@ -90,6 +90,7 @@ class Position:
     entry_bar_ts: int = 0     # bar timestamp at entry (time stop)
     breakeven_moved: bool = False
     trail_price: float = 0.0  # high-water (LONG) / low-water (SHORT) for trailing
+    trough_price: float = 0.0  # worst adverse extreme since entry (MAE anchor)
     exchange_position_id: str = ""
     # adaptive-exit state
     style: str = "trend"      # trend (ride with trail) | scalp (passive maker target)
@@ -123,6 +124,8 @@ class TradeRecord:
     reason_close: str
     r_multiple: float = 0.0  # pnl / planned risk
     mode: str = "paper"
+    mae_r: float = 0.0       # max adverse excursion, in R (how far it went against us)
+    mfe_r: float = 0.0       # max favorable excursion, in R (best it ever looked)
 
     @property
     def won(self) -> bool:
