@@ -305,7 +305,8 @@ function renderRadar(){
       :`<tr><td colspan="10" class="empty">No carry positions — the desk waits for genuinely extreme funding</td></tr>`;
   }
   if(R&&rbody){
-    $("radar-meta").textContent=R.ts?`· scan ${fmt.time(R.ts)}${R.demo?" · DEMO BOARD (synthetic feed)":""}${R.error?` · ⚠ ${R.error}`:""}`:"";
+    const uni=(R.top_volume||[]).map(s=>s.replace("-USDT","")).join(" ");
+    $("radar-meta").textContent=R.ts?`· scan ${fmt.time(R.ts)}${R.demo?" · DEMO BOARD (synthetic feed)":""}${uni?` · tuner universe: ${uni}`:""}${R.error?` · ⚠ ${R.error}`:""}`:"";
     const rows=R.rows||[];
     rbody.innerHTML=rows.length?rows.map((r,i)=>{
       const kindCls=r.kind==="carry"?"pnl-pos":(r.kind==="trend"?"sc-pos":"");

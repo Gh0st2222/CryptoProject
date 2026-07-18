@@ -119,13 +119,12 @@ class AutoTuner:
             await asyncio.sleep(gap)
 
     def _universe(self) -> list[str]:
-        """The research universe: top-10 perps by 24h volume from the radar (so
-        the tuner learns the whole board, not just BTC's microstructure), plus
-        the user's own symbols. Falls back to the configured symbols offline."""
+        """The research universe: the radar's ACTUAL top-10 BingX perps by 24h
+        USDT volume (clean majors — no index products, no long-tail memes; see
+        scanner.top_volume_universe), plus the user's own symbols. Falls back to
+        the configured symbols offline."""
         sc = getattr(self.orch, "scanner", None)
-        rows = sc.rows if sc is not None else []
-        by_vol = sorted(rows, key=lambda r: r.get("quote_volume", 0.0), reverse=True)
-        uni = [r["symbol"] for r in by_vol[:10]]
+        uni = list(sc.top_volume) if sc is not None and sc.top_volume else []
         for s in self.orch.cfg.symbols:
             if s not in uni:
                 uni.append(s)

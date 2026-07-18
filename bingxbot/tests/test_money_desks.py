@@ -5,8 +5,9 @@ import numpy as np
 from bingxbot.config import CarryConfig, RiskConfig
 from bingxbot.engine.backtest import _fitness
 from bingxbot.engine.carry import carry_entry_ok, carry_exit_reason, receiving_side
-from bingxbot.engine.scanner import (annualize_funding, demo_universe,
-                                     rank_universe, trend_read_4h)
+from bingxbot.engine.scanner import (annualize_funding, clean_perp,
+                                     demo_universe, rank_universe,
+                                     top_volume_universe, trend_read_4h)
 from bingxbot.exchange.models import LONG, SHORT, ContractSpec
 from bingxbot.risk.manager import MAINT_MARGIN_RATE, RiskManager
 
@@ -32,6 +33,52 @@ def test_rank_universe_orders_by_edge_and_filters_illiquid():
     assert hot["kind"] == "carry"
     assert hot["carry_side"] == "SHORT"          # positive funding -> shorts receive
     assert abs(hot["funding_apr"] - 0.002 * 3 * 365) < 1e-9
+
+
+def test_clean_perp_filters_junk_listings():
+    # real majors pass
+    for s in ("BTC-USDT", "ETH-USDT", "SOL-USDT", "DOGE-USDT", "PEPE-USDT", "LINK-USDT"):
+        assert clean_perp(s), s
+    # index products, USDC quotes, multiplied listings, long-tail memes don't
+    for s in ("NCCOXAG2USD-USDT", "NCSINASDAQ100USD-USDT", "TRX-USDC", "UNI-USDC",
+              "1000PEPE-USDT", "BROCCOLI-USDT", "MOODENG-USDT", "ESPORTS-USDT"):
+        assert not clean_perp(s), s
+
+
+def test_junk_carry_is_not_harvestable():
+    """The exact failure from live: a 6.5M-volume meme printing -1010% APR must
+    not rank as harvestable carry, and index products must not become trend."""
+    premium = [
+        {"symbol": "HOME-USDT", "mark": 1.0, "funding_rate": -0.00922, "next_funding_time": 0},   # -1010% APR
+        {"symbol": "BTC-USDT", "mark": 60_000.0, "funding_rate": 0.0004, "next_funding_time": 0},  # 44% APR, liquid
+        {"symbol": "NCCOXAG2USD-USDT", "mark": 30.0, "funding_rate": 0.0001, "next_funding_time": 0},
+    ]
+    tickers = [
+        {"symbol": "HOME-USDT", "last": 1.0, "quote_volume": 8.1e6, "change_pct": -23.1},
+        {"symbol": "BTC-USDT", "last": 60_000.0, "quote_volume": 2e9, "change_pct": 1.0},
+        {"symbol": "NCCOXAG2USD-USDT", "last": 30.0, "quote_volume": 91e6, "change_pct": 1.6},
+    ]
+    trend = {"NCCOXAG2USD-USDT": {"er": 0.6, "dir": -1, "atr_pct": 0.01}}
+    rows = {r["symbol"]: r for r in rank_universe(premium, tickers, trend)}
+    assert "NCCOXAG2USD-USDT" not in rows, "index products are excluded entirely"
+    assert rows["HOME-USDT"]["kind"] == "watch", "illiquid extreme funding = watch, never carry"
+    assert rows["HOME-USDT"]["score"] < rows["BTC-USDT"]["score"], "junk cannot outrank a real carry"
+    assert rows["BTC-USDT"]["kind"] == "carry"
+
+
+def test_top_volume_universe_returns_actual_majors():
+    tickers = [
+        {"symbol": "BTC-USDT", "quote_volume": 2e9}, {"symbol": "ETH-USDT", "quote_volume": 9e8},
+        {"symbol": "SOL-USDT", "quote_volume": 4e8}, {"symbol": "XRP-USDT", "quote_volume": 3e8},
+        {"symbol": "DOGE-USDT", "quote_volume": 2e8},
+        {"symbol": "NCCOXAG2USD-USDT", "quote_volume": 5e8},   # index product: out
+        {"symbol": "BROCCOLI-USDT", "quote_volume": 6.5e6},    # long-tail meme: out
+        {"symbol": "TRX-USDC", "quote_volume": 6.5e6},         # USDC quote: out
+    ]
+    uni = top_volume_universe(tickers, 10)
+    assert uni[:2] == ["BTC-USDT", "ETH-USDT"]
+    assert "NCCOXAG2USD-USDT" not in uni and "BROCCOLI-USDT" not in uni and "TRX-USDC" not in uni
+    assert set(uni) == {"BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "DOGE-USDT"}
 
 
 def test_trend_read_4h_direction():
