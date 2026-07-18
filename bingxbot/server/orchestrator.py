@@ -30,6 +30,8 @@ log = logging.getLogger("orchestrator")
 
 LIVE_CONFIRM_PHRASE = "TRADE LIVE"
 CHAMPIONS_PATH = ROOT / "data_cache" / "champions.json"
+OVERLAYS_PATH = ROOT / "data_cache" / "overlays.json"
+LIVE_FLAG_TTL_MS = 48 * 3600 * 1000   # a live-evidence flag expires after 2 days
 CHAMPIONS_KEEP = 100         # vault capacity
 CHAMPIONS_PROTECT_USED = 15  # the most-used champions are never pruned (proven, not just high-scoring)
 CHAMPION_STALE_DAYS = 7      # never-used champions age out of the vault after a week
@@ -169,6 +171,10 @@ class Orchestrator:
         self.scanner = None         # MarketScanner (universe radar), set on engine start
         self.carry = None           # CarryDesk (funding harvest), set on engine start
         self._adopt_miss: dict[str, int] = {}   # consecutive radar misses per adopted symbol
+        try:
+            self.symbol_overlays: dict[str, dict] = json.loads(OVERLAYS_PATH.read_text())
+        except (OSError, json.JSONDecodeError):
+            self.symbol_overlays = {}   # per-symbol brain-scalar overlays (tuner-owned)
 
     # ------------------------------------------------------------- CPU offload
 
@@ -327,6 +333,9 @@ class Orchestrator:
         protected.update(c["id"] for c in used[:CHAMPIONS_PROTECT_USED])
 
         now = now_ms()
+        for c in champs:   # live-evidence flags expire — a bad fortnight isn't forever
+            if c.get("live_flag") and now - c["live_flag"].get("ts", 0) > LIVE_FLAG_TTL_MS:
+                del c["live_flag"]
         stale_ms = CHAMPION_STALE_DAYS * 86_400_000
         survivors = [c for c in champs
                      if c.get("id") in protected
@@ -337,22 +346,30 @@ class Orchestrator:
         self.champions = survivors[:CHAMPIONS_KEEP]
         self.save_champions()
 
-    def champion_live_stats(self) -> dict:
+    def champion_live_stats(self, recent_n: int | None = None) -> dict:
         """Aggregate REAL executed trades from the journal by the champion that was
-        active when each was taken -> {id: {trades, wins, pnl, win_rate}}. This is a
-        champion's actual live/paper track record, not its backtest score."""
-        out: dict[str, dict] = {}
+        active when each was taken -> {id: {trades, wins, pnl, win_rate, pf}}.
+        With recent_n, judge only each champion's most recent trades — the number
+        live-evidence demotion runs on. This is a champion's actual track record,
+        not its backtest score."""
+        pnls: dict[str, list[float]] = {}
         for r in self.journal.rows:
             cid = r.get("champion_id")
-            if not cid:
-                continue
-            g = out.setdefault(cid, {"trades": 0, "wins": 0, "pnl": 0.0})
-            g["trades"] += 1
-            g["wins"] += 1 if r.get("pnl", 0.0) > 0 else 0
-            g["pnl"] += float(r.get("pnl", 0.0))
-        for g in out.values():
-            g["pnl"] = round(g["pnl"], 4)
-            g["win_rate"] = round(g["wins"] / g["trades"], 3) if g["trades"] else 0.0
+            if cid:
+                pnls.setdefault(cid, []).append(float(r.get("pnl", 0.0)))
+        out: dict[str, dict] = {}
+        for cid, xs in pnls.items():
+            if recent_n:
+                xs = xs[-recent_n:]
+            wins = sum(1 for x in xs if x > 0)
+            gw = sum(x for x in xs if x > 0)
+            gl = -sum(x for x in xs if x <= 0)
+            out[cid] = {
+                "trades": len(xs), "wins": wins,
+                "pnl": round(sum(xs), 4),
+                "win_rate": round(wins / len(xs), 3) if xs else 0.0,
+                "pf": round(gw / gl, 3) if gl > 0 else (999.0 if gw > 0 else 0.0),
+            }
         return out
 
     def save_champions(self) -> None:
@@ -534,6 +551,8 @@ class Orchestrator:
         self.engine = TraderEngine(self.cfg, feed, broker, portfolio, risk, self.specs,
                                    on_update, journal=self.journal, record=self.record)
         self.engine.active_champion_id = self.active_champion_id
+        for sym, ov in self.symbol_overlays.items():   # overlays survive restarts
+            self.engine.set_overlay(sym, ov.get("params"))
         await self.engine.start()
 
         from ..engine.autotuner import AutoTuner
@@ -811,6 +830,43 @@ class Orchestrator:
 
         asyncio.get_running_loop().create_task(runner())
         return job
+
+    def _save_overlays(self) -> None:
+        try:
+            OVERLAYS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            OVERLAYS_PATH.write_text(json.dumps(self.symbol_overlays, indent=2))
+        except OSError as e:
+            log.warning("could not save overlays: %s", e)
+
+    def update_symbol_overlays(self, overlays: dict, traded: list[str]) -> None:
+        """Apply the tuner's per-symbol overlay decisions: set where a candidate
+        clearly beat the global set on that symbol, clear where nothing does (the
+        global set is the best known there), and drop symbols no longer traded."""
+        changed = False
+        for sym in list(self.symbol_overlays):
+            if sym not in traded and sym not in overlays:
+                self.symbol_overlays.pop(sym, None)
+                changed = True
+                if self.engine is not None:
+                    self.engine.set_overlay(sym, None)
+        for sym in traded:
+            ov = overlays.get(sym)
+            cur = self.symbol_overlays.get(sym)
+            if ov is not None:
+                if cur is None or cur.get("params") != ov["params"]:
+                    self.symbol_overlays[sym] = {**ov, "ts": now_ms()}
+                    changed = True
+                    if self.engine is not None:
+                        self.engine.set_overlay(sym, ov["params"])
+                    log.info("overlay SET %s (fit %.2f vs global %.2f)", sym, ov["fitness"], ov["vs"])
+            elif cur is not None:
+                self.symbol_overlays.pop(sym, None)
+                changed = True
+                if self.engine is not None:
+                    self.engine.set_overlay(sym, None)
+                log.info("overlay CLEARED %s (global set is best there)", sym)
+        if changed:
+            self._save_overlays()
 
     async def maybe_adopt(self) -> None:
         """Radar-driven universe: adopt the strongest liquid 4h trends beyond the

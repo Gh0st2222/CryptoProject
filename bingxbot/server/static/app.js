@@ -200,6 +200,7 @@ function renderBrain(){
   $("b-vol").textContent=`vol ${(micro.spread_bps).toFixed(1)}bp`;
   renderMTF(es);
   renderGates(es);
+  $("b-overlay").style.display=es.overlay?"":"none";
 
   // desks
   renderDesks(b.desks);
@@ -629,7 +630,8 @@ function renderChampions(){
     const liveCell=lv.trades?`${lv.trades} · <span class="${pnlCls(lv.pnl)}">${fmt.signed(lv.pnl,2)}</span>`
                             :`<span style="color:var(--muted)">—</span>`;
     const badges=(c.active?`<span class="champ-live" title="Currently driving live trading">LIVE</span> `:"")
-                +(c.top_used?`<span title="Top-10 most used — protected from pruning">🔥</span> `:"");
+                +(c.top_used?`<span title="Top-10 most used — protected from pruning">🔥</span> `:"")
+                +(c.live_flag?`<span title="Demoted on LIVE evidence: real PF ${(c.live_flag.pf??0).toFixed(2)} over ${c.live_flag.trades??0} trades — excluded as a candidate for 48h">⚠</span> `:"");
     return `<tr class="${c.active?'champ-active':''}">
       <td>${badges}${fmt.dt(c.born_ts)}</td>
       <td class="r">${bfCell} ${arrow} <span class="${cf>=0?'pnl-pos':'pnl-neg'}">${cf.toFixed(2)}</span></td>
@@ -795,6 +797,9 @@ function renderAnalytics(d){
     ["Win rate",fmt.pct(s.win_rate),s.win_rate>=0.5?"pnl-pos":""],
     ["Profit factor",(s.profit_factor||0).toFixed(2),s.profit_factor>=1?"pnl-pos":"pnl-neg"],
     ["Trades",s.trades],["Net PnL",fmt.signed(s.pnl,2),pnlCls(s.pnl)],
+    ["Avg MAE (heat)",(s.avg_mae_r??0).toFixed(2)+"R","pnl-neg"],
+    ["Avg MFE (shown)",(s.avg_mfe_r??0).toFixed(2)+"R","pnl-pos"],
+    ["MFE captured",fmt.pct(s.mfe_capture??0,0),(s.mfe_capture??0)>=0.4?"pnl-pos":""],
   ].map(([k,v,cls])=>`<div class="card"><div class="k">${k}</div><div class="v ${cls??""}">${v}</div></div>`).join("");
   $("an-align").innerHTML=anRows(s.by_alignment); $("an-regime").innerHTML=anRows(s.by_regime);
   $("an-desk").innerHTML=anRows(s.by_desk); $("an-exit").innerHTML=anRows(s.by_exit);

@@ -27,6 +27,9 @@ log = logging.getLogger("carry")
 
 LOOP_S = 90                 # management cadence (stops / funding / exits)
 FUNDING_MS = 8 * 3600 * 1000
+ENTRY_WINDOW_MS = 3 * 3600 * 1000   # enter only within 3h of the next settlement:
+                                    # collect the first print soon, carry less
+                                    # price risk per print collected
 
 
 # ------------------------------------------------------- pure decision logic
@@ -46,6 +49,31 @@ def carry_entry_ok(apr: float, er_4h: float, dir_4h: int, cfg) -> tuple[bool, st
     if dir_4h * side_d < 0 and er_4h >= cfg.trend_veto_er:
         return False, f"4h trend (ER {er_4h:.2f}) opposes {side}"
     return True, "ok"
+
+
+def pick_carry_entry(rows: list[dict], held: set, cfg, now: int) -> tuple[dict | None, str]:
+    """Choose the carry entry for this pass, if any: among qualifying harvestable
+    rows, the one whose settlement lands SOONEST — and only inside the entry
+    window (being long price-risk for 7 hours to collect one print is a worse
+    trade than waiting). Pure and testable; cfg is CarryConfig."""
+    qualifying, reason = [], ""
+    for row in rows:
+        sym = row.get("symbol", "")
+        if row.get("kind") != "carry" or sym in held:
+            continue
+        ok, why = carry_entry_ok(row.get("funding_apr", 0.0), row.get("er_4h", 0.0),
+                                 row.get("dir_4h", 0), cfg)
+        reason = f"{sym}: {why}"
+        if ok:
+            qualifying.append(row)
+    if not qualifying:
+        return None, reason or "no harvestable funding on the board"
+    qualifying.sort(key=lambda r: r.get("next_funding_time", 0) or (now + FUNDING_MS))
+    soon = qualifying[0]
+    wait_ms = (soon.get("next_funding_time", 0) or (now + FUNDING_MS)) - now
+    if wait_ms > ENTRY_WINDOW_MS:
+        return None, f"{soon['symbol']}: waiting funding window ({wait_ms/3_600_000:.1f}h out)"
+    return soon, f"{soon['symbol']}: ok"
 
 
 def carry_exit_reason(side: str, apr: float, er_4h: float, dir_4h: int,
@@ -165,17 +193,9 @@ class CarryDesk:
         if not ok:
             self.last_reason = f"risk: {why}"
             return
-        for row in radar.rows:
-            sym = row["symbol"]
-            if row.get("kind") != "carry" or sym in pf.positions:
-                continue
-            apr = row.get("funding_apr", 0.0)
-            g_ok, g_why = carry_entry_ok(apr, row.get("er_4h", 0.0), row.get("dir_4h", 0), cfg.carry)
-            self.last_reason = f"{sym}: {g_why}"
-            if not g_ok:
-                continue
-            await self._open(row, equity)
-            return   # one entry per loop — carry scales slowly by design
+        row, self.last_reason = pick_carry_entry(radar.rows, set(pf.positions), cfg.carry, now_ms())
+        if row is not None:
+            await self._open(row, equity)   # one entry per loop — carry scales slowly by design
 
     async def _open(self, row: dict, equity: float) -> None:
         orch, cfg = self.orch, self.orch.cfg

@@ -48,6 +48,9 @@ VAULT_CANDIDATES = 4        # also re-validate this many top vault champions eac
 STALL_REINJECT = 20         # cycles without a promotion before a diversity restart
 DEMOTE_FLOOR = -1.0         # incumbent scoring below this on the TRADED basket is toxic...
 DEMOTE_PATIENCE = 3         # ...for this many consecutive cycles -> stand down
+LIVE_MIN_SAMPLE = 10        # real trades needed before live evidence can demote
+LIVE_RECENT_N = 20          # judge a champion on its most recent real trades
+LIVE_PF_FLOOR = 0.7         # real profit factor below this (and < 1/2 expectation) -> demote
 LOOKBACK_DAYS = 60.0
 DATA_TTL_S = 1800
 GAP_FAST = 20               # cadence right after a promotion (keep hammering)
@@ -62,6 +65,37 @@ def _current_params(cfg) -> dict:
         src = cfg.strategy if grp == "strategy" else cfg.risk
         p[name] = getattr(src, name)
     return p
+
+
+# Brain-only scalars that may differ PER SYMBOL. Risk/exit geometry stays
+# global — one account, one risk policy; but BTC and a hot adopted mid-cap
+# genuinely should not share one edge threshold.
+BRAIN_PARAMS = ("base_threshold", "target_trades_per_hour", "cost_multiple",
+                "hedge_eta", "horizon_bars", "min_p_win", "kelly_fraction")
+
+
+def select_overlays(cand_params: list[dict], per_sym_fits: list[list[float]],
+                    applied_fits: list[float], applied_params: dict, syms: list[str],
+                    margin: float = IMPROVE_MARGIN, floor: float = MIN_ABS_FITNESS) -> dict:
+    """Pick a per-symbol brain overlay wherever some candidate CLEARLY beats the
+    globally applied set on that specific symbol (clearly positive too). Pure —
+    the per-symbol validation numbers already exist; this stops averaging them
+    away. Returns {symbol: {params, fitness, vs}}."""
+    out: dict[str, dict] = {}
+    for j, sym in enumerate(syms):
+        base = applied_fits[j] if j < len(applied_fits) else 0.0
+        best_i, best_f = -1, -1e18
+        for i in range(len(cand_params)):
+            f = per_sym_fits[i][j]
+            if f > best_f:
+                best_i, best_f = i, f
+        if best_i < 0 or best_f <= max(base * margin, floor):
+            continue
+        ov = {k: cand_params[best_i][k] for k in BRAIN_PARAMS if k in cand_params[best_i]}
+        same = all(abs(float(ov.get(k, 0)) - float(applied_params.get(k, 0))) < 1e-9 for k in ov)
+        if ov and not same:
+            out[sym] = {"params": ov, "fitness": round(best_f, 3), "vs": round(base, 3)}
+    return out
 
 
 def _default_params() -> dict:
@@ -256,8 +290,8 @@ class AutoTuner:
         # the incumbent. The vault is a candidate pool, not a graveyard — the best
         # available champion drives trading, wherever it came from.
         topk = self.de.top_k(TOP_K_VALIDATE)          # (params, train_fit)
-        vault = sorted(self.orch.champions, key=lambda c: c.get("fitness", 0.0),
-                       reverse=True)[:VAULT_CANDIDATES]
+        vault = sorted((c for c in self.orch.champions if not c.get("live_flag")),
+                       key=lambda c: c.get("fitness", 0.0), reverse=True)[:VAULT_CANDIDATES]
         cands: list[dict] = [{"source": "de", "params": p, "train_fit": tfit, "cid": None}
                              for p, tfit in topk]
         cands += [{"source": "vault", "params": c.get("params", {}), "train_fit": None, "cid": c.get("id")}
@@ -280,7 +314,7 @@ class AutoTuner:
             return fit, rs[0]["stats"]          # stats shown from the research symbol
 
         champ_fit, _ = basket_fit(len(cands))
-        best, best_adj, best_stats = None, -1e18, {}
+        best, best_i, best_adj, best_stats = None, -1, -1e18, {}
         for i, c in enumerate(cands):
             oos, stats0 = basket_fit(i)
             # DE members carry an overfit penalty (in-sample -> OOS drop); vault
@@ -289,7 +323,7 @@ class AutoTuner:
             if c["source"] == "vault" and c["cid"]:
                 self.orch.set_champion_current(c["cid"], oos, stats0)  # keep its CURRENT eval fresh
             if adj > best_adj:
-                best, best_adj, best_stats = c, adj, stats0
+                best, best_i, best_adj, best_stats = c, i, adj, stats0
 
         self.cycles += 1
         self.champion_fitness = round(champ_fit, 3)
@@ -337,7 +371,8 @@ class AutoTuner:
             self._champ_bad_streak += 1
             if self._champ_bad_streak >= DEMOTE_PATIENCE:
                 self._champ_bad_streak = 0
-                alt = max((c for c in self.orch.champions if c.get("fitness", 0.0) > 0),
+                alt = max((c for c in self.orch.champions
+                           if c.get("fitness", 0.0) > 0 and not c.get("live_flag")),
                           key=lambda c: c.get("fitness", 0.0), default=None)
                 fb_params = alt["params"] if alt else _default_params()
                 fb_name = "vault fallback" if alt else "baseline reset"
@@ -357,6 +392,55 @@ class AutoTuner:
                     self.history = self.history[-25:]
                     log.warning("auto-tune STAND-DOWN: incumbent %.2f on traded basket -> %s",
                                 champ_fit, fb_name)
+
+        # PER-SYMBOL OVERLAYS: the per-symbol validation numbers already exist —
+        # stop averaging them away. Wherever a candidate clearly beats the
+        # globally applied set on one specific traded symbol, that symbol's brain
+        # gets the winner's scalars as an overlay (risk geometry stays global).
+        try:
+            per_sym = [[val_res[i * nb + j]["fitness"] for j in range(nb)]
+                       for i in range(len(cands))]
+            applied_row = best_i if promoted else len(cands)
+            applied_fits = [val_res[applied_row * nb + j]["fitness"] for j in range(nb)]
+            applied_params = best_params if promoted else champ
+            overlays = select_overlays([c["params"] for c in cands], per_sym,
+                                       applied_fits, applied_params, [s for s, _ in basket])
+            self.orch.update_symbol_overlays(overlays, traded=[s for s, _ in basket])
+        except Exception as e:  # noqa: BLE001 — overlays are an optimization, never fatal
+            log.warning("overlay pass failed: %s", e)
+
+        # LIVE-EVIDENCE DEMOTION: backtests propose, live results dispose. A
+        # champion with a real sample whose actual profit factor collapsed vs
+        # its validation expectation stops trading NOW, whatever backtests say.
+        act = self.orch.find_champion(self.orch.active_champion_id)
+        if act is not None and not act.get("live_flag"):
+            lv = self.orch.champion_live_stats(recent_n=LIVE_RECENT_N).get(act["id"])
+            if (lv and lv["trades"] >= LIVE_MIN_SAMPLE and lv["pf"] < LIVE_PF_FLOOR
+                    and lv["pf"] < 0.5 * max(act.get("profit_factor", 1.0), 1.0)):
+                act["live_flag"] = {"pf": lv["pf"], "trades": lv["trades"],
+                                    "ts": int(time.time() * 1000)}
+                alt = max((c for c in self.orch.champions
+                           if c.get("fitness", 0.0) > 0 and c["id"] != act["id"]
+                           and not c.get("live_flag")),
+                          key=lambda c: c.get("fitness", 0.0), default=None)
+                fb = alt["params"] if alt else _default_params()
+                self.orch.apply_params(fb)
+                if alt is not None:
+                    self.orch.mark_champion_used(alt["id"])
+                else:
+                    self.orch.save_champions()
+                self.history.append({
+                    "ts": int(time.time() * 1000),
+                    "from_fitness": round(champ_fit, 3),
+                    "to_fitness": round(alt.get("fitness", 0.0), 3) if alt else 0.0,
+                    "valid_wr": round(lv["win_rate"], 3), "valid_pf": round(lv["pf"], 3),
+                    "gen": self.de.generation,
+                    "source": f"live-evidence demotion (real PF {lv['pf']:.2f} on {lv['trades']} trades)",
+                    "params": {},
+                })
+                self.history = self.history[-25:]
+                log.warning("LIVE-EVIDENCE DEMOTION: champion %s real PF %.2f over %d trades",
+                            act["id"], lv["pf"], lv["trades"])
 
         # diversity restart: if the population has converged without finding a
         # champion for a long time, it's stuck in an overfit basin — re-inject
