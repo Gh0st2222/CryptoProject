@@ -90,13 +90,20 @@ class TradeJournal:
         wins = sum(1 for r in rows if r.get("pnl", 0) > 0)
         gross_w = sum(r["pnl"] for r in rows if r.get("pnl", 0) > 0)
         gross_l = -sum(r["pnl"] for r in rows if r.get("pnl", 0) <= 0)
+        def signed_align(r) -> float:
+            """Alignment RELATIVE TO THE TRADE: a SHORT taken with the higher-TF
+            bias pointing down is WITH-trend — bucketing raw bias sign alone
+            mislabeled every with-trend short as counter-trend."""
+            d = 1.0 if r.get("side") == "LONG" else -1.0
+            return r.get("mtf_bias", 0.0) * d
+
         return {
             "trades": len(rows),
             "win_rate": round(wins / len(rows), 4),
             "pnl": round(sum(r.get("pnl", 0.0) for r in rows), 4),
             "profit_factor": round(gross_w / gross_l, 3) if gross_l > 0 else (999.0 if gross_w > 0 else 0.0),
             "by_regime": agg(lambda r: r.get("regime")),
-            "by_alignment": agg(lambda r: _bucket_align(r.get("mtf_bias", 0.0))),
+            "by_alignment": agg(lambda r: _bucket_align(signed_align(r))),
             "by_hour": agg(lambda r: r.get("hour")),
             "by_desk": agg(lambda r: r.get("desk")),
             "by_side": agg(lambda r: r.get("side")),

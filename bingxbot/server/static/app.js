@@ -621,7 +621,10 @@ function renderChampions(){
   body.innerHTML=champStore.map((c,i)=>{
     const params=CHAMP_KEYS.filter(k=>c.params&&c.params[k]!=null).map(k=>`${k}=${c.params[k]}`).join("  ");
     const bf=c.birth_fitness??c.fitness??0, cf=c.fitness??0;
-    const arrow=cf>bf+1e-9?"▲":(cf<bf-1e-9?"▼":"·");
+    const oldScale=(c.fver??1)!==2;   // born under an older fitness scale — numbers not comparable
+    const arrow=oldScale?"·":(cf>bf+1e-9?"▲":(cf<bf-1e-9?"▼":"·"));
+    const bfCell=oldScale?`<span style="color:var(--muted);opacity:.5" title="recorded under an older fitness scale — not comparable to the current number">${bf.toFixed(2)}*</span>`
+                         :`<span style="color:var(--muted)">${bf.toFixed(2)}</span>`;
     const lv=c.live||{trades:0,pnl:0};
     const liveCell=lv.trades?`${lv.trades} · <span class="${pnlCls(lv.pnl)}">${fmt.signed(lv.pnl,2)}</span>`
                             :`<span style="color:var(--muted)">—</span>`;
@@ -629,7 +632,7 @@ function renderChampions(){
                 +(c.top_used?`<span title="Top-10 most used — protected from pruning">🔥</span> `:"");
     return `<tr class="${c.active?'champ-active':''}">
       <td>${badges}${fmt.dt(c.born_ts)}</td>
-      <td class="r"><span style="color:var(--muted)">${bf.toFixed(2)}</span> ${arrow} <span class="${cf>=0?'pnl-pos':'pnl-neg'}">${cf.toFixed(2)}</span></td>
+      <td class="r">${bfCell} ${arrow} <span class="${cf>=0?'pnl-pos':'pnl-neg'}">${cf.toFixed(2)}</span></td>
       <td class="r">${fmt.pct(c.win_rate,0)}</td>
       <td class="r">${(c.profit_factor||0).toFixed(2)}</td>
       <td class="r" style="color:var(--muted)">${c.cur_trades??0}</td>

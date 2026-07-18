@@ -621,6 +621,10 @@ def _apply_params(strat: StrategyConfig, risk: RiskConfig, p: dict) -> tuple[Str
     return s, r
 
 
+FITNESS_VER = 2   # bump when the fitness scale changes — birth scores recorded
+                  # under a different version are not comparable to current ones
+
+
 def _fitness(stats: dict) -> float:
     """LOG-WEALTH growth as a SMOOTH, ordered objective — what compounding
     actually maximizes (Kelly-consistent), net of fees AND funding drag, with a

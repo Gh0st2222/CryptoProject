@@ -272,13 +272,14 @@ class Orchestrator:
             self.set_champion_current(existing["id"], fitness, stats)
             self.save_champions()
             return existing["id"]
+        from ..engine.backtest import FITNESS_VER
         cid = uuid.uuid4().hex[:8]
         fit = round(float(fitness), 3)
         wr = round(stats.get("win_rate", 0.0), 4)
         pf = round(stats.get("profit_factor", 0.0), 3)
         tr = int(stats.get("trades", 0))
         self.champions.append({
-            "id": cid, "born_ts": now_ms(),
+            "id": cid, "born_ts": now_ms(), "fver": FITNESS_VER,
             "birth_fitness": fit, "birth_wr": wr, "birth_pf": pf, "birth_trades": tr,
             "fitness": fit, "win_rate": wr, "profit_factor": pf, "cur_trades": tr,
             "cur_ts": now_ms(), "uses": 0, "last_used_ts": 0, "params": dict(params),
