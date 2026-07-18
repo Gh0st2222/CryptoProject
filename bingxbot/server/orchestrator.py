@@ -773,9 +773,9 @@ class Orchestrator:
                 symbols: list[str] = []
                 if self.rest is not None:
                     try:
+                        from ..engine.scanner import top_volume_universe
                         ticks = await self.rest.tickers_24h()
-                        ticks.sort(key=lambda t: t.get("quote_volume", 0.0), reverse=True)
-                        symbols = [t["symbol"] for t in ticks[:top_n]]
+                        symbols = top_volume_universe(ticks, top_n)   # clean majors only
                     except Exception as e:  # noqa: BLE001
                         log.warning("carry lab tickers failed: %s", e)
                 if not symbols:

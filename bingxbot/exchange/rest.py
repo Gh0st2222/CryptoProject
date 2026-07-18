@@ -269,10 +269,15 @@ class BingXRest:
             sym = row.get("symbol", "")
             if not sym:
                 continue
+            last = safe_float(row.get("lastPrice"))
+            qv = safe_float(row.get("quoteVolume"))
+            base_vol = safe_float(row.get("volume"))
+            # defensive: some listings report quoteVolume oddly — cross-check
+            # against coin volume x price and take the larger USDT estimate.
             out.append({
                 "symbol": sym,
-                "last": safe_float(row.get("lastPrice")),
-                "quote_volume": safe_float(row.get("quoteVolume")),
+                "last": last,
+                "quote_volume": max(qv, base_vol * last),
                 "change_pct": safe_float(row.get("priceChangePercent")),
             })
         return out
