@@ -335,7 +335,7 @@ function renderAutotuner(){
     ["DE generation",at.generation??"—"],
     ["Population",at.population??"—"],
     ["Research cores",at.research_cores??"—"],
-    ["Researching",at.research_symbol||"—"],
+    ["Researching",at.research_symbol?`${at.research_symbol.replace("-USDT","")} · ${at.research_idx||"?"}/${at.research_universe||"?"}${at.next_rotation_ts?` · ⟳${Math.max(0,Math.round((at.next_rotation_ts-Date.now())/60000))}m`:""}`:"—"],
     ["Cycles run",at.cycles],
     ["Improvements",at.improvements],
     ["Champion fitness",at.champion_fitness??"—"],

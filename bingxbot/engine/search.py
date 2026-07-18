@@ -101,6 +101,8 @@ class DEOptimizer:
         self.pop: list[dict] = []
         self.fitness: list[float] = []
         self.generation = 0
+        self.extra: dict = {}   # owner-attached state persisted with the population
+                                # (e.g. the tuner's rotation position)
 
     # -- lifecycle -------------------------------------------------------
     def _rand_vec(self) -> dict:
@@ -212,6 +214,7 @@ class DEOptimizer:
             self.state_path.write_text(json.dumps({
                 "generation": self.generation, "keys": self.keys,
                 "pop": self.pop, "fitness": self.fitness,
+                "extra": self.extra,
             }))
         except OSError:
             pass
@@ -228,5 +231,6 @@ class DEOptimizer:
         if len(self.fitness) != len(self.pop):
             self.fitness = [-1e9] * len(self.pop)
         self.generation = int(d.get("generation", 0))
+        self.extra = d.get("extra", {}) if isinstance(d.get("extra"), dict) else {}
         self.pop_size = len(self.pop)
         return True

@@ -53,6 +53,10 @@ LIVE_RECENT_N = 20          # judge a champion on its most recent real trades
 LIVE_PF_FLOOR = 0.7         # real profit factor below this (and < 1/2 expectation) -> demote
 LOOKBACK_DAYS = 60.0
 DATA_TTL_S = 1800
+ROTATE_EVERY_S = 900        # research symbol rotates every 15 min (own clock,
+                            # decoupled from the data cache; position survives
+                            # restarts via the DE state file — no more re-anchoring
+                            # to symbol #1 on every boot)
 GAP_FAST = 20               # cadence right after a promotion (keep hammering)
 GAP_SLOW = 60               # cadence when stable
 VAULT_REVAL_EVERY = 15      # re-validate the champion vault every N cycles
@@ -122,6 +126,7 @@ class AutoTuner:
         self.de = DEOptimizer(pop_size=POP_SIZE, seed=self.rng.randint(0, 2**31))
         self._cache: dict[str, tuple[list, float]] = {}   # symbol -> (candles, fetched_ts)
         self._rot_idx = -1
+        self._rot_ts = 0.0
         self.research_symbol = ""   # rotates across the top-volume board each window
         self._data_ts = 0.0
         self._scored_ts = -1.0      # data window the population was last fully scored on
@@ -191,16 +196,22 @@ class AutoTuner:
         return candles
 
     async def _ensure_data(self) -> list:
-        """Rotate the research symbol across the universe each data window: every
-        ~30 min the DE trains against a different top-volume perp, so surviving
-        parameters must work on the BOARD, not on one symbol's quirks."""
+        """Rotate the research symbol across the universe on its own clock (every
+        ROTATE_EVERY_S) so the DE trains against a different top-volume perp a few
+        times an hour — surviving parameters must work on the BOARD, not on one
+        symbol's quirks. The rotation position persists with the DE state, so a
+        restart CONTINUES the tour instead of re-anchoring at symbol #1."""
         uni = self._universe()
+        now = time.time()
         rotate = (not self.research_symbol
                   or self.research_symbol not in uni
-                  or time.time() - self._data_ts >= DATA_TTL_S)
+                  or now - self._rot_ts >= ROTATE_EVERY_S)
         if rotate:
             self._rot_idx = (self._rot_idx + 1) % len(uni)
             self.research_symbol = uni[self._rot_idx]
+            self._rot_ts = now
+            self.de.extra.update({"research_symbol": self.research_symbol,
+                                  "rot_idx": self._rot_idx, "rot_ts": now})
         candles = await self._get_candles(self.research_symbol)
         self._data_ts = self._cache[self.research_symbol][1]
         return candles
@@ -251,7 +262,13 @@ class AutoTuner:
 
         champ = _current_params(cfg)
         if not self.de.ready():
-            if not self.de.load():
+            if self.de.load():
+                # resume the symbol tour where the last session left it
+                ex = self.de.extra
+                self._rot_idx = int(ex.get("rot_idx", self._rot_idx))
+                self._rot_ts = float(ex.get("rot_ts", 0.0))
+                self.research_symbol = ex.get("research_symbol", self.research_symbol)
+            else:
                 self.de.seed_population(champ)
         self.de.inject(champ)
 
@@ -506,6 +523,9 @@ class AutoTuner:
             "population": len(self.de.pop),
             "research_cores": self.orch.research_workers,
             "research_symbol": self.research_symbol,
+            "research_idx": self._rot_idx + 1,
+            "research_universe": len(self._universe()),
+            "next_rotation_ts": int((self._rot_ts + ROTATE_EVERY_S) * 1000),
             "next_run_ts": int(self.next_run_ts * 1000),
             "last_cycle": self.last_cycle,
             "history": self.history[-12:][::-1],

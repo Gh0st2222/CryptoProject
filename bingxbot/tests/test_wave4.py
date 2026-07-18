@@ -73,6 +73,48 @@ def test_champion_live_stats_recent_pf(tmp_path):
         "recent window must expose the collapse the all-time numbers hide"
 
 
+# ---------------------------------------------------------------- rotation
+
+def test_research_rotation_advances_and_persists(tmp_path, monkeypatch):
+    import asyncio
+
+    import bingxbot.engine.autotuner as AT
+    from bingxbot.config import BotConfig
+    from bingxbot.engine.search import DEOptimizer
+    from bingxbot.server.orchestrator import Orchestrator
+
+    monkeypatch.setattr(AT, "ROTATE_EVERY_S", 0)   # rotate on every data pass
+    orch = Orchestrator(BotConfig())
+    tuner = AT.AutoTuner(orch)
+    tuner.de.state_path = tmp_path / "de.json"
+
+    class _Sc:
+        top_volume = ["SOL-USDT", "XRP-USDT", "DOGE-USDT"]
+    orch.scanner = _Sc()
+
+    async def fake_get(sym):
+        return [None] * 10
+    tuner._get_candles = fake_get
+    tuner._cache = {s: ([None] * 10, 1.0) for s in
+                    ("SOL-USDT", "XRP-USDT", "DOGE-USDT", "BTC-USDT", "ETH-USDT")}
+
+    seen = []
+    for _ in range(4):
+        asyncio.run(tuner._ensure_data())
+        seen.append(tuner.research_symbol)
+    assert len(set(seen[:3])) == 3, f"must tour the universe, saw {seen}"
+
+    # the tour position survives a save/load (i.e. a restart)
+    tuner.de.pop = [{"x": 1}] * 4
+    tuner.de.fitness = [0.0] * 4
+    tuner.de.save()
+    de2 = DEOptimizer(state_path=tuner.de.state_path)
+    de2.keys = tuner.de.keys
+    raw = __import__("json").loads(tuner.de.state_path.read_text())
+    assert raw["extra"]["research_symbol"] == tuner.research_symbol
+    assert raw["extra"]["rot_idx"] == tuner._rot_idx
+
+
 # ------------------------------------------------------------- carry timing
 
 def _row(sym, apr, nft):
