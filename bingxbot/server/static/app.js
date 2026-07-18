@@ -86,14 +86,36 @@ function renderTop(){
   $("t-tr").textContent=st?String(st.trades):"—";
   const h=S.engine?.risk?.health?.scalar; $("t-health").textContent=h!=null?`${(h*100).toFixed(0)}%`:"—";
 }
+let autoFollow=true;   // the chart follows whatever symbol the machine is looking at
+function engineSymbols(){ const es=S?.engine?.symbols; return es?Object.keys(es):symbols(); }
+function followFocus(){
+  if(!autoFollow) return;
+  const f=S?.engine?.focus;
+  if(f&&f!==curSymbol&&S?.engine?.symbols?.[f]) setSymbol(f);
+}
 function renderSymTabs(){
-  const wrap=$("sym-tabs"), syms=symbols();
-  if([...wrap.children].map(b=>b.dataset.sym).join(",")!==syms.join(",")){
+  const wrap=$("sym-tabs"), syms=engineSymbols();
+  const adopted=new Set(S?.engine?.adopted||[]);
+  const sig=syms.join(",")+"|"+[...adopted].join(",");
+  if(wrap.dataset.sig!==sig){
+    wrap.dataset.sig=sig;
     wrap.innerHTML="";
-    for(const s of syms){ const b=document.createElement("button"); b.className="sym-tab"; b.dataset.sym=s; b.textContent=s.replace("-USDT","");
-      b.onclick=()=>setSymbol(s); wrap.appendChild(b); }
+    const a=document.createElement("button");
+    a.className="sym-tab auto"+(autoFollow?" on":""); a.id="auto-follow-btn"; a.textContent="◉ AUTO";
+    a.title="Chart follows the symbol the machine is looking at (position first, else closest to firing)";
+    a.onclick=()=>{ autoFollow=!autoFollow; a.classList.toggle("on",autoFollow); if(autoFollow) followFocus(); };
+    wrap.appendChild(a);
+    for(const s of syms){
+      const b=document.createElement("button");
+      b.className="sym-tab"+(adopted.has(s)?" adopted":""); b.dataset.sym=s;
+      b.textContent=s.replace("-USDT","")+(adopted.has(s)?" ◈":"");
+      if(adopted.has(s)) b.title="Adopted by the radar (trending) — auto-released when the trend dies";
+      b.onclick=()=>{ autoFollow=false; $("auto-follow-btn")?.classList.remove("on"); setSymbol(s); };
+      wrap.appendChild(b);
+    }
     setSymbol(syms.includes(curSymbol)?curSymbol:syms[0],true);
   }
+  followFocus();
 }
 function renderTape(){
   const tape=S.engine?.tape??[]; const track=$("tape-track");
@@ -163,7 +185,8 @@ function renderBrain(){
   const es=engSym(); if(!es) return;
   const b=es.brain, micro=es.micro, ctx=es.context||{};
   const fund=ctx.funding_rate!=null?` · fund ${(ctx.funding_rate*100).toFixed(4)}%`:"";
-  $("px-meta").textContent=`spread ${micro.spread_bps.toFixed(1)}bp · OBI ${fmt.signed(micro.obi,2)} · flow ${fmt.signed(micro.flow,2)}${fund}`;
+  const tf=S?.engine?.interval||"";
+  $("px-meta").textContent=`1m chart · ${tf} signals · spread ${micro.spread_bps.toFixed(1)}bp · OBI ${fmt.signed(micro.obi,2)} · flow ${fmt.signed(micro.flow,2)}${fund}`;
   $("brain-graded").textContent=`${b.graded} graded`;
 
   // edge + p(win) gauges (also driven by the fast 'hot' channel)
@@ -310,6 +333,7 @@ function renderAutotuner(){
     ["DE generation",at.generation??"—"],
     ["Population",at.population??"—"],
     ["Research cores",at.research_cores??"—"],
+    ["Researching",at.research_symbol||"—"],
     ["Cycles run",at.cycles],
     ["Improvements",at.improvements],
     ["Champion fitness",at.champion_fitness??"—"],
@@ -341,6 +365,7 @@ function renderSettings(){
   $("cfg-levmin").value=c.risk.min_leverage; $("cfg-levmax").value=c.risk.max_leverage;
   $("cfg-dayloss").value=c.risk.max_daily_loss_pct; $("cfg-hardrisk").value=c.risk.max_risk_hard_pct;
   $("cfg-autotune").checked=c.strategy.auto_tune; $("cfg-allowlive").checked=c.allow_live;
+  $("cfg-adopt").value=c.strategy.adopt_symbols??2;
   if(c.carry){ $("cfg-carry").checked=c.carry.enabled; $("cfg-carrymax").value=c.carry.max_positions; }
   $("cfg-keys").textContent=c.has_keys?"configured ✓":"not set (paper/backtest only)"; $("cfg-keys").style.color=c.has_keys?"var(--good)":"";
   $("auto-params").innerHTML=AUTO_PARAMS.map(([k,lab,grp])=>{
@@ -364,6 +389,8 @@ function applyHot(h){
   const pf=S.engine.portfolio; if(pf) pf.equity=he.equity;
   if(typeof he.killed==="boolean"&&S.engine.risk) S.engine.risk.killed=he.killed;
   if(typeof he.feed_healthy==="boolean") S.engine.feed_healthy=he.feed_healthy;
+  if(he.focus) S.engine.focus=he.focus;
+  if(he.adopted) S.engine.adopted=he.adopted;
   for(const [sym,hs] of Object.entries(he.symbols||{})){
     const s=S.engine.symbols?.[sym]; if(!s) continue;
     s.price=hs.price; s.stage=hs.stage; s.eval_ms=hs.eval_ms; s.entry_block=hs.entry_block; s.bars_held=hs.bars_held;
@@ -382,6 +409,7 @@ let lastEqT=0;
 function renderHot(){
   if(!S?.engine) return;
   renderTop(); renderPipeline(); renderPositions(); renderTape();
+  renderSymTabs();   // adopted set + auto-follow react at hot cadence
   const es=engSym(); if(es&&es.brain){ renderEdgeGauge(es.brain, es); renderMTF(es); renderGates(es); }
   // live-forming candle straight off the hot channel — the chart moves at tick
   // cadence now instead of waiting for the next REST poll.
@@ -412,6 +440,9 @@ $("btn-kill").onclick=async()=>{ if(!confirm("Kill switch: flatten all and halt 
   try{ await api("/api/control",{action:"kill"}); toast("Kill switch engaged","warn"); }catch(e){ toast(e.message,"bad"); } };
 $("btn-flatten").onclick=async()=>{ try{ const r=await api("/api/control",{action:"flatten"}); toast(r.message,"good"); }catch(e){ toast(e.message,"bad"); } };
 $("btn-reset-kill").onclick=async()=>{ try{ const r=await api("/api/control",{action:"reset_kill"}); toast(r.message,"good"); }catch(e){ toast(e.message,"bad"); } };
+$("btn-paper-reset").onclick=async()=>{
+  if(!confirm("Reset the paper account? The persisted session (positions, trades, equity history) is wiped.")) return;
+  try{ await api("/api/paper_reset"); lastEqT=0; toast("Paper account reset — fresh balance","good"); }catch(e){ toast(e.message,"bad"); } };
 $("mode-select").onchange=async(ev)=>{ const mode=ev.target.value; if(mode==="live"){ openLiveModal(); return; }
   try{ const r=await api("/api/mode",{mode}); toast(r.message,"good"); }catch(e){ toast(e.message,"bad"); ev.target.value=S?.mode??"idle"; } };
 function openLiveModal(){ $("live-phrase").textContent=S?.live_confirm_phrase??"TRADE LIVE"; $("live-confirm-input").value=""; $("live-go").disabled=true; $("live-modal").classList.add("open"); }
@@ -427,12 +458,14 @@ document.querySelectorAll(".tab").forEach(b=>{ b.onclick=()=>{
   if(b.dataset.tab==="portfolio") ensurePfChart();
   if(b.dataset.tab==="walkforward") ensureWfChart();
   if(b.dataset.tab==="analytics") loadAnalytics();
+  if(b.dataset.tab==="record") loadRecord();
 }; });
 document.querySelectorAll('[data-page="settings"] input, [data-page="settings"] select').forEach(el=>el.addEventListener("input",()=>{settingsDirty=true;}));
 $("cfg-save").onclick=async()=>{
   const patch={ symbols:$("cfg-symbols").value.split(",").map(s=>s.trim().toUpperCase()).filter(Boolean),
     feed:$("cfg-feed").value, allow_live:$("cfg-allowlive").checked,
-    strategy:{ interval:$("cfg-interval").value, auto_tune:$("cfg-autotune").checked },
+    strategy:{ interval:$("cfg-interval").value, auto_tune:$("cfg-autotune").checked,
+      adopt_symbols:parseInt($("cfg-adopt").value,10) },
     risk:{ min_leverage:parseInt($("cfg-levmin").value,10), max_leverage:parseInt($("cfg-levmax").value,10),
       max_daily_loss_pct:parseFloat($("cfg-dayloss").value), max_risk_hard_pct:parseFloat($("cfg-hardrisk").value),
       max_open_positions:parseInt($("cfg-maxpos").value,10) },
@@ -643,6 +676,99 @@ function renderWalkforward(res){
     <td class="r">${f.tuned?"yes":"default"}</td></tr>`).join("");
   toast(`Walk-forward OOS: ${fmt.signed(ret,1)}% · WR ${fmt.pct(res.oos_win_rate)} · PF ${res.oos_profit_factor.toFixed(2)}`,ret>=0?"good":"warn");
 }
+
+/* ---------------------------------------------------------------- carry lab */
+$("cl-run").onclick=async()=>{
+  try{
+    const r=await api("/api/carrylab",{days:parseFloat($("cl-days").value),top_n:parseInt($("cl-topn").value,10)});
+    $("cl-results").style.display="none";
+    pollJob(r.job_id,$("cl-progress"),renderCarryLab);
+  }catch(e){ toast(e.message,"bad"); }
+};
+function renderCarryLab(res){
+  $("cl-results").style.display="block";
+  if(res.error){ toast(res.error,"bad"); return; }
+  $("cl-note").textContent=res.demo?"DEMO DATA (no exchange access) — run on your machine for real funding history":"";
+  const rec=res.recommend;
+  const cur=res.current||{};
+  $("cl-cards").innerHTML=[
+    ["Days",res.days],["Symbols",(res.symbols||[]).length],
+    ["Current thresholds",`${(cur.min_apr*100).toFixed(0)}% / ${(cur.exit_apr*100).toFixed(0)}%`],
+    ["Evidence pick",rec?`enter ≥${(rec.min_apr*100).toFixed(0)}% · exit <${(rec.exit_apr*100).toFixed(0)}%`:"no combo traded"],
+    ["Net @ pick",rec?fmt.signed(rec.net*100,2)+"%":"—",rec&&rec.net>0?"pnl-pos":"pnl-neg"],
+    ["Entries @ pick",rec?rec.entries:"—"],
+  ].map(([k,v,cls])=>`<div class="card"><div class="k">${k}</div><div class="v ${cls??""}" style="font-size:13px">${esc(String(v))}</div></div>`).join("");
+  $("cl-body").innerHTML=(res.symbols||[]).map(s=>{
+    const c=s.current||{};
+    return `<tr><td><b>${esc(s.symbol)}</b></td><td class="r">${s.prints}</td>
+      <td class="r">${c.entries}</td><td class="r">${c.wins}</td>
+      <td class="r ${c.funding_ret>=0?'pnl-pos':'pnl-neg'}">${fmt.signed(c.funding_ret*100,2)}%</td>
+      <td class="r ${pnlCls(c.price_ret)}">${fmt.signed(c.price_ret*100,2)}%</td>
+      <td class="r">${(c.fees*100).toFixed(2)}%</td>
+      <td class="r ${pnlCls(c.net)}"><b>${fmt.signed(c.net*100,2)}%</b></td>
+      <td class="r pnl-neg">${fmt.signed(c.worst*100,1)}%</td>
+      <td class="r">${c.avg_hold_h}h</td></tr>`;
+  }).join("");
+  if(rec) toast(`Carry lab: evidence says enter ≥${(rec.min_apr*100).toFixed(0)}% APR (net ${fmt.signed(rec.net*100,2)}%)`,rec.net>0?"good":"warn");
+}
+
+/* ---------------------------------------------------------------- record */
+let recordChart=null, recordSeries=null, recordRows=[];
+function ensureRecordChart(){
+  if(recordChart) return;
+  recordChart=LightweightCharts.createChart($("chart-record"),baseOpts(200));
+  recordSeries=recordChart.addAreaSeries({lineColor:C.accent,lineWidth:2,topColor:"rgba(0,210,255,0.22)",bottomColor:"rgba(0,210,255,0.02)",priceLineVisible:false});
+  new ResizeObserver(()=>{ recordChart.applyOptions({width:$("chart-record").clientWidth}); }).observe($("chart-record"));
+}
+async function loadRecord(){
+  try{ const d=await api("/api/record"); renderRecord(d); }catch(e){ toast(e.message,"bad"); }
+}
+function renderRecord(d){
+  ensureRecordChart();
+  const rows=(d.rows||[]); recordRows=rows;
+  const today=d.today;
+  const all=today?rows.concat([{...today,partial:true}]):rows;
+  const wins=rows.filter(r=>r.pnl>0).length;
+  const tot=rows.reduce((a,r)=>a+r.pnl,0);
+  const best=rows.length?Math.max(...rows.map(r=>r.pnl)):0;
+  const worst=rows.length?Math.min(...rows.map(r=>r.pnl)):0;
+  $("rec-cards").innerHTML=[
+    ["Days recorded",rows.length],
+    ["Total PnL",fmt.signed(tot,2),pnlCls(tot)],
+    ["Win days",rows.length?`${wins}/${rows.length}`:"—"],
+    ["Best day",fmt.signed(best,2),"pnl-pos"],["Worst day",fmt.signed(worst,2),"pnl-neg"],
+    ["Today (partial)",today?fmt.signed(today.pnl,2):"—",pnlCls(today?.pnl??0)],
+  ].map(([k,v,cls])=>`<div class="card"><div class="k">${k}</div><div class="v ${cls??""}">${v}</div></div>`).join("");
+  requestAnimationFrame(()=>{
+    recordChart.applyOptions({width:$("chart-record").clientWidth});
+    recordSeries.setData(all.map(r=>({time:r.d,value:r.equity})));
+    recordChart.timeScale().fitContent();
+  });
+  const months={};
+  for(const r of rows){ const m=r.d.slice(0,7);
+    const g=months[m]=months[m]||{pnl:0,trades:0,windays:0,days:0,eq0:null,eq1:0};
+    if(g.eq0==null) g.eq0=r.equity-r.pnl;
+    g.eq1=r.equity; g.pnl+=r.pnl; g.trades+=r.trades; g.days++; if(r.pnl>0) g.windays++; }
+  const mk=Object.keys(months).sort().reverse();
+  $("rec-months").innerHTML=mk.length?mk.map(m=>{ const g=months[m];
+    const ret=g.eq0>0?(g.eq1/g.eq0-1)*100:0;
+    return `<tr><td>${m}</td><td class="r ${pnlCls(g.pnl)}">${fmt.signed(g.pnl,2)}</td>
+      <td class="r ${pnlCls(ret)}">${fmt.signed(ret,2)}%</td><td class="r">${g.trades}</td>
+      <td class="r">${g.windays}/${g.days}</td></tr>`; }).join("")
+    :`<tr><td colspan="5" class="empty">No complete months yet</td></tr>`;
+  $("rec-body").innerHTML=all.length?all.slice().reverse().map(r=>`<tr${r.partial?' style="color:var(--accent-2)"':''}>
+    <td>${r.d}${r.partial?" (today)":""}</td><td>${esc(r.mode||"")}</td>
+    <td class="r">${fmt.usd(r.equity)}</td><td class="r ${pnlCls(r.pnl)}">${fmt.signed(r.pnl,2)}</td>
+    <td class="r">${r.trades}</td><td class="r">${r.wins??0}</td><td class="r">${(r.fees??0).toFixed(2)}</td></tr>`).join("")
+    :`<tr><td colspan="7" class="empty">The first row appears after the first UTC midnight of running</td></tr>`;
+}
+$("rec-export").onclick=()=>{
+  const head="date,mode,equity,pnl,trades,wins,fees";
+  const csv=[head,...recordRows.map(r=>[r.d,r.mode,r.equity,r.pnl,r.trades,r.wins??0,r.fees??0].join(","))].join("\n");
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));
+  a.download="track_record.csv"; a.click(); URL.revokeObjectURL(a.href);
+};
 
 /* ---------------------------------------------------------------- analytics */
 async function loadAnalytics(){

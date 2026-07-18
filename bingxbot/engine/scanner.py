@@ -183,6 +183,12 @@ class MarketScanner:
         self.ts = time.time()
         self.scans += 1
         self.error = ""
+        maybe_adopt = getattr(self.orch, "maybe_adopt", None)
+        if maybe_adopt is not None:
+            try:
+                await maybe_adopt()   # radar picks feed the trend engine
+            except Exception as e:  # noqa: BLE001
+                log.warning("adoption pass failed: %s", e)
         if self.orch._notify:
             await self.orch._notify("radar")
         return self.rows

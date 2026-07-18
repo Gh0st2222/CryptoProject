@@ -70,6 +70,7 @@ class StrategyConfig:
     maker_wait_bars: int = 2        # bars to wait for a maker fill before cancelling
     auto_tune: bool = True          # background walk-forward self-tuning
     auto_tune_minutes: int = 90     # how often the auto-tuner re-evaluates
+    adopt_symbols: int = 2          # radar may adopt this many extra trending perps
 
 
 @dataclass
@@ -207,7 +208,7 @@ _NESTED_USER_OWNED = {
     "exchange": {"base_url", "ws_url", "recv_window_ms", "taker_fee", "maker_fee"},
     "server": {"host", "port"},
     "paper": {"starting_balance", "slippage_bps"},
-    "strategy": {"interval", "warmup_bars"},
+    "strategy": {"interval", "warmup_bars", "adopt_symbols"},
     # leverage band intentionally omitted so migrating an old config resets it
     # to the current 2-7x default; it stays UI-editable afterwards.
     "risk": {"max_open_positions", "max_daily_loss_pct", "margin_mode",

@@ -155,15 +155,45 @@ class BingXMarketWS(_BaseWS):
         self._kline_open: dict[str, int] = {}
         self._kline_last: dict[str, Candle] = {}
 
+    @staticmethod
+    def _symbol_channels(symbol: str, interval: str, depth_level: int = 20) -> set[str]:
+        return {
+            f"{symbol}@kline_{interval}",
+            f"{symbol}@trade",
+            f"{symbol}@bookTicker",
+            f"{symbol}@depth{depth_level}@500ms",
+        }
+
     def subscribe_symbol(self, symbol: str, interval: str = "1m", depth_level: int = 20) -> None:
-        self._channels.update(
-            {
-                f"{symbol}@kline_{interval}",
-                f"{symbol}@trade",
-                f"{symbol}@bookTicker",
-                f"{symbol}@depth{depth_level}@500ms",
-            }
-        )
+        self._channels.update(self._symbol_channels(symbol, interval, depth_level))
+
+    async def subscribe_now(self, symbol: str, interval: str = "1m") -> None:
+        """Runtime adoption: register the channels AND send the sub frames on the
+        live connection (reconnects re-subscribe everything from _channels)."""
+        new = self._symbol_channels(symbol, interval) - self._channels
+        self._channels.update(new)
+        if self.connected and self._ws is not None and not self._ws.closed:
+            for ch in sorted(new):
+                try:
+                    await self._ws.send_str(
+                        json.dumps({"id": str(uuid.uuid4()), "reqType": "sub", "dataType": ch}))
+                    await asyncio.sleep(0.05)
+                except Exception as e:  # noqa: BLE001 — reconnect will re-sub anyway
+                    log.warning("live subscribe %s failed: %s", ch, e)
+                    break
+
+    async def unsubscribe_now(self, symbol: str, interval: str = "1m") -> None:
+        gone = self._symbol_channels(symbol, interval) & self._channels
+        self._channels -= gone
+        if self.connected and self._ws is not None and not self._ws.closed:
+            for ch in sorted(gone):
+                try:
+                    await self._ws.send_str(
+                        json.dumps({"id": str(uuid.uuid4()), "reqType": "unsub", "dataType": ch}))
+                    await asyncio.sleep(0.05)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("unsubscribe %s: %s", ch, e)
+                    break
 
     async def _on_connected(self) -> None:
         for ch in sorted(self._channels):

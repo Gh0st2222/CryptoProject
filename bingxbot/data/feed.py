@@ -31,10 +31,17 @@ FLOW_WINDOW_S = 30.0
 MTF_SEED_MIN = 1200
 
 
+DISPLAY_MS = 60_000    # the UI chart always renders 1m bars, whatever the signal TF
+
+
 class MarketState:
     def __init__(self, symbol: str, capacity: int = 3000):
         self.symbol = symbol
         self.candles = CandleSeries(capacity)
+        # 1m DISPLAY series, aggregated from raw ticks — the chart follows the
+        # market at 1m no matter what timeframe the brain trades on.
+        self.display = CandleSeries(1500)
+        self._disp_bar: Candle | None = None
         self.book: BookTop | None = None
         self.depth: DepthSnapshot | None = None
         self.last_price = 0.0
@@ -85,9 +92,25 @@ class MarketState:
             "mark": self.mark,
         }
 
+    def _display_tick(self, ts: int, price: float, qty: float) -> None:
+        b = (ts // DISPLAY_MS) * DISPLAY_MS
+        d = self._disp_bar
+        if d is None or b > d.ts:
+            if d is not None:
+                self.display.append(Candle(d.ts, d.open, d.high, d.low, d.close, d.volume, closed=True))
+            self._disp_bar = Candle(ts=b, open=price, high=price, low=price,
+                                    close=price, volume=qty, closed=False)
+        else:
+            d.high = max(d.high, price)
+            d.low = min(d.low, price)
+            d.close = price
+            d.volume += qty
+        self.display.update_partial(self._disp_bar)
+
     def on_tick(self, t: Tick) -> None:
         self.last_price = t.price
         self.last_tick_ts = t.ts
+        self._display_tick(t.ts, t.price, t.qty)
         signed = -t.qty if t.is_buyer_maker else t.qty
         self.cvd += signed
         mono = time.monotonic()
@@ -184,17 +207,49 @@ class LiveFeed(BaseFeed):
             self.ws.subscribe_symbol(s, interval)
         self._ctx_task: asyncio.Task | None = None
 
+    async def _seed_symbol(self, s: str) -> None:
+        seed_n = min(max(self.warmup_bars + 60, MTF_SEED_MIN), 1440)
+        candles = await self.rest.klines(s, self.interval, limit=seed_n)
+        if candles:
+            candles = candles[:-1]  # last row is the still-open bar
+        n = self.states[s].candles.seed(candles)
+        # 1m display backdrop so the chart has history before ticks accumulate
+        try:
+            disp = await self.rest.klines(s, "1m", limit=400)
+            if disp:
+                self.states[s].display.seed(disp[:-1])
+        except Exception as e:  # noqa: BLE001 — display is cosmetic, never fatal
+            log.debug("display seed %s: %s", s, e)
+        log.info("%s seeded %d bars (%s)", s, n, self.interval)
+
     async def start(self) -> None:
         for s in self.symbols:
-            seed_n = min(max(self.warmup_bars + 60, MTF_SEED_MIN), 1440)
-            candles = await self.rest.klines(s, self.interval, limit=seed_n)
-            if candles:
-                candles = candles[:-1]  # last row is the still-open bar
-            n = self.states[s].candles.seed(candles)
-            log.info("%s seeded %d bars (%s)", s, n, self.interval)
+            await self._seed_symbol(s)
         await self.ws.start()
         self._ctx_task = asyncio.create_task(self._poll_context(), name="ctx-poller")
         self.started = True
+
+    async def add_symbol(self, s: str) -> bool:
+        """Runtime adoption: seed history, subscribe streams — no restart."""
+        if s in self.states:
+            return True
+        self.states[s] = MarketState(s)
+        try:
+            await self._seed_symbol(s)
+        except Exception as e:  # noqa: BLE001
+            log.warning("adopt %s: seed failed (%s)", s, e)
+            self.states.pop(s, None)
+            return False
+        if s not in self.symbols:
+            self.symbols.append(s)
+        await self.ws.subscribe_now(s, self.interval)
+        return True
+
+    async def remove_symbol(self, s: str) -> None:
+        if s in self.symbols:
+            self.symbols.remove(s)
+        self.states.pop(s, None)
+        await self.ws.unsubscribe_now(s, self.interval)
 
     async def stop(self) -> None:
         if self._ctx_task:
@@ -286,18 +341,49 @@ class SyntheticFeed(BaseFeed):
             self._drift[s], self._vol[s] = 0.0, 0.0014          # chop / vol spike
         self._regime_left[s] = self._rng.randint(60, 240)       # bars
 
-    async def start(self) -> None:
+    def _seed_symbol(self, s: str) -> None:
         from .history import synthetic_candles
         seed_n = max(self.warmup_bars, MTF_SEED_MIN)
+        candles = synthetic_candles(s, self.interval, seed_n,
+                                    seed=self._rng.randint(0, 10**9),
+                                    start_price=self._px[s])
+        self.states[s].candles.seed(candles)
+        self._px[s] = candles[-1].close
+        # 1m display backdrop, ending exactly where live ticks will begin
+        disp = synthetic_candles(s, "1m", 360, seed=self._rng.randint(0, 10**9),
+                                 start_price=self._px[s])
+        shift = self._px[s] / disp[-1].close if disp[-1].close > 0 else 1.0
+        for c in disp:
+            c.open *= shift; c.high *= shift; c.low *= shift; c.close *= shift
+        self.states[s].display.seed(disp)
+
+    async def start(self) -> None:
         for s in self.symbols:
-            candles = synthetic_candles(s, self.interval, seed_n,
-                                        seed=self._rng.randint(0, 10**9),
-                                        start_price=self._px[s])
-            self.states[s].candles.seed(candles)
-            self._px[s] = candles[-1].close
+            self._seed_symbol(s)
             self._tasks.append(asyncio.create_task(self._run_symbol(s), name=f"synth-{s}"))
         self.started = True
         log.info("synthetic feed started (speed x%.1f)", self.speed)
+
+    async def add_symbol(self, s: str) -> bool:
+        if s in self.states:
+            return True
+        self.states[s] = MarketState(s)
+        self._px[s] = 100.0 * (1 + len(self._px))
+        self._roll_regime(s)
+        self._seed_symbol(s)
+        if s not in self.symbols:
+            self.symbols.append(s)
+        self._tasks.append(asyncio.create_task(self._run_symbol(s), name=f"synth-{s}"))
+        return True
+
+    async def remove_symbol(self, s: str) -> None:
+        if s in self.symbols:
+            self.symbols.remove(s)
+        self.states.pop(s, None)
+        for t in list(self._tasks):
+            if t.get_name() == f"synth-{s}":
+                t.cancel()
+                self._tasks.remove(t)
 
     async def stop(self) -> None:
         for t in self._tasks:

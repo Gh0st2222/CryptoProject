@@ -39,6 +39,26 @@ penalty** (what compounding actually maximizes), promotion demands a margin that
 (multiple-testing bias), and a **liquidation-distance guard** caps leverage so
 the stop always fires before isolated-margin liquidation can.
 
+And the machinery to keep it honest over time:
+
+- **Carry Lab** (Radar tab): replays the carry desk's exact rules over *real
+  historical funding prints* + 1h prices for the top-volume perps, sweeps the
+  threshold grid, and recommends evidence-based `min_apr`/`exit_apr` — the
+  desk's thresholds are measured, not assumed.
+- **Radar adoption**: strong, liquid 4h trends found by the radar are **adopted
+  into the engine at runtime** (own brain, same gates; auto-released when the
+  trend dies, never with an open position). The tuner also **rotates its
+  research symbol across the top-10 by volume** and validates champions on a
+  cross-symbol basket — parameters must earn on the board, not on BTC's quirks.
+- **Paper sessions survive restarts**: positions, trades, equity history and
+  risk day-state persist to disk and restore on boot ("Reset paper account"
+  starts fresh). The **Record tab** appends one row per UTC day — equity,
+  PnL, trades — building the provable months-long track record that is this
+  project's real asset.
+- The chart is **always 1m** (tick-aggregated display series) and
+  **auto-follows** the symbol the machine is looking at; the *bar interval*
+  setting is the signal timeframe the brain trades on, not a display choice.
+
 - **Live trading** — real orders on BingX, exchange-side stop-loss/take-profit
   on every entry, kill switch, reconciliation against exchange state.
 - **Realtime simulation (paper)** — the *real* BingX market feed, fake money;

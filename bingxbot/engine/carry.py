@@ -123,8 +123,23 @@ class CarryDesk:
 
     # ----------------------------------------------------------------- loop
 
+    def _adopt_orphans(self) -> None:
+        """After a paper-state restore, positions on symbols outside the engine's
+        brain contexts (i.e. old carry trades) have no manager — claim them so
+        their stops and funding keep being handled."""
+        eng = self.orch.engine
+        if eng is None:
+            return
+        for sym, pos in eng.portfolio.positions.items():
+            if sym not in eng.ctx and sym not in self.meta:
+                self.meta[sym] = {"rate": 0.0, "apr": 0.0,
+                                  "next_ft": now_ms() + FUNDING_MS,
+                                  "opened_ts": pos.opened_ts, "er": 0.0, "dir": 0}
+                log.info("carry re-adopted restored position %s", sym)
+
     async def _loop(self) -> None:
         await asyncio.sleep(20)
+        self._adopt_orphans()
         while True:
             try:
                 if self.orch.cfg.carry.enabled and self.orch.engine is not None:
