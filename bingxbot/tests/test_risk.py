@@ -85,10 +85,17 @@ def test_adaptive_trail_advances_only_forward():
 
 
 def test_adaptive_exit_on_edge_reversal():
+    """A reversed edge with NO supporting higher-TF backdrop exits — but only
+    after persisting EDGE_FLIP_BARS consecutive closes (one noisy close is not
+    a reversal)."""
     ex = AdaptiveExitManager(RiskConfig(hold_edge_frac=0.7))
     pos = Position(symbol="X", side=LONG, qty=1, entry_price=100.0, opened_ts=0, stop_price=98.0)
     pos.init_risk = 2.0
     pos.peak_price = 101.0
-    _, reason = ex.manage(pos, 100.5, 101.0, 100.0, 1.0, {"eff_ratio": 0.4},
-                          edge=-0.5, threshold=0.3, regime="TREND_UP", bars_held=3)
-    assert reason and "reversed" in reason
+    row = {"eff_ratio": 0.4}          # mtf_bias absent -> backdrop not supporting
+    _, r1 = ex.manage(pos, 100.5, 101.0, 100.0, 1.0, row,
+                      edge=-0.5, threshold=0.3, regime="TREND_UP", bars_held=3)
+    assert r1 is None, "a single reversed close must not exit"
+    _, r2 = ex.manage(pos, 100.5, 101.0, 100.0, 1.0, row,
+                      edge=-0.5, threshold=0.3, regime="TREND_UP", bars_held=4)
+    assert r2 and "reversed" in r2

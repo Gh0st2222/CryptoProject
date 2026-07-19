@@ -168,6 +168,67 @@ async def test_settle_risk_accounts_each_trade_exactly_once():
     assert risk.state.trades_today == 3
 
 
+# ------------------------------------------- edge-flip exit trend discipline
+
+def _long(stop=97.0):
+    p = Position(symbol="BTC-USDT", side=LONG, qty=1.0, entry_price=100.0,
+                 opened_ts=1, stop_price=stop)
+    return p
+
+
+def test_edge_flip_holds_through_pullback_in_supported_trend():
+    """A shallow reversed edge while the 15m/1h backdrop still clearly says UP
+    is a pullback, not a reversal — the position must be held, however many
+    bars the wobble lasts. This is the exit-side mirror of the entry's hard
+    MTF veto (the old behavior sold with-trend longs at pullback lows)."""
+    from bingxbot.strategy.exits import AdaptiveExitManager
+    ex = AdaptiveExitManager(RiskConfig())
+    pos = _long()
+    ex.attach(pos, atr=1.0, init_risk=3.0)
+    row = {"eff_ratio": 0.5, "mtf_bias": 0.6, "funding_rate": 0.0}
+    for bars in range(1, 7):
+        _, reason = ex.manage(pos, 99.5, 100.2, 99.3, 1.0, row, edge=-0.25,
+                              threshold=0.3, regime="TREND_UP", bars_held=bars)
+        assert reason is None, f"supported-trend pullback exited at bar {bars}: {reason}"
+
+
+def test_edge_flip_fires_after_persistence_when_backdrop_decays():
+    from bingxbot.strategy.exits import EDGE_FLIP_BARS, AdaptiveExitManager
+    ex = AdaptiveExitManager(RiskConfig())
+    pos = _long()
+    ex.attach(pos, atr=1.0, init_risk=3.0)
+    row = {"eff_ratio": 0.5, "mtf_bias": 0.1, "funding_rate": 0.0}   # trend gone
+    reasons = []
+    for bars in range(1, EDGE_FLIP_BARS + 1):
+        _, reason = ex.manage(pos, 99.5, 100.2, 99.3, 1.0, row, edge=-0.25,
+                              threshold=0.3, regime="TREND_UP", bars_held=bars)
+        reasons.append(reason)
+    assert reasons[:-1] == [None] * (EDGE_FLIP_BARS - 1), "one noisy close must not exit"
+    assert reasons[-1] == "edge reversed"
+    # an intervening non-reversed close resets the persistence counter
+    pos2 = _long()
+    ex.attach(pos2, atr=1.0, init_risk=3.0)
+    ex.manage(pos2, 99.5, 100.2, 99.3, 1.0, row, edge=-0.25, threshold=0.3,
+              regime="TREND_UP", bars_held=1)
+    ex.manage(pos2, 99.5, 100.2, 99.3, 1.0, row, edge=0.05, threshold=0.3,
+              regime="TREND_UP", bars_held=2)
+    assert pos2.edge_flip_bars == 0
+    _, reason = ex.manage(pos2, 99.5, 100.2, 99.3, 1.0, row, edge=-0.25,
+                          threshold=0.3, regime="TREND_UP", bars_held=3)
+    assert reason is None
+
+
+def test_severe_edge_reversal_overrides_trend_and_persistence():
+    from bingxbot.strategy.exits import AdaptiveExitManager
+    ex = AdaptiveExitManager(RiskConfig())
+    pos = _long()
+    ex.attach(pos, atr=1.0, init_risk=3.0)
+    row = {"eff_ratio": 0.5, "mtf_bias": 0.6, "funding_rate": 0.0}   # backdrop still UP
+    _, reason = ex.manage(pos, 99.5, 100.2, 99.3, 1.0, row, edge=-0.60,
+                          threshold=0.3, regime="TREND_UP", bars_held=1)
+    assert reason == "edge reversed hard", "a violent reversal must exit immediately"
+
+
 # ------------------------------------------------------- tunable clamping
 
 def test_apply_tunables_clamps_to_bounds():
