@@ -98,6 +98,7 @@ class Position:
     init_risk: float = 0.0    # initial stop distance in price (defines 1R)
     peak_price: float = 0.0   # best price reached since entry (chandelier anchor)
     scaled_out: bool = False  # partial take-profit already taken
+    edge_flip_bars: int = 0   # consecutive closes the fused edge has been reversed
 
     def direction(self) -> int:
         return 1 if self.side == LONG else -1

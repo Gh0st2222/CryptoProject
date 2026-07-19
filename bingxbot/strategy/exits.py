@@ -16,7 +16,11 @@ winners pay for many small losers:
 - **Give-back lock**: after a big move, exit if it retraces too much of its peak.
 - **Edge-flip exit**: the brain re-scores every bar; if the fused edge turns
   against the position with conviction, we exit — *the algorithm decides whether
-  the move continues or is done*, rather than waiting for a static stop.
+  the move continues or is done*, rather than waiting for a static stop. It is
+  disciplined like the entry side: while the 15m/1h backdrop still clearly
+  supports the position, a shallow one-bar wobble is a pullback (the stop /
+  trail / give-back own that case) — only a persistent flip against a decayed
+  backdrop, or a severe outright reversal, exits.
 """
 from __future__ import annotations
 
@@ -26,6 +30,16 @@ from ..config import RiskConfig
 from ..exchange.models import LONG, Position
 from ..strategy.regime import REGIME_EXIT_MULT
 from ..util import clamp
+
+# Structural discipline on the edge-flip exit, mirroring the entry chain: the
+# entry refuses to trade against a decided 15m/1h trend (hard MTF veto) and
+# demands a persistent signal (entry_confirm_scans), but the exit used to fire
+# on a single bar's shallow negative edge — selling with-trend longs at pullback
+# lows the entry gate would never have shorted. Constants, not tunables, for the
+# same reason the entry veto is one: the tuner must never optimize discipline away.
+MTF_EXIT_GUARD = 0.35      # a backdrop this decided still owns the position
+EDGE_EXIT_OVERRIDE = 0.55  # a reversal this strong overrules backdrop AND persistence
+EDGE_FLIP_BARS = 2         # consecutive closes a normal flip must persist
 
 
 @dataclass
@@ -102,9 +116,19 @@ class AdaptiveExitManager:
         gain = (price - pos.entry_price) * d
         rr = gain / risk
 
-        # 1) edge-flip exit — the brain says the move reversed
-        if edge * d <= -cfg.hold_edge_frac * threshold and abs(edge) > 0.15:
-            return False, f"edge reversed {edge:+.2f}"
+        # 1) edge-flip exit — the brain says the move reversed. A severe
+        #    reversal exits now; a normal flip must persist EDGE_FLIP_BARS
+        #    consecutive closes AND the higher-TF backdrop must no longer
+        #    clearly support the position. (Stable reason labels so the
+        #    analytics tab groups these into one bucket per kind.)
+        flip = edge * d <= -cfg.hold_edge_frac * threshold and abs(edge) > 0.15
+        pos.edge_flip_bars = pos.edge_flip_bars + 1 if flip else 0
+        if flip:
+            if abs(edge) >= EDGE_EXIT_OVERRIDE:
+                return False, "edge reversed hard"
+            supported = row.get("mtf_bias", 0.0) * d >= MTF_EXIT_GUARD
+            if not supported and pos.edge_flip_bars >= EDGE_FLIP_BARS:
+                return False, "edge reversed"
 
         # scalp: the passive maker target is the primary exit (handled intrabar
         # by the fill model). Here we just run a tight stop, breakeven and a

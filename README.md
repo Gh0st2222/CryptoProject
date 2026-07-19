@@ -138,8 +138,14 @@ payoff shape that survives fees:
   instead of round-tripping to breakeven. Width also widens with trend quality
   (Kaufman efficiency ratio) and regime.
 - **Edge-flip exit** — every bar the brain re-scores; if the fused edge turns
-  against the position with conviction, it exits *now*. This is the algorithm
-  deciding the move is done rather than waiting for a static stop.
+  against the position with conviction, it exits. Disciplined like the entry
+  side: while the 15m/1h backdrop still clearly supports the position, a
+  shallow one-bar wobble is treated as a pullback (the stop/trail/give-back own
+  that case) — a normal flip must persist two consecutive closes **and** the
+  higher-TF backdrop must have decayed; only a severe outright reversal exits
+  immediately regardless. These guards are structural constants, not tunables,
+  for the same reason the entry veto is — so the tuner can never optimize the
+  discipline away.
 - Breakeven once +`be_rr` R; give-back lock protects a large open profit; a long
   time-stop backstops dead trades.
 
