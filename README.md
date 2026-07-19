@@ -246,8 +246,12 @@ It also reads a real **1m / 5m / 15m / 1h timeframe ladder** — each rung with 
 own EMA stack, RSI, ADX and slope — and fuses them into a genuine cross-timeframe
 alignment the entry gate and trend desk use. Because coarser rungs are exact
 aggregations of the base bar, a 1m feed yields the whole ladder with **no extra
-data pulled** (well inside rate limits). The terminal shows the ladder live so you
-see exactly what the brain sees on each timeframe.
+data pulled** (well inside rate limits). Rungs are **epoch-anchored and strictly
+causal**: every base bar reads only the last higher-TF bucket that had fully
+closed by that bar's close, so the backtester and tuner can never peek at a
+higher-TF close that hasn't printed yet, and live/backtest see identical numbers
+(enforced by a no-lookahead regression test). The terminal shows the ladder live
+so you see exactly what the brain sees on each timeframe.
 
 **Hard trend veto.** On top of that ladder sits a non-negotiable rule: when the
 higher timeframes (15m/1h) have decided a direction, the bot will **not** take a
@@ -389,7 +393,7 @@ owned and continuously optimized by the auto-tuner and shown read-only:
 | `feed` | `bingx` | `bingx` (real market) or `synthetic` (offline) |
 | `strategy.interval` | `5m` | decision bar size (15m/5m recommended) |
 | `paper.starting_balance` | 10000 | simulation bankroll |
-| `risk.max_open_positions` | 2 | concurrent positions |
+| `risk.max_open_positions` | 3 | concurrent positions — always on **different** tokens (one position per symbol is structural: portfolio & brokers refuse a second open on a held token, and the carry desk never touches a token a signal brain is watching) |
 | `risk.min_leverage` / `max_leverage` | 2 / 7 | leverage band (auto-adapted within) |
 | `risk.max_risk_hard_pct` | 0.035 | hard cap on any single trade's loss |
 | `risk.max_daily_loss_pct` | 0.05 | kill-switch level |
@@ -405,14 +409,17 @@ Auto-managed (the tuner owns them): `base_threshold`, `cost_multiple`,
 ## Tests
 
 ```bash
-python -m pytest bingxbot/tests/ -q      # 29 tests
+python -m pytest bingxbot/tests/ -q      # 61 tests
 ```
 
 Covering the exact BingX signature scheme, indicator math, within-desk Hedge
 learning (a prescient alpha must accumulate weight), the meta-allocator backing
 a winning desk, probability calibration beating the Brier baseline, Kelly
 monotonicity/caps, cost/P(win) gating, sizing & kill-switch, paper-broker
-accounting, and backtest determinism + bounded losses + a full engine boot.
+accounting, backtest determinism + bounded losses + a full engine boot, a strict
+**no-lookahead regression test** on the multi-timeframe ladder (features at bar
+i must be identical with the future removed), the **one-position-per-token**
+guards, exactly-once risk settlement, and tunable-bounds clamping.
 
 ## Disclaimer
 
