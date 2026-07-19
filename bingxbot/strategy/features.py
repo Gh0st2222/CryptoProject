@@ -24,11 +24,24 @@ WARMUP_MIN = 260  # rows before this contain NaNs from the widest rolling window
 LADDER = (("1m", 1), ("5m", 5), ("15m", 15), ("1h", 60))
 
 
-def _broadcast(htf: np.ndarray, factor: int, n: int) -> np.ndarray:
-    """Map a higher-TF series back onto base bars (base bar i -> HTF bar i//factor)."""
-    idx = np.arange(n) // factor
-    idx = np.clip(idx, 0, len(htf) - 1)
-    return htf[idx]
+def _bdiff(x: np.ndarray) -> np.ndarray:
+    """Backward difference: slope at i from bars i-1 -> i only. np.gradient's
+    central difference reads bar i+1 — one bar of future — which both leaked
+    into backtests and disagreed with the live edge row (where gradient falls
+    back to a one-sided difference)."""
+    return np.diff(x, prepend=x[:1]) if len(x) else x
+
+
+def _causal_read_idx(ts: np.ndarray, bidx: np.ndarray, base_ms: int, bucket_ms: int,
+                     n_buckets: int) -> np.ndarray:
+    """For each base bar i, the index of the last higher-TF bucket whose value
+    was fully known at bar i's close: the bar's own bucket when bar i is that
+    bucket's final base bar (its close IS the bucket close), otherwise the
+    previous bucket. Purely a function of timestamps, so live and backtest
+    agree exactly — and no read ever includes bars beyond i (no lookahead)."""
+    completes_bucket = ((ts + base_ms) % bucket_ms) == 0
+    idx = np.where(completes_bucket, bidx, bidx - 1)
+    return np.clip(idx, 0, max(n_buckets - 1, 0))
 
 
 def _base_minutes(interval: str | None, ts: np.ndarray) -> int:
@@ -71,15 +84,15 @@ class FeatureFrame:
         f["ema_21"] = ta.ema(c, 21)
         f["ema_55"] = ta.ema(c, 55)
         f["ema_100"] = ta.ema(c, 100)
-        f["ema21_slope"] = np.gradient(f["ema_21"]) / np.maximum(c, 1e-12)
-        f["ema55_slope"] = np.gradient(f["ema_55"]) / np.maximum(c, 1e-12)
+        f["ema21_slope"] = _bdiff(f["ema_21"]) / np.maximum(c, 1e-12)
+        f["ema55_slope"] = _bdiff(f["ema_55"]) / np.maximum(c, 1e-12)
         f["linreg_slope"] = ta.linreg_slope(c, 20)
         f["eff_ratio"] = ta.efficiency_ratio(c, 20)          # Kaufman trend quality
 
         macd_line, macd_sig, macd_hist = ta.macd(c, 12, 26, 9)
         f["macd_hist"] = macd_hist / np.maximum(c, 1e-12)
         f["macd_line"] = macd_line / np.maximum(c, 1e-12)
-        f["macd_rising"] = np.gradient(np.nan_to_num(macd_hist))
+        f["macd_rising"] = _bdiff(np.nan_to_num(macd_hist))
 
         # --- volatility
         f["atr"] = ta.atr(h, l, c, 14)
@@ -129,10 +142,14 @@ class FeatureFrame:
 
     def _add_mtf(self, f, o, h, l, c, v, base_min: int) -> None:
         """Build a real timeframe ladder: for each standard rung at/above the base
-        bar, an EMA-stack + slope direction, RSI and ADX, broadcast back onto base
-        bars. Coarser rungs are exact aggregations of the base, so a 1m base yields
-        a genuine 1m/5m/15m/1h read — the brain's real cross-TF context."""
+        bar, an EMA-stack + slope direction, RSI and ADX, mapped back onto base
+        bars. Rungs are epoch-anchored aggregations of the base (real 5m/15m/1h
+        buckets), and every base bar reads only the last rung bar that had fully
+        CLOSED by that base bar's close — strictly causal, so the backtester and
+        tuner can never peek at a higher-TF close that hasn't printed yet, and
+        live sees exactly the same numbers on the same data."""
         n = self.n
+        base_ms = base_min * 60_000
         base_dir = np.clip(np.tanh(np.nan_to_num(f["linreg_slope"]) * 4000), -1, 1)
         dirs = [base_dir]          # base counted once for alignment
         higher: list[np.ndarray] = []
@@ -149,15 +166,19 @@ class FeatureFrame:
                 factor = max(2, int(round(mins / base_min)))
                 if n < factor * 8:
                     continue
-                _o, _h, _l, _c, _v = ta.resample_ohlc(f["ts"], o, h, l, c, v, factor)
+                bucket_ms = mins * 60_000
+                _o, _h, _l, _c, _v, bidx = ta.resample_ohlc(f["ts"], o, h, l, c, v, bucket_ms)
+                if len(_c) < 8:
+                    continue
                 he21, he55 = ta.ema(_c, 21), ta.ema(_c, 55)
-                hslope = np.gradient(he21) / np.maximum(_c, 1e-12)
+                hslope = _bdiff(he21) / np.maximum(_c, 1e-12)
                 stack = np.sign(_c - he21) + np.sign(he21 - he55)   # price/ema alignment
                 hdir = 0.6 * np.tanh(hslope * 4000) + 0.4 * np.clip(stack / 2.0, -1, 1)
-                di = np.clip(_broadcast(np.nan_to_num(hdir), factor, n), -1, 1)
-                ri = _broadcast(np.nan_to_num(ta.rsi(_c, 14), nan=50.0), factor, n)
-                ai = _broadcast(np.nan_to_num(ta.adx(_h, _l, _c, 14)), factor, n)
-                sl = _broadcast(np.nan_to_num(hslope), factor, n)
+                read = _causal_read_idx(f["ts"], bidx, base_ms, bucket_ms, len(_c))
+                di = np.clip(np.nan_to_num(hdir)[read], -1, 1)
+                ri = np.nan_to_num(ta.rsi(_c, 14), nan=50.0)[read]
+                ai = np.nan_to_num(ta.adx(_h, _l, _c, 14))[read]
+                sl = np.nan_to_num(hslope)[read]
             f[f"tf_{label}_dir"], f[f"tf_{label}_rsi"] = di, ri
             f[f"tf_{label}_adx"], f[f"tf_{label}_slope"] = ai, sl
             present.append(label)
