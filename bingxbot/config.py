@@ -70,7 +70,10 @@ class StrategyConfig:
     maker_wait_bars: int = 2        # bars to wait for a maker fill before cancelling
     auto_tune: bool = True          # background walk-forward self-tuning
     auto_tune_minutes: int = 90     # how often the auto-tuner re-evaluates
-    adopt_symbols: int = 2          # radar may adopt this many extra trending perps
+    adopt_symbols: int = 3          # radar may adopt this many extra trending perps
+                                    # (2 user symbols + 3 adopted = up to 5 brains
+                                    # hunting, so the 3-position cap has real
+                                    # candidates even while brains are in trades)
 
 
 @dataclass
@@ -100,7 +103,10 @@ class RiskConfig:
     scalp_time_stop: int = 24           # scalps are quick; bail if it stalls
     scalp_expected_rr: float = 1.1      # ~1:1 target:stop for Kelly on scalps
     maker_adverse_bps: float = 0.4      # honest adverse-selection penalty on maker fills
-    max_open_positions: int = 2
+    max_open_positions: int = 3              # up to 3 concurrent positions, each on a
+                                             # DIFFERENT token (one position per symbol
+                                             # is structural: portfolio + brokers refuse
+                                             # a second open on a held symbol)
     correlation_haircut: float = 0.65        # shrink a same-direction add across symbols
     max_net_exposure: float = 2.5            # cap on summed same-direction notional / equity
     max_position_notional_pct: float = 0.35  # of equity x leverage, per position
@@ -144,7 +150,7 @@ class ServerConfig:
 # override values persisted by an older build. On load, a config written by an
 # older version keeps only the user-owned settings; the tuner-owned params are
 # reset to current defaults (then the auto-tuner evolves from there).
-CONFIG_VERSION = 6
+CONFIG_VERSION = 7
 
 # Top-level settings the user owns — everything else is auto-managed by the
 # tuner and reset to code defaults when migrating an older config.
@@ -208,10 +214,13 @@ _NESTED_USER_OWNED = {
     "exchange": {"base_url", "ws_url", "recv_window_ms", "taker_fee", "maker_fee"},
     "server": {"host", "port"},
     "paper": {"starting_balance", "slippage_bps"},
-    "strategy": {"interval", "warmup_bars", "adopt_symbols"},
-    # leverage band intentionally omitted so migrating an old config resets it
-    # to the current 2-7x default; it stays UI-editable afterwards.
-    "risk": {"max_open_positions", "max_daily_loss_pct", "margin_mode",
+    # auto_tune is user-owned (Settings toggle) — a migration must not silently
+    # re-enable a tuner the user turned off.
+    "strategy": {"interval", "warmup_bars", "adopt_symbols", "auto_tune"},
+    # leverage band and max_open_positions intentionally omitted so migrating an
+    # old config picks up the current defaults (2-7x band, 3 concurrent tokens);
+    # both stay UI-editable afterwards. max_risk_hard_pct is UI-editable and kept.
+    "risk": {"max_daily_loss_pct", "max_risk_hard_pct", "margin_mode",
              "max_spread_bps", "max_consecutive_losses", "cooldown_minutes"},
     "carry": {"enabled", "max_positions"},
 }

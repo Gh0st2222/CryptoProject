@@ -607,7 +607,14 @@ def apply_tunables_inplace(strat: StrategyConfig, risk: RiskConfig, p: dict) -> 
         spec = TUNABLES.get(name)
         if not spec:
             continue
-        target = strat if spec[2] == "strategy" else risk
+        lo, hi, grp, kind = spec
+        target = strat if grp == "strategy" else risk
+        # clamp into the searched box: params also arrive from the champion
+        # vault and the HTTP apply endpoint, not only from the DE (whose
+        # trials are already in-bounds) — an out-of-range value must not be
+        # able to set e.g. risk_per_trade to something unbounded.
+        if kind != "bool":
+            val = clamp(float(val), lo, hi)
         setattr(target, name, _coerce(name, val))
     # keep dependent bounds coherent
     risk.sl_atr_max = max(risk.sl_atr_max, risk.sl_atr_min + 0.4)

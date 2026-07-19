@@ -37,7 +37,8 @@ class Broker:
 class PaperBroker(Broker):
     def __init__(self, portfolio: Portfolio, feed_states: dict, specs: dict[str, ContractSpec],
                  taker_fee: float, slippage_bps: float,
-                 maker_fee: float = 0.0002, entry_mode: str = "maker"):
+                 maker_fee: float = 0.0002, entry_mode: str = "maker",
+                 maker_adverse_bps: float = 0.4):
         self.portfolio = portfolio
         self.states = feed_states
         self.specs = specs
@@ -45,6 +46,7 @@ class PaperBroker(Broker):
         self.maker_fee = maker_fee
         self.entry_mode = entry_mode
         self.slip = slippage_bps / 10_000.0
+        self.maker_adverse = maker_adverse_bps / 10_000.0
 
     def _fill_price(self, symbol: str, is_buy: bool, maker: bool = False) -> float:
         st = self.states.get(symbol)
@@ -64,10 +66,17 @@ class PaperBroker(Broker):
 
     async def open_position(self, symbol: str, side: str, sized: SizedOrder,
                             reason: str, bar_ts: int) -> OrderResult:
+        if symbol in self.portfolio.positions:
+            return OrderResult(ok=False, error=f"position already open on {symbol}")
         maker = self.entry_mode == "maker"
         px = self._fill_price(symbol, is_buy=(side == LONG), maker=maker)
         if px <= 0:
             return OrderResult(ok=False, error="no market price")
+        if maker:
+            # honest adverse-selection penalty on the passive fill — a resting
+            # limit gets filled when price moves through it, same as the backtest.
+            d = 1 if side == LONG else -1
+            px *= 1 + d * self.maker_adverse
         fee = sized.qty * px * (self.maker_fee if maker else self.taker_fee)
         pos = Position(
             symbol=symbol, side=side, qty=sized.qty, entry_price=px,
@@ -75,7 +84,8 @@ class PaperBroker(Broker):
             stop_price=sized.stop_price, take_profit=sized.take_profit,
             entry_fee=fee, entry_reason=reason, entry_bar_ts=bar_ts,
         )
-        self.portfolio.open_position(pos, fee)
+        if not self.portfolio.open_position(pos, fee):
+            return OrderResult(ok=False, error=f"position already open on {symbol}")
         log.info("[paper] OPEN %s %s qty=%.6g @ %.6g sl=%.6g tp=%.6g (%s)",
                  side, symbol, sized.qty, px, sized.stop_price, sized.take_profit, reason)
         return OrderResult(ok=True, order_id=f"paper-{uuid.uuid4().hex[:10]}",
@@ -155,6 +165,8 @@ class LiveBroker(Broker):
                             reason: str, bar_ts: int) -> OrderResult:
         if not self.cfg.allow_live:
             return OrderResult(ok=False, error="allow_live is false")
+        if symbol in self.portfolio.positions:
+            return OrderResult(ok=False, error=f"position already open on {symbol}")
         await self.prepare_symbol(symbol)
         await self._ensure_leverage(symbol, side, sized.leverage)
         spec = self.specs.get(symbol, ContractSpec(symbol))
@@ -249,11 +261,19 @@ class LiveBroker(Broker):
                            filled_qty=filled_qty, fee=fee, raw=resp if isinstance(resp, dict) else {})
 
     async def _await_limit_fill(self, symbol: str, order_id: str) -> tuple[float, float, float]:
-        """Poll a resting maker order for a fill within the wait window. Returns
-        (avg_price, filled_qty, fee); filled_qty 0 => never filled."""
-        polls = max(2, self.cfg.strategy.maker_wait_bars * 4)   # ~1.5s each
+        """Poll a resting maker order for a fill within the wait window. The
+        window matches what the backtest models: the limit rests for
+        `maker_wait_bars` SIGNAL bars (e.g. 2 x 15m), not a fixed few seconds —
+        the old 12s window abandoned nearly every maker entry the simulation
+        assumed would fill. Poll cadence stretches with the window so the number
+        of REST calls stays bounded. Returns (avg_price, filled_qty, fee);
+        filled_qty 0 => never filled."""
+        from ..util import interval_ms
+        window_s = max(1, self.cfg.strategy.maker_wait_bars) * interval_ms(self.cfg.strategy.interval) / 1000.0
+        poll_gap = min(max(1.5, window_s / 40.0), 20.0)
+        polls = max(2, int(window_s / poll_gap))
         for _ in range(polls):
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(poll_gap)
             try:
                 o = await self.rest.get_order(symbol, order_id)
             except BingXError as e:

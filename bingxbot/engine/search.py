@@ -134,8 +134,11 @@ class DEOptimizer:
 
     # -- one generation -------------------------------------------------
     def trials(self) -> list[dict]:
-        """rand/1/bin: for each member, trial = a + F*(b-c) crossed with the
-        member (at least one gene forced from the mutant)."""
+        """rand/1/bin with F-dither: for each member, trial = a + F*(b-c)
+        crossed with the member (at least one gene forced from the mutant).
+        F is drawn fresh per trial from [0.4, 0.9] — standard dither, which
+        keeps both large exploratory and small refining steps in play instead
+        of one fixed step size for the whole run."""
         n = len(self.pop)
         out = []
         for i in range(n):
@@ -145,12 +148,13 @@ class DEOptimizer:
                 a, b, c = self.pop[ia], self.pop[ib], self.pop[ic]
             else:
                 a = b = c = self.pop[i]
+            f_i = 0.4 + 0.5 * self.rng.random()
             jrand = self.rng.randrange(len(self.keys))
             trial = {}
             for ki, k in enumerate(self.keys):
                 lo, hi = self.bounds[k]
                 if self.rng.random() < self.cr or ki == jrand:
-                    v = a[k] + self.f * (b[k] - c[k])
+                    v = a[k] + f_i * (b[k] - c[k])
                 else:
                     v = self.pop[i][k]
                 trial[k] = _coerce(k, clamp(float(v), lo, hi))

@@ -193,7 +193,11 @@ class CarryDesk:
         if not ok:
             self.last_reason = f"risk: {why}"
             return
-        row, self.last_reason = pick_carry_entry(radar.rows, set(pf.positions), cfg.carry, now_ms())
+        # one desk per token, ever: skip anything already held AND anything a
+        # signal brain is watching (eng.ctx) — two desks must never end up
+        # looking at, or racing to open, the same token.
+        held = set(pf.positions) | set(eng.ctx)
+        row, self.last_reason = pick_carry_entry(radar.rows, held, cfg.carry, now_ms())
         if row is not None:
             await self._open(row, equity)   # one entry per loop — carry scales slowly by design
 
@@ -244,6 +248,10 @@ class CarryDesk:
     async def _manage_open(self) -> None:
         orch = self.orch
         eng, cfg = orch.engine, orch.cfg
+        # drop meta for positions that vanished outside our control (exchange-side
+        # stop, manual close, reconcile) so it can't shadow a future entry.
+        for sym in [s for s in self.meta if s not in eng.portfolio.positions]:
+            self.meta.pop(sym, None)
         for sym, pos in list(self.positions().items()):
             m = self.meta.get(sym, {})
             # refresh mark + funding (REST; live data when available, radar-stale otherwise)
@@ -290,6 +298,7 @@ class CarryDesk:
         if res.ok:
             self.exits += 1
             m = self.meta.pop(sym, {})
+            eng.settle_risk()   # carry losses count toward the daily loss cap too
             t = eng.portfolio.trades[-1] if eng.portfolio.trades else None
             if t is not None and self.orch.journal is not None:
                 try:

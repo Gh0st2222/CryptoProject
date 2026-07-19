@@ -78,6 +78,9 @@ class TraderEngine:
         self.overlays: dict[str, dict] = {}   # per-symbol brain-scalar overlays (tuner-owned)
         self.ctx: dict[str, SymbolCtx] = {sym: self._make_ctx(sym) for sym in cfg.symbols}
         self.adopted: set[str] = set()   # radar-adopted symbols (beyond the user's list)
+        # trades already fed to the risk manager (daily loss / streak / health).
+        # Restored trades were accounted in the restored day-state already.
+        self._risk_settled = len(portfolio.trades)
         self._task: asyncio.Task | None = None
         self._housekeeper: asyncio.Task | None = None
         self._fast_pusher: asyncio.Task | None = None
@@ -136,11 +139,31 @@ class TraderEngine:
             except Exception:  # noqa: BLE001 - the loop must survive anything
                 log.exception("event %s/%s failed", kind, symbol)
 
+    def settle_risk(self) -> None:
+        """Feed every not-yet-accounted closed trade to the risk manager exactly
+        once — the single choke-point for daily-loss / kill-switch / streak /
+        health accounting. Closes that don't pass through the engine's own exit
+        path (carry desk, live reconcile after an exchange-side SL/TP, manual
+        flatten) used to bypass risk accounting entirely, so a stopped-out carry
+        trade or an exchange-side stop never counted toward the daily loss cap."""
+        trades = self.portfolio.trades
+        if self._risk_settled > len(trades):     # paper reset cleared the list
+            self._risk_settled = len(trades)
+            return
+        if self._risk_settled == len(trades):
+            return
+        marks = {s: st.mark_price() for s, st in self.feed.states.items()}
+        equity = self.portfolio.equity(marks)
+        for t in trades[self._risk_settled:]:
+            self.risk.on_trade_closed(t, equity)
+        self._risk_settled = len(trades)
+
     async def _housekeeping(self) -> None:
         beat = 0
         while self.running:
             await asyncio.sleep(5)
             beat += 1
+            self.settle_risk()   # catch closes that bypassed the engine exit path
             marks = {s: st.mark_price() for s, st in self.feed.states.items()}
             self.portfolio.record_equity(now_ms(), marks)
             self.risk.health.mark_equity(self.portfolio.equity(marks))
@@ -342,6 +365,11 @@ class TraderEngine:
         sized.stop_price = bracket.stop
         sized.take_profit = bracket.take_profit
         reason = f"edge {edge:+.2f} P{p_win:.0%} k{kelly:.2f} {ev['regime']}"
+        # re-check right before the fill: another desk (carry) may have opened
+        # this token while we were sizing — one position per token, always.
+        if self.portfolio.positions.get(symbol) is not None:
+            ctx.last_entry_block = "position already open on this token"
+            return
         ctx.set_stage("FILL")
         res = await self.broker.open_position(symbol, side, sized, reason, bar_ts=int(row["ts"]))
         ctx.last_entry_block = "" if res.ok else f"broker: {res.error}"
@@ -511,8 +539,7 @@ class TraderEngine:
         if res.ok:
             trades = self.portfolio.trades
             if trades:
-                marks = {s: st.mark_price() for s, st in self.feed.states.items()}
-                self.risk.on_trade_closed(trades[-1], self.portfolio.equity(marks))
+                self.settle_risk()   # exactly-once risk accounting for this close
                 t = trades[-1]
                 self._push_tape(symbol, "CLOSE", t.side, t.exit_price,
                                 {"pnl": round(t.pnl, 4), "reason": reason})

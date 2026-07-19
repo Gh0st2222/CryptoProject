@@ -55,8 +55,13 @@ LOOKBACK_DAYS = 60.0
 DATA_TTL_S = 1800
 GAP_FAST = 20               # cadence right after a promotion (keep hammering)
 GAP_SLOW = 60               # cadence when stable
+DUTY_CYCLE = 0.35           # research may use at most ~this fraction of wall time:
+                            # the sleep stretches with the measured cycle length so
+                            # a slow host isn't pinned wall-to-wall by the tuner
 VAULT_REVAL_EVERY = 15      # re-validate the champion vault every N cycles
 MIN_BARS = 3000
+MIN_FOLD_BARS = 450         # a training fold below this can't produce a meaningful
+                            # backtest (warmup + a real trading tail)
 
 
 def _current_params(cfg) -> dict:
@@ -155,12 +160,19 @@ class AutoTuner:
         while self.running:
             cfg = self.orch.cfg
             promoted = False
+            t0 = time.monotonic()
             if cfg.strategy.auto_tune and self.orch.mode != MODE_IDLE and self.orch.engine is not None:
                 try:
                     promoted = await self._cycle()
                 except Exception as e:  # noqa: BLE001
                     log.warning("auto-tune cycle failed: %s", e)
-            gap = GAP_FAST if promoted else GAP_SLOW
+            cycle_s = time.monotonic() - t0
+            # duty-cycle pacing: the sleep stretches with how long the cycle
+            # actually took, so research never monopolizes a slow host — a 4-min
+            # cycle is followed by a ~7-min breather, while a 10s cycle keeps
+            # the old fast cadence.
+            gap = max(GAP_FAST if promoted else GAP_SLOW,
+                      cycle_s * (1.0 - DUTY_CYCLE) / DUTY_CYCLE)
             self.next_run_ts = time.time() + gap
             await asyncio.sleep(gap)
 
@@ -206,8 +218,12 @@ class AutoTuner:
         return candles
 
     def _valid_window(self, candles: list) -> list:
+        """The held-out recent window, with a lead-in EXACTLY equal to the
+        backtester's warmup (300) so OOS trading starts precisely at the 75%
+        cut. The old 400-bar lead-in started trading 100 bars early — 100 bars
+        of TRAINING data silently counted toward every 'out-of-sample' score."""
         val_cut = int(len(candles) * 0.75)
-        return candles[max(0, val_cut - 400):]             # recent held-out (+ warmup lead-in)
+        return candles[max(0, val_cut - 300):]
 
     def _traded_symbols(self) -> list[str]:
         """What the engine is actually running right now — the set promotions
@@ -253,11 +269,21 @@ class AutoTuner:
         if not self.de.ready():
             if not self.de.load():
                 self.de.seed_population(champ)
+                # cold start: the vault's best sets join the gene pool so the
+                # search resumes from everything already proven, not from noise.
+                for c in sorted(self.orch.champions, key=lambda c: c.get("fitness", 0.0),
+                                reverse=True)[:3]:
+                    if c.get("params"):
+                        self.de.inject(c["params"])
         self.de.inject(champ)
 
         # folds scale with the research pool: more cores -> more (finer) folds,
-        # one fold per worker, indicators built once per fold.
-        nf = int(clamp(self.orch.research_workers, 3, 8))
+        # one fold per worker, indicators built once per fold — but never so
+        # many that a fold drops below what a backtest needs (score_fold
+        # returns -1 under 360 bars; on an 8-core host with minimal data that
+        # used to zero out EVERY fold and turn DE selection into pure noise).
+        max_folds_by_data = max(1, len(train) // MIN_FOLD_BARS)
+        nf = int(clamp(min(self.orch.research_workers, max_folds_by_data), 1, 8))
         folds = _make_folds(train, nf)
         trials = self.de.trials()
         # Only re-score the whole population when the data window changed (every
@@ -296,6 +322,15 @@ class AutoTuner:
                              for p, tfit in topk]
         cands += [{"source": "vault", "params": c.get("params", {}), "train_fit": None, "cid": c.get("id")}
                   for c in vault]
+        # dedupe identical parameter sets (a converged population's top-k are
+        # often clones, and a vault champion may equal a DE member): validating
+        # duplicates wastes basket runs and double-counts the multiple-testing
+        # meter for what is really one candidate.
+        uniq: list[dict] = []
+        for c in cands:
+            if not any(self.orch._params_match(c["params"], u["params"]) for u in uniq):
+                uniq.append(c)
+        cands = uniq
 
         # every candidate × every basket symbol, one parallel batch; a candidate's
         # OOS fitness is its MEAN across the basket (must earn on the board).
@@ -310,7 +345,12 @@ class AutoTuner:
 
         def basket_fit(idx: int) -> tuple[float, dict]:
             rs = val_res[idx * nb:(idx + 1) * nb]
-            fit = sum(r["fitness"] for r in rs) / max(len(rs), 1)
+            fits = [r["fitness"] for r in rs]
+            mean = sum(fits) / max(len(fits), 1)
+            # mean blended with the WORST symbol: a set brilliant on three
+            # symbols and toxic on the fourth must not average its way into
+            # promotion — it has to be at least tolerable everywhere we trade.
+            fit = 0.7 * mean + 0.3 * min(fits) if fits else -1.0
             return fit, rs[0]["stats"]          # stats shown from the research symbol
 
         champ_fit, _ = basket_fit(len(cands))

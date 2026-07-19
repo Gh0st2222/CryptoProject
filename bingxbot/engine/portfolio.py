@@ -2,10 +2,13 @@
 trades, equity curve, and performance statistics."""
 from __future__ import annotations
 
+import logging
 import math
 from collections import deque
 
 from ..exchange.models import Position, TradeRecord
+
+log = logging.getLogger("portfolio")
 
 
 class Portfolio:
@@ -41,9 +44,17 @@ class Portfolio:
 
     # ------------------------------------------------------------- trades
 
-    def open_position(self, pos: Position, entry_fee: float) -> None:
+    def open_position(self, pos: Position, entry_fee: float) -> bool:
+        """Register a new position. STRICTLY one position per symbol: a second
+        open on a held symbol is refused instead of silently overwriting the
+        existing position (which would orphan its entry fee and unrealized PnL
+        from the accounting). Returns False when refused."""
+        if pos.symbol in self.positions:
+            log.error("refused duplicate open on %s: position already held", pos.symbol)
+            return False
         self.positions[pos.symbol] = pos
         self.cash -= entry_fee
+        return True
 
     def charge_funding(self, amount: float) -> None:
         """Perp funding transfer while holding (+ = paid out, - = received).

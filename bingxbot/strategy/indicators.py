@@ -196,20 +196,32 @@ def rolling_min(x: np.ndarray, n: int) -> np.ndarray:
 
 
 def resample_ohlc(ts: np.ndarray, o: np.ndarray, h: np.ndarray, l: np.ndarray,
-                  c: np.ndarray, v: np.ndarray, factor: int):
-    """Aggregate base bars into higher-timeframe bars (grouped by `factor`).
-    Returns arrays aligned so index i//factor maps base bar i to its HTF bar;
-    used to build multi-timeframe context features without extra downloads."""
-    n = len(c)
-    groups = (n + factor - 1) // factor
-    ho = np.empty(groups); hh = np.empty(groups); hl = np.empty(groups)
-    hc = np.empty(groups); hv = np.empty(groups)
-    for g in range(groups):
-        a = g * factor
-        b = min(a + factor, n)
-        ho[g] = o[a]
-        hh[g] = h[a:b].max()
-        hl[g] = l[a:b].min()
-        hc[g] = c[b - 1]
-        hv[g] = v[a:b].sum()
-    return ho, hh, hl, hc, hv
+                  c: np.ndarray, v: np.ndarray, bucket_ms: int):
+    """Aggregate base bars into higher-timeframe bars anchored to EPOCH time
+    (bucket = ts // bucket_ms), like real exchange 5m/15m/1h candles.
+
+    Epoch anchoring matters twice over the old index-based grouping:
+    - bucket boundaries don't shift as a live sliding window advances, so the
+      HTF read is stable bar to bar instead of jittering with the window offset;
+    - a base bar's bucket membership is a pure function of its timestamp, so
+      live and backtest agree exactly on which HTF bar a base bar belongs to.
+
+    Returns (ho, hh, hl, hc, hv, bidx) where bidx[i] is the ordinal of the
+    bucket containing base bar i. The LAST bucket may be partial (built only
+    from the bars that exist so far) — callers must not read a bucket's values
+    at base bars before that bucket's final bar, or they read the future.
+    """
+    ids = ts // bucket_ms
+    new_bucket = np.empty(len(ids), dtype=bool)
+    if len(ids):
+        new_bucket[0] = True
+        new_bucket[1:] = ids[1:] != ids[:-1]
+    starts = np.flatnonzero(new_bucket)
+    bidx = np.cumsum(new_bucket) - 1
+    ho = o[starts]
+    hh = np.maximum.reduceat(h, starts) if len(starts) else h[:0]
+    hl = np.minimum.reduceat(l, starts) if len(starts) else l[:0]
+    ends = np.append(starts[1:], len(ids)) - 1 if len(starts) else starts
+    hc = c[ends]
+    hv = np.add.reduceat(v, starts) if len(starts) else v[:0]
+    return ho, hh, hl, hc, hv, bidx
