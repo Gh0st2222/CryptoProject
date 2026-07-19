@@ -529,7 +529,8 @@ class Orchestrator:
             maker = spec0.maker_fee if spec0 else self.cfg.exchange.maker_fee
             broker = PaperBroker(portfolio, feed.states, self.specs,
                                  taker_fee=taker, slippage_bps=self.cfg.paper.slippage_bps,
-                                 maker_fee=maker, entry_mode=self.cfg.strategy.entry_mode)
+                                 maker_fee=maker, entry_mode=self.cfg.strategy.entry_mode,
+                                 maker_adverse_bps=self.cfg.risk.maker_adverse_bps)
         risk = RiskManager(self.cfg.risk)
 
         # a paper session SURVIVES restarts: restore positions/trades/equity/risk
@@ -879,7 +880,10 @@ class Orchestrator:
         user = set(self.cfg.symbols)
         good = [r for r in self.scanner.rows
                 if r["symbol"] not in user and r.get("kind") == "trend"
-                and r.get("er_4h", 0.0) >= 0.4 and r.get("dir_4h", 0) != 0]
+                and r.get("er_4h", 0.0) >= 0.4 and r.get("dir_4h", 0) != 0
+                # never adopt a token that already has a position (e.g. a live
+                # carry trade) — one desk per token, one manager per position.
+                and eng.portfolio.positions.get(r["symbol"]) is None]
         want = [r["symbol"] for r in good[:cap]]
         for sym in list(eng.adopted):
             if sym in want:
