@@ -327,7 +327,8 @@
           <div class="ff"><label>Paper starting balance</label><input class="field" id="cfg-balance" type="number" step="100"></div>
           <div class="ff"><label>Max open positions</label><input class="field" id="cfg-maxpos" type="number" step="1"></div>
           <div class="ff"><label>Radar may adopt (extra trending perps)</label><input class="field" id="cfg-adopt" type="number" step="1" min="0" max="3"></div>
-          <div class="hint"><b>Bar interval = the SIGNAL timeframe.</b> The brain, tuner and backtests all decide on these bars — it is not a display setting. The main chart always shows 1m regardless. Interval / symbols / feed changes restart the engine (paper session is preserved).</div>
+          <div class="ff"><label>Radar extra tokens (beyond the majors allowlist)</label><input class="field" id="cfg-radarextra" placeholder="e.g. DOGE, WIF — empty = majors only"></div>
+          <div class="hint"><b>Bar interval = the SIGNAL timeframe.</b> The brain, tuner and backtests all decide on these bars — it is not a display setting. The main chart always shows 1m regardless. Interval / symbols / feed changes restart the engine (paper session is preserved). The radar only considers an <b>allowlist of established majors</b> (never memecoins, whatever their volume); your symbols and any tokens you add here are always admitted on top.</div>
         </div>
         <div class="sgroup">
           <h3>Leverage &amp; risk band</h3>

@@ -796,11 +796,15 @@ class Orchestrator:
                     try:
                         from ..engine.scanner import top_volume_universe
                         ticks = await self.rest.tickers_24h()
-                        symbols = top_volume_universe(ticks, top_n)   # clean majors only
+                        # same eligibility the radar uses (CoinGecko universe +
+                        # user extras) when the scanner is up; majors otherwise
+                        allowed = ((self.scanner.universe.allowed() | self.scanner._extra_allowed())
+                                   if self.scanner is not None else None)
+                        symbols = top_volume_universe(ticks, top_n, allowed)
                     except Exception as e:  # noqa: BLE001
                         log.warning("carry lab tickers failed: %s", e)
                 if not symbols:
-                    symbols = ["PEPE-USDT", "WIF-USDT", "SOL-USDT", "DOGE-USDT", "BTC-USDT", "ETH-USDT"][:top_n]
+                    symbols = ["SOL-USDT", "SUI-USDT", "SEI-USDT", "AVAX-USDT", "BTC-USDT", "ETH-USDT"][:top_n]
 
                 per_symbol, grids = [], []
                 for k, sym in enumerate(symbols):

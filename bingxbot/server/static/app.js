@@ -307,7 +307,8 @@ function renderRadar(){
   }
   if(R&&rbody){
     const uni=(R.top_volume||[]).map(s=>s.replace("-USDT","")).join(" ");
-    $("radar-meta").textContent=R.ts?`· scan ${fmt.time(R.ts)}${R.demo?" · DEMO BOARD (synthetic feed)":""}${uni?` · tuner universe: ${uni}`:""}${R.error?` · ⚠ ${R.error}`:""}`:"";
+    const uv=R.universe; const uvTxt=uv?` · eligibility: ${uv.source} (${uv.count} tokens${uv.age_min!=null?`, ${uv.age_min<90?uv.age_min+"m":Math.round(uv.age_min/60)+"h"} old`:""})`:"";
+    $("radar-meta").textContent=R.ts?`· scan ${fmt.time(R.ts)}${R.demo?" · DEMO BOARD (synthetic feed)":""}${uvTxt}${uni?` · tuner universe: ${uni}`:""}${R.error?` · ⚠ ${R.error}`:""}`:"";
     const rows=R.rows||[];
     rbody.innerHTML=rows.length?rows.map((r,i)=>{
       const kindCls=r.kind==="carry"?"pnl-pos":(r.kind==="trend"?"sc-pos":"");
@@ -363,6 +364,7 @@ const AUTO_PARAMS=[
 function renderSettings(){
   if(settingsDirty||!S) return; const c=S.config;
   $("cfg-symbols").value=c.symbols.join(", "); $("cfg-feed").value=c.feed; $("cfg-interval").value=c.strategy.interval;
+  $("cfg-radarextra").value=(c.radar_extra||[]).join(", ");
   $("cfg-balance").value=c.paper.starting_balance; $("cfg-maxpos").value=c.risk.max_open_positions;
   $("cfg-levmin").value=c.risk.min_leverage; $("cfg-levmax").value=c.risk.max_leverage;
   $("cfg-dayloss").value=c.risk.max_daily_loss_pct; $("cfg-hardrisk").value=c.risk.max_risk_hard_pct;
@@ -465,6 +467,7 @@ document.querySelectorAll(".tab").forEach(b=>{ b.onclick=()=>{
 document.querySelectorAll('[data-page="settings"] input, [data-page="settings"] select').forEach(el=>el.addEventListener("input",()=>{settingsDirty=true;}));
 $("cfg-save").onclick=async()=>{
   const patch={ symbols:$("cfg-symbols").value.split(",").map(s=>s.trim().toUpperCase()).filter(Boolean),
+    radar_extra:$("cfg-radarextra").value.split(",").map(s=>s.trim().toUpperCase()).filter(Boolean),
     feed:$("cfg-feed").value, allow_live:$("cfg-allowlive").checked,
     strategy:{ interval:$("cfg-interval").value, auto_tune:$("cfg-autotune").checked,
       adopt_symbols:parseInt($("cfg-adopt").value,10) },

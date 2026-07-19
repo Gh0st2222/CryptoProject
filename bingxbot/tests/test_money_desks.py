@@ -5,9 +5,11 @@ import numpy as np
 from bingxbot.config import CarryConfig, RiskConfig
 from bingxbot.engine.backtest import _fitness
 from bingxbot.engine.carry import carry_entry_ok, carry_exit_reason, receiving_side
-from bingxbot.engine.scanner import (annualize_funding, clean_perp,
-                                     demo_universe, rank_universe,
-                                     top_volume_universe, trend_read_4h)
+from bingxbot.engine.scanner import (MAJORS, DynamicUniverse, annualize_funding,
+                                     clean_perp, demo_universe,
+                                     parse_coingecko_universe, rank_universe,
+                                     reasonable_perp, top_volume_universe,
+                                     trend_read_4h)
 from bingxbot.exchange.models import LONG, SHORT, ContractSpec
 from bingxbot.risk.manager import MAINT_MARGIN_RATE, RiskManager
 
@@ -25,7 +27,7 @@ def test_rank_universe_orders_by_edge_and_filters_illiquid():
         {"symbol": "COLD-USDT", "last": 1.0, "quote_volume": 60e6, "change_pct": 0.2},
         {"symbol": "THIN-USDT", "last": 1.0, "quote_volume": 1e5, "change_pct": 9.0},  # illiquid
     ]
-    rows = rank_universe(premium, tickers)
+    rows = rank_universe(premium, tickers, allowed={"HOT", "COLD", "THIN"})
     syms = [r["symbol"] for r in rows]
     assert "THIN-USDT" not in syms, "illiquid perps must be filtered out"
     assert syms[0] == "HOT-USDT", "extreme funding should rank first"
@@ -33,6 +35,8 @@ def test_rank_universe_orders_by_edge_and_filters_illiquid():
     assert hot["kind"] == "carry"
     assert hot["carry_side"] == "SHORT"          # positive funding -> shorts receive
     assert abs(hot["funding_apr"] - 0.002 * 3 * 365) < 1e-9
+    # ...and none of them exist for the radar without being admitted
+    assert rank_universe(premium, tickers) == [], "unlisted tokens are invisible by default"
 
 
 def test_clean_perp_filters_junk_listings():
@@ -59,18 +63,22 @@ def test_junk_carry_is_not_harvestable():
         {"symbol": "NCCOXAG2USD-USDT", "last": 30.0, "quote_volume": 91e6, "change_pct": 1.6},
     ]
     trend = {"NCCOXAG2USD-USDT": {"er": 0.6, "dir": -1, "atr_pct": 0.01}}
-    rows = {r["symbol"]: r for r in rank_universe(premium, tickers, trend)}
+    # HOME admitted explicitly so the harvestability logic itself is exercised
+    rows = {r["symbol"]: r for r in rank_universe(premium, tickers, trend,
+                                                  allowed={"HOME", "BTC"})}
     assert "NCCOXAG2USD-USDT" not in rows, "index products are excluded entirely"
     assert rows["HOME-USDT"]["kind"] == "watch", "illiquid extreme funding = watch, never carry"
     assert rows["HOME-USDT"]["score"] < rows["BTC-USDT"]["score"], "junk cannot outrank a real carry"
     assert rows["BTC-USDT"]["kind"] == "carry"
+    # without explicit admission the meme never even reaches "watch"
+    assert "HOME-USDT" not in {r["symbol"] for r in rank_universe(premium, tickers, trend)}
 
 
 def test_top_volume_universe_returns_actual_majors():
     tickers = [
         {"symbol": "BTC-USDT", "quote_volume": 2e9}, {"symbol": "ETH-USDT", "quote_volume": 9e8},
         {"symbol": "SOL-USDT", "quote_volume": 4e8}, {"symbol": "XRP-USDT", "quote_volume": 3e8},
-        {"symbol": "DOGE-USDT", "quote_volume": 2e8},
+        {"symbol": "DOGE-USDT", "quote_volume": 2e8},          # memecoin: out by default
         {"symbol": "NCCOXAG2USD-USDT", "quote_volume": 5e8},   # index product: out
         {"symbol": "BROCCOLI-USDT", "quote_volume": 6.5e6},    # long-tail meme: out
         {"symbol": "TRX-USDC", "quote_volume": 6.5e6},         # USDC quote: out
@@ -78,7 +86,51 @@ def test_top_volume_universe_returns_actual_majors():
     uni = top_volume_universe(tickers, 10)
     assert uni[:2] == ["BTC-USDT", "ETH-USDT"]
     assert "NCCOXAG2USD-USDT" not in uni and "BROCCOLI-USDT" not in uni and "TRX-USDC" not in uni
-    assert set(uni) == {"BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "DOGE-USDT"}
+    assert set(uni) == {"BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT"}, \
+        "a memecoin's volume must not buy it into the research universe"
+    # ...unless the user deliberately admits it (radar_extra / own symbols)
+    uni2 = top_volume_universe(tickers, 10, allowed={"BTC", "ETH", "SOL", "XRP", "DOGE"})
+    assert "DOGE-USDT" in uni2
+
+
+def test_parse_coingecko_universe_drops_memes_and_stables():
+    """Top-100 by market cap INCLUDES big memecoins — the whole point of the
+    meme-category subtraction is that DOGE/SHIB/PEPE stay out even while they
+    sit in the top-100. Stables/wrapped forms and format-junk drop too."""
+    top = [{"symbol": s} for s in
+           ("btc", "eth", "sol", "doge", "shib", "pepe", "usdt", "usdc", "wbtc",
+            "steth", "link", "avax", "1inch", "verylongname", "ton")]
+    memes = [{"symbol": s} for s in ("doge", "shib", "pepe", "wif", "bonk")]
+    bases = parse_coingecko_universe(top, memes)
+    assert {"BTC", "ETH", "SOL", "LINK", "AVAX", "TON"} <= bases
+    for junk in ("DOGE", "SHIB", "PEPE", "USDT", "USDC", "WBTC", "STETH",
+                 "1INCH", "VERYLONGNAME"):
+        assert junk not in bases, junk
+
+
+def test_dynamic_universe_cache_and_fallback(tmp_path):
+    p = tmp_path / "radar_universe.json"
+    # no cache yet -> built-in majors fallback, radar never goes blind
+    u = DynamicUniverse(path=p)
+    assert u.allowed() == set(MAJORS) and u.source == "builtin majors"
+    # a persisted fetch is picked up on construction (survives restarts)
+    import json as _json
+    saved = sorted({"BTC", "ETH", "SOL", "LINK", "AVAX", "TON", "XRP", "ADA"} |
+                   {f"TK{c}" for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"})   # >= 30 tokens
+    p.write_text(_json.dumps({"ts": 1_700_000_000.0, "bases": saved}))
+    u2 = DynamicUniverse(path=p)
+    assert u2.allowed() == set(saved) and "cached" in u2.source
+    # an undersized/garbage cache is rejected, falling back to majors
+    p.write_text(_json.dumps({"ts": 1.0, "bases": ["BTC"]}))
+    u3 = DynamicUniverse(path=p)
+    assert u3.allowed() == set(MAJORS)
+
+
+def test_reasonable_perp_uses_allowed_set():
+    assert reasonable_perp("BTC-USDT")                       # majors fallback
+    assert not reasonable_perp("PEPE-USDT")                  # meme: out by default
+    assert reasonable_perp("PEPE-USDT", {"PEPE"})            # deliberate override
+    assert not reasonable_perp("1000PEPE-USDT", {"PEPE"})    # format junk stays out
 
 
 def test_trend_read_4h_direction():

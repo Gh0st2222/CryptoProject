@@ -22,6 +22,13 @@ REST/WS bot can actually collect:
    calls, 4h trend probes on the interesting few) and the **carry desk**
    harvests it: receiving side only, never against a strong 4h trend, small
    size, fixed low leverage, always stopped, out when the funding normalizes.
+   The radar's eligibility universe is **popular, reasonable tokens only**:
+   the CoinGecko **top-100 by market cap minus its meme-token category**
+   (so DOGE/SHIB/PEPE stay out even while top-100) minus stables/wrapped forms,
+   refreshed every few hours and cached to disk — falling back to a built-in
+   majors list offline. Memecoins never reach the board, the carry desk, trend
+   adoption or the tuner's research universe, however hard they pump; your own
+   `symbols` and the `radar_extra` setting are always admitted on top.
 2. **Higher-timeframe trend.** The signal brain runs on **15m bars by default**
    (1m is demoted to *execution*: the reactive intra-bar scanner times entries
    inside the forming bar). On 15m–4h, momentum has decades of evidence and the
