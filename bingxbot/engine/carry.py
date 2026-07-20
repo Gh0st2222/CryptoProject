@@ -189,7 +189,8 @@ class CarryDesk:
             return
         marks = {s: st.mark_price() for s, st in eng.feed.states.items()}
         equity = pf.equity(marks)
-        ok, why = risk.can_enter(equity, len(pf.positions), 1.0)
+        pending = eng.pending_entries() if hasattr(eng, "pending_entries") else 0
+        ok, why = risk.can_enter(equity, len(pf.positions) + pending, 1.0)
         if not ok:
             self.last_reason = f"risk: {why}"
             return

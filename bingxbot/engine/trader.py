@@ -244,6 +244,13 @@ class TraderEngine:
         log.info("DROPPED %s (trend gone)", sym)
         return True
 
+    def pending_entries(self) -> int:
+        """Resting limit entries currently waiting for a fill. Each one is a
+        RESERVED position slot: counting only open positions at decision time
+        let several resting limits all fill and exceed max_open_positions."""
+        return sum(1 for c in self.ctx.values()
+                   if c.pending_task is not None and not c.pending_task.done())
+
     def focus_symbol(self) -> str:
         """The symbol the machine is 'looking at' right now: an open position
         wins; otherwise whichever is closest to firing (edge vs threshold)."""
@@ -333,7 +340,8 @@ class TraderEngine:
         equity = self.portfolio.equity(marks)
         spread = st.spread_bps.get(1.0)
 
-        ok, why = self.risk.can_enter(equity, len(self.portfolio.positions), spread)
+        ok, why = self.risk.can_enter(
+            equity, len(self.portfolio.positions) + self.pending_entries(), spread)
         if not ok:
             ctx.last_entry_block = why
             return
@@ -499,7 +507,8 @@ class TraderEngine:
         spread = st.spread_bps.get(1.0)
         marks = {s: s_st.mark_price() for s, s_st in self.feed.states.items()}
         risk_ok, risk_why = self.risk.can_enter(
-            self.portfolio.equity(marks), len(self.portfolio.positions), spread)
+            self.portfolio.equity(marks),
+            len(self.portfolio.positions) + self.pending_entries(), spread)
         gates = [{"n": "risk", "ok": risk_ok, "d": risk_why or "clear"}]
         gates += ctx.brain.entry_report(edge, p_win, row, fees_rt, spread or 1.0, slip)
         for name, (g_ok, d) in (("mtf veto", gate_mtf_veto(strat, edge, row)),
