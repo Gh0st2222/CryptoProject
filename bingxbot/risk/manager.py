@@ -37,6 +37,10 @@ class SizedOrder:
     size_mult: float = 1.0
     entry_limit: float = 0.0   # >0: rest a limit at this price (pullback entry)
     entry_wait_s: float = 0.0  # how long the resting limit stays alive
+    allow_taker_fallback: bool = False  # touch-style limits may take on a post-only
+                                        # rejection (price moved into us — the backtest
+                                        # counts that as a fill); deep pullback limits
+                                        # never chase
 
 
 @dataclass
@@ -211,9 +215,21 @@ class RiskManager:
                           size_mult=eff_mult)
 
     def payoff_ratio(self, style: str = "trend") -> float:
-        """Assumed winner:loser ratio for Kelly. Trends run (asymmetric); scalps
-        are ~1:1 to a passive target."""
-        return self.cfg.scalp_expected_rr if style == "scalp" else self.cfg.expected_rr
+        """Winner:loser ratio for Kelly — MEASURED from recent realized trades
+        (avg winning R / avg losing R over the health window) and blended with
+        the configured prior by sample size. Kelly with an assumed b that the
+        exits don't actually deliver mis-sizes every trade; this makes the
+        sizing self-correcting: exits capture less -> b falls -> size falls."""
+        prior = self.cfg.scalp_expected_rr if style == "scalp" else self.cfg.expected_rr
+        hist = self.health.r_hist
+        wins = [r for r in hist if r > 0]
+        losses = [-r for r in hist if r < 0]
+        if len(wins) >= 8 and len(losses) >= 8:
+            measured = clamp((sum(wins) / len(wins)) / max(sum(losses) / len(losses), 1e-9),
+                             0.6, 4.0)
+            w = clamp(len(hist) / 30.0, 0.0, 1.0)
+            return (1 - w) * prior + w * measured
+        return prior
 
     def time_stop_hit(self, bars_held: int) -> bool:
         return bars_held >= self.cfg.time_stop_bars

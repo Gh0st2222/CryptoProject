@@ -338,6 +338,53 @@ def test_stop_out_shows_full_mae():
     assert tr.mae_r == pytest.approx(1.0), "a 1R stop-out must show 1R of heat"
 
 
+# ------------------------------------------- anti-churn threshold + Kelly b
+
+def test_adaptive_threshold_never_loosens_below_base():
+    """The rate-targeting adaptor may only TIGHTEN the entry gate above the
+    OOS-validated base_threshold — loosening below base to chase a trade-rate
+    target was the marginal-entry churn generator."""
+    from bingxbot.strategy.brain import TradingBrain
+    brain = TradingBrain(base_threshold=0.30, threshold_adapt=True,
+                         target_trades_per_hour=6.0, bars_per_hour=4.0)
+    brain._score_hist.extend([0.05] * 300)   # edges far below base -> quantile tiny
+    brain._adapt_threshold()
+    assert brain.threshold >= 0.30 - 1e-9, \
+        f"threshold {brain.threshold} loosened below the validated base"
+    brain._score_hist.clear()
+    brain._score_hist.extend([0.8] * 300)    # edges running hot -> bar rises
+    brain._adapt_threshold()
+    assert brain.threshold > 0.30
+
+
+def test_kelly_payoff_ratio_is_measured_from_realized_trades():
+    from bingxbot.risk.manager import RiskManager
+    rm = RiskManager(RiskConfig(expected_rr=2.2))
+    assert rm.payoff_ratio("trend") == pytest.approx(2.2), "no sample -> prior"
+    # realized trades: winners +0.9R, losers -1.0R -> measured b ~0.9, far
+    # below the 2.2 assumption -> Kelly must size on the evidence
+    for _ in range(15):
+        rm.health.r_hist.append(0.9)
+        rm.health.r_hist.append(-1.0)
+    b = rm.payoff_ratio("trend")
+    assert 0.8 <= b <= 1.1, f"measured payoff {b} should reflect realized ~0.9"
+
+
+def test_react_tail_matches_full_tail_features():
+    """The reactive scanner's shorter tail must produce the same last-row
+    features as the full tail (exact for windowed indicators, negligible EMA
+    warmup drift) — speed must not change what the brain sees."""
+    candles = synthetic_candles("BTC-USDT", "15m", 1500, seed=5)
+    full = FeatureFrame(candles_to_arrays(candles), interval="15m")
+    short = FeatureFrame(candles_to_arrays(candles[-640:]), interval="15m")
+    for key in ("atr_pct", "atr_pctile", "bb_pctb", "bb_width_pctile", "rsi_14",
+                "vwap_dev", "eff_ratio", "mtf_bias", "mtf_align", "dc_pos"):
+        a, b = float(full.f[key][-1]), float(short.f[key][-1])
+        if np.isnan(a) and np.isnan(b):
+            continue
+        assert a == pytest.approx(b, rel=1e-3, abs=2e-3), f"{key}: full={a} short={b}"
+
+
 # ------------------------------------------------------- tunable clamping
 
 def test_apply_tunables_clamps_to_bounds():

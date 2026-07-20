@@ -75,7 +75,8 @@ class StrategyConfig:
                                     # when the move runs — tuner-owned, so the
                                     # optimizer decides with data whether it pays.
     auto_tune: bool = True          # background walk-forward self-tuning
-    auto_tune_minutes: int = 90     # how often the auto-tuner re-evaluates
+                                    # (cadence is self-managed: fast after a
+                                    # promotion, duty-cycled on slow hosts)
     adopt_symbols: int = 3          # radar may adopt this many extra trending perps
                                     # (2 user symbols + 3 adopted = up to 5 brains
                                     # hunting, so the 3-position cap has real

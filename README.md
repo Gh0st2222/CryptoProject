@@ -129,7 +129,11 @@ firing ● vs dormant ○, so a resting alpha never looks broken).
    edge stops predicting, P(win) falls below 0.5 and the gate simply refuses.
 
 A cost gate (`β·|edge|·ATR%·√horizon` must clear round-trip fees × `cost_multiple`)
-and an order-flow veto sit in front of every entry.
+and an order-flow veto sit in front of every entry. The adaptive threshold may
+only **tighten** above the OOS-validated `base_threshold` (raising the bar when
+edges run hot) — it can never loosen below it to chase a trade-rate target;
+that one-way rule is what keeps the machine trading the fat part of the edge
+distribution instead of churning marginal P≈53% entries.
 
 ## Adaptive exits (the algorithm decides when the move is over)
 
@@ -168,7 +172,10 @@ payoff shape that survives fees:
   less than the floor. Conviction (Kelly) and the health governor scale the
   risk budget; a **hard per-trade risk cap** backstops everything. Live mode
   sets the chosen leverage on the exchange per trade.
-- **Fractional-Kelly sizing** from calibrated P(win) and the trade's reward:risk.
+- **Fractional-Kelly sizing** from calibrated P(win) and a reward:risk that is
+  **measured from realized trades** (recent avg winning R vs avg losing R,
+  blended with the configured prior by sample size) — if the exits capture less
+  than assumed, Kelly's b falls and size falls with it, automatically.
 - **Health governor.** Tracks recent expectancy and drawdown and scales risk
   down when cold, back up as it recovers — hands-off auto-correction.
 - Exchange-side **STOP_MARKET** protection on every live entry, so the stop
