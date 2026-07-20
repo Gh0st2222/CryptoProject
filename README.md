@@ -22,6 +22,12 @@ REST/WS bot can actually collect:
    calls, 4h trend probes on the interesting few) and the **carry desk**
    harvests it: receiving side only, never against a strong 4h trend, small
    size, fixed low leverage, always stopped, out when the funding normalizes.
+   The radar's eligibility universe is **popular tokens only**: the CoinGecko
+   **top-100 by market cap, as-is** — refreshed every few hours and cached to
+   disk, falling back to a built-in majors list offline. Long-tail micro-caps
+   never reach the board, the carry desk, trend adoption or the tuner's
+   research universe, however hard they pump; your own `symbols` and the
+   `radar_extra` setting are always admitted on top.
 2. **Higher-timeframe trend.** The signal brain runs on **15m bars by default**
    (1m is demoted to *execution*: the reactive intra-bar scanner times entries
    inside the forming bar). On 15m–4h, momentum has decades of evidence and the
@@ -339,7 +345,14 @@ scalpers lose. PULSE attacks that on three fronts:
 
 1. **Maker entries** — resting post-only limit orders pay the maker fee
    (~0.02%) instead of taker (~0.05%), roughly halving round-trip cost. (Default
-   `entry_mode: "maker"`.)
+   `entry_mode: "maker"`.) The tuner also owns an optional **pullback entry**
+   depth (`entry_pullback_atr`): when > 0, trend entries rest the limit that
+   many ATRs *behind* the signal and let the retrace come to them — cheaper
+   fills on entries that pull back, missed trades when the move runs away
+   without one. Identical semantics in backtest, paper and live (limit rests
+   for `maker_wait_bars` signal bars, then the entry is abandoned, never
+   chased), so the optimizer decides with data whether waiting for dips beats
+   chasing.
 2. **Discipline gate** — it only trades where an edge can exist: confirmed,
    efficient, multi-timeframe-aligned trends. It sits out choppy/volatile
    regimes entirely (that's where accounts quietly bleed). Trading *less* is the

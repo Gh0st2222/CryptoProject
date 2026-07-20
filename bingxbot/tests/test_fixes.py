@@ -1,6 +1,8 @@
 """Tests for the deep-review fixes: causal (no-lookahead) MTF ladder, the
 one-position-per-token guarantee, exactly-once risk settlement, tunable-bounds
-clamping, and carry/token exclusivity."""
+clamping, carry/token exclusivity, and pullback (resting) entries."""
+import asyncio
+
 import numpy as np
 import pytest
 
@@ -227,6 +229,72 @@ def test_severe_edge_reversal_overrides_trend_and_persistence():
     _, reason = ex.manage(pos, 99.5, 100.2, 99.3, 1.0, row, edge=-0.60,
                           threshold=0.3, regime="TREND_UP", bars_held=1)
     assert reason == "edge reversed hard", "a violent reversal must exit immediately"
+
+
+# ------------------------------------------------- pullback (resting) entries
+
+class _MutState:
+    """Fake market state with a mutable tape price."""
+    def __init__(self, px):
+        self.last_price = px
+        self.book = None
+
+        class candles:
+            last_close = 0.0
+
+
+@pytest.mark.asyncio
+async def test_paper_pullback_limit_fills_on_touch():
+    from bingxbot.engine.brokers import PaperBroker
+    from bingxbot.risk.manager import SizedOrder
+    pf = Portfolio(10_000.0, mode="paper")
+    st = _MutState(100.0)
+    broker = PaperBroker(pf, {"BTC-USDT": st}, {}, taker_fee=0.0005, slippage_bps=0.0,
+                         maker_adverse_bps=0.0)
+    sized = SizedOrder(qty=1.0, notional=99.5, leverage=1, stop_price=97.0,
+                       take_profit=0.0, risk_amount=2.5,
+                       entry_limit=99.5, entry_wait_s=6.0)
+    task = asyncio.get_running_loop().create_task(
+        broker.open_position("BTC-USDT", LONG, sized, "pullback test", 0))
+    await asyncio.sleep(1.2)
+    assert not task.done(), "must rest while price stays above the limit"
+    st.last_price = 99.4                      # the retrace touches the limit
+    res = await asyncio.wait_for(task, timeout=5.0)
+    assert res.ok and res.filled_price == pytest.approx(99.5)
+    assert pf.positions["BTC-USDT"].entry_price == pytest.approx(99.5)
+
+
+@pytest.mark.asyncio
+async def test_paper_pullback_limit_abandons_when_price_runs():
+    from bingxbot.engine.brokers import PaperBroker
+    from bingxbot.risk.manager import SizedOrder
+    pf = Portfolio(10_000.0, mode="paper")
+    st = _MutState(100.0)                     # never retraces
+    broker = PaperBroker(pf, {"BTC-USDT": st}, {}, taker_fee=0.0005, slippage_bps=0.0)
+    sized = SizedOrder(qty=1.0, notional=99.0, leverage=1, stop_price=97.0,
+                       take_profit=0.0, risk_amount=2.0,
+                       entry_limit=99.0, entry_wait_s=1.5)
+    res = await broker.open_position("BTC-USDT", LONG, sized, "pullback test", 0)
+    assert not res.ok and "unfilled" in res.error
+    assert not pf.positions, "an abandoned pullback entry must not open anything"
+
+
+def test_pullback_depth_is_tuner_owned_and_off_by_default():
+    from bingxbot.engine.backtest import TUNABLES
+    assert StrategyConfig().entry_pullback_atr == 0.0, "ships off; the tuner explores it"
+    lo, hi, grp, kind = TUNABLES["entry_pullback_atr"]
+    assert grp == "strategy" and kind == "float" and lo == 0.0 and hi <= 2.0
+
+
+def test_backtest_runs_with_pullback_entries():
+    s = StrategyConfig(entry_pullback_atr=0.6)
+    from bingxbot.engine.backtest import run_backtest
+    candles = synthetic_candles("BTC-USDT", "5m", 8000, seed=11)
+    res = run_backtest(candles, "BTC-USDT", "5m", s, RiskConfig(), starting_balance=10_000.0)
+    assert "error" not in res
+    # deterministic like every other mode
+    res2 = run_backtest(candles, "BTC-USDT", "5m", s, RiskConfig(), starting_balance=10_000.0)
+    assert res["stats"] == res2["stats"]
 
 
 # ------------------------------------------------------- tunable clamping

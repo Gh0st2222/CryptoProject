@@ -68,6 +68,12 @@ class StrategyConfig:
     entry_mode: str = "maker"       # maker (post-only, pays maker fee) | taker
     maker_offset_bps: float = 1.0   # how far inside the touch to rest the limit
     maker_wait_bars: int = 2        # bars to wait for a maker fill before cancelling
+    entry_pullback_atr: float = 0.0  # trend entries: rest the limit this many ATRs
+                                    # BEHIND price and let the pullback come to us
+                                    # (0 = enter at the touch as before). Cheaper
+                                    # fills on entries that retrace, missed trades
+                                    # when the move runs — tuner-owned, so the
+                                    # optimizer decides with data whether it pays.
     auto_tune: bool = True          # background walk-forward self-tuning
     auto_tune_minutes: int = 90     # how often the auto-tuner re-evaluates
     adopt_symbols: int = 3          # radar may adopt this many extra trending perps
@@ -154,13 +160,16 @@ CONFIG_VERSION = 7
 
 # Top-level settings the user owns — everything else is auto-managed by the
 # tuner and reset to code defaults when migrating an older config.
-USER_OWNED_TOP = {"symbols", "mode", "feed", "allow_live", "data_dir", "log_level"}
+USER_OWNED_TOP = {"symbols", "radar_extra", "mode", "feed", "allow_live", "data_dir", "log_level"}
 
 
 @dataclass
 class BotConfig:
     version: int = CONFIG_VERSION
     symbols: list[str] = field(default_factory=lambda: ["BTC-USDT", "ETH-USDT"])
+    radar_extra: list[str] = field(default_factory=list)  # extra tokens the radar may
+                                        # consider beyond the built-in majors allowlist
+                                        # (e.g. ["DOGE"] to re-admit one deliberately)
     mode: str = MODE_PAPER              # idle | paper | live
     feed: str = FEED_BINGX              # bingx | synthetic (offline demo)
     allow_live: bool = False            # hard gate: live orders refused unless true
@@ -205,7 +214,8 @@ def _merge_into(dc: Any, data: dict) -> None:
             setattr(dc, f.name, float(val))
         elif isinstance(cur, list):
             if isinstance(val, list):
-                setattr(dc, f.name, [str(x).strip().upper() if f.name == "symbols" else x for x in val if str(x).strip()])
+                upper = f.name in ("symbols", "radar_extra")
+                setattr(dc, f.name, [str(x).strip().upper() if upper else x for x in val if str(x).strip()])
         elif isinstance(cur, str):
             setattr(dc, f.name, str(val))
 

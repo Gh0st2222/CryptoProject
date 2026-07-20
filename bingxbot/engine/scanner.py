@@ -17,15 +17,24 @@ works offline.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import random
 import time
 
 import numpy as np
 
+from ..config import ROOT
 from ..util import clamp
 
 log = logging.getLogger("radar")
+
+UNIVERSE_PATH = ROOT / "data_cache" / "radar_universe.json"
+UNIVERSE_TTL_S = 6 * 3600      # market caps drift slowly; refresh a few times a day
+UNIVERSE_RETRY_S = 900         # min gap between fetch attempts (success or fail)
+UNIVERSE_MIN_TOKENS = 30       # a smaller result is a broken response, not a universe
+COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 
 SCAN_EVERY_S = 240          # full board refresh cadence
 MIN_QVOL_USDT = 5_000_000   # display-board floor (can't exit = not worth showing)
@@ -40,14 +49,74 @@ FUNDING_WINDOWS_PER_YEAR = 3 * 365
 
 
 def clean_perp(symbol: str) -> bool:
-    """A 'real' crypto perp we'd let the machine trade or study: USDT-quoted,
-    short all-letter base — which excludes BingX's tokenized stock/commodity
-    index products (NCSINASDAQ100..., NCCOXAG2USD...), leverage-multiplied
-    listings (1000PEPE) and the exotic long-name micro-caps."""
+    """Format sanity: USDT-quoted, short all-letter base — excludes BingX's
+    tokenized stock/commodity index products (NCSINASDAQ100..., NCCOXAG2USD...),
+    leverage-multiplied listings (1000PEPE) and exotic long-name micro-caps.
+    Format alone does NOT make a token reasonable — see MAJORS below."""
     if not symbol.endswith("-USDT"):
         return False
     base = symbol[:-5]
     return base.isalpha() and 2 <= len(base) <= 6
+
+
+# The radar's eligibility universe: popular tokens only. Volume floors cannot
+# express this — a pumping micro-cap out-trades ATOM every time, and extreme
+# funding (the carry column) is exactly where squeezed junk lives — so
+# eligibility is an explicit allowlist, not a statistic.
+#
+# The LIVE list is the CoinGecko top-100 by market cap, taken AS-IS (whatever
+# is big enough to be top-100 is admitted — the only rows dropped are ones
+# whose ticker can't match a clean BingX perp symbol anyway). Refreshed every
+# few hours and cached to disk (see DynamicUniverse). MAJORS below is the
+# OFFLINE FALLBACK used until the first successful fetch or when CoinGecko is
+# unreachable. The user's configured symbols and the `radar_extra` setting are
+# always admitted on top, so any deliberate choice extends the list.
+MAJORS: frozenset[str] = frozenset({
+    # L1 / L2 / payments
+    "BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX", "DOT", "ATOM", "NEAR",
+    "APT", "SUI", "TON", "TRX", "LTC", "BCH", "XLM", "ALGO", "HBAR", "ICP",
+    "FIL", "ETC", "VET", "EGLD", "FLOW", "MINA", "KAS", "SEI", "TIA", "INJ",
+    "STX", "ROSE", "KAVA", "XTZ", "EOS", "KSM", "ZEC", "DASH", "NEO", "QNT",
+    "IOTA", "CELO", "ARB", "OP", "POL", "MATIC", "STRK", "IMX", "MNT", "ZK",
+    "TAO", "HYPE",
+    # DeFi / infra / data
+    "LINK", "UNI", "AAVE", "MKR", "CRV", "COMP", "SNX", "LDO", "RUNE", "GRT",
+    "ENS", "DYDX", "GMX", "CAKE", "JUP", "PYTH", "JTO", "ENA", "ONDO", "WLD",
+    "RNDR", "RENDER", "FET", "AR", "ZRO", "EIGEN", "PENDLE",
+    # gaming / consumer (established mid-caps, not memes)
+    "THETA", "AXS", "SAND", "MANA", "GALA", "CHZ", "ENJ",
+})
+
+
+def _base(symbol: str) -> str:
+    return symbol[:-5] if symbol.endswith("-USDT") else symbol
+
+
+def reasonable_perp(symbol: str, allowed: set[str] | None = None) -> bool:
+    """Eligible for the radar: clean format AND in the allowed base set.
+    `allowed` is the FULL admitted universe (dynamic CoinGecko list plus the
+    user's own bases), already assembled by the caller; None falls back to the
+    built-in MAJORS."""
+    if not clean_perp(symbol):
+        return False
+    b = _base(symbol)
+    return b in (allowed if allowed else MAJORS)
+
+
+def parse_coingecko_universe(top_rows: list[dict]) -> set[str]:
+    """Pure: CoinGecko /coins/markets payload -> admitted base-ticker set.
+    The top-100 by market cap, AS-IS — everything CoinGecko gives us. Rows are
+    only dropped when their ticker can't possibly match a clean BingX perp
+    symbol (non-alpha or outside 2-6 letters, same as clean_perp). Unit-testable
+    without a network."""
+    out: set[str] = set()
+    for r in top_rows or []:
+        if not isinstance(r, dict):
+            continue
+        b = str(r.get("symbol", "")).strip().upper()
+        if b and b.isalpha() and 2 <= len(b) <= 6:
+            out.add(b)
+    return out
 
 
 def annualize_funding(rate_8h: float) -> float:
@@ -78,16 +147,20 @@ def trend_read_4h(closes: np.ndarray) -> dict:
 
 def rank_universe(premium: list[dict], tickers: list[dict],
                   trend: dict[str, dict] | None = None,
-                  min_qvol: float = MIN_QVOL_USDT) -> list[dict]:
+                  min_qvol: float = MIN_QVOL_USDT,
+                  allowed: set[str] | None = None) -> list[dict]:
     """Join funding + volume (+ optional 4h trend) into one ranked board.
-    Pure and synchronous — unit-testable without a network."""
+    Only bases in `allowed` (the dynamic reasonable-token universe + the
+    user's own; None -> built-in MAJORS) are eligible — memecoins never reach
+    the board however hard they pump. Pure and synchronous — unit-testable
+    without a network."""
     vol = {t["symbol"]: t for t in tickers}
     trend = trend or {}
     rows = []
     for p in premium:
         sym = p["symbol"]
         t = vol.get(sym)
-        if t is None or not clean_perp(sym):
+        if t is None or not reasonable_perp(sym, allowed):
             continue
         qv = t.get("quote_volume", 0.0)
         if qv < min_qvol:
@@ -128,33 +201,108 @@ def rank_universe(premium: list[dict], tickers: list[dict],
     return rows
 
 
-def top_volume_universe(tickers: list[dict], n: int = 10) -> list[str]:
+def top_volume_universe(tickers: list[dict], n: int = 10,
+                        allowed: set[str] | None = None) -> list[str]:
     """The tuner's research universe: the ACTUAL top-N BingX perps by 24h USDT
-    volume — clean majors only (no index products, no long-tail memes). Falls
-    back to relaxing the floor rather than returning nothing."""
-    clean = [t for t in tickers if clean_perp(t["symbol"])]
-    clean.sort(key=lambda t: t.get("quote_volume", 0.0), reverse=True)
-    majors = [t["symbol"] for t in clean if t.get("quote_volume", 0.0) >= UNIVERSE_MIN_QVOL]
-    return majors[:n] if len(majors) >= 4 else [t["symbol"] for t in clean[:n]]
+    volume among admitted tokens (`allowed`; None -> built-in MAJORS — never a
+    long-tail micro-cap, no matter its volume). Falls back to relaxing the
+    VOLUME floor, never the eligibility list."""
+    ok = [t for t in tickers if reasonable_perp(t["symbol"], allowed)]
+    ok.sort(key=lambda t: t.get("quote_volume", 0.0), reverse=True)
+    liquid = [t["symbol"] for t in ok if t.get("quote_volume", 0.0) >= UNIVERSE_MIN_QVOL]
+    return liquid[:n] if len(liquid) >= 4 else [t["symbol"] for t in ok[:n]]
 
 
 def demo_universe(seed: int | None = None) -> tuple[list[dict], list[dict]]:
     """Fabricated but plausible board for the synthetic feed — lets the Radar
-    tab and carry desk run end-to-end with no exchange access."""
+    tab and carry desk run end-to-end with no exchange access. Majors only,
+    matching the live policy; a couple of squeezed mid-cap MAJORS carry the
+    juicy funding."""
     rng = random.Random(seed)
-    names = ["BTC-USDT", "ETH-USDT", "SOL-USDT", "DOGE-USDT", "XRP-USDT", "PEPE-USDT",
-             "WIF-USDT", "AVAX-USDT", "LINK-USDT", "ARB-USDT", "OP-USDT", "SUI-USDT"]
+    names = ["BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "AVAX-USDT", "SUI-USDT",
+             "SEI-USDT", "LINK-USDT", "ARB-USDT", "OP-USDT", "TON-USDT", "NEAR-USDT"]
     premium, tickers = [], []
     for i, s in enumerate(names):
-        hot = i in (5, 6)  # a couple of squeezed mid-caps with juicy funding
+        hot = i in (5, 6)  # squeezed mid-cap majors with juicy funding
         fr = rng.uniform(0.0008, 0.0025) * rng.choice([1, -1]) if hot else rng.gauss(0.0001, 0.00012)
         px = rng.uniform(0.5, 60000)
         premium.append({"symbol": s, "mark": px, "funding_rate": round(fr, 6),
                         "next_funding_time": int(time.time() * 1000) + rng.randint(1, 8) * 3_600_000})
         tickers.append({"symbol": s, "last": px,
-                        "quote_volume": rng.uniform(8e6, 9e8),
+                        "quote_volume": rng.uniform(5e7, 9e8) if hot else rng.uniform(8e6, 9e8),
                         "change_pct": rng.gauss(0, 3.5)})
     return premium, tickers
+
+
+class DynamicUniverse:
+    """The radar's live eligibility list: the CoinGecko top-100 by market cap,
+    as-is, cached to disk so a restart (or a CoinGecko outage) never leaves the
+    radar blind — it falls back to the last good fetch, and to the built-in
+    MAJORS before the first one ever."""
+
+    def __init__(self, path=UNIVERSE_PATH):
+        self.path = path
+        self.bases: set[str] = set()
+        self.fetched_ts = 0.0
+        self._next_try = 0.0
+        self.source = "builtin majors"
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            d = json.loads(self.path.read_text())
+            bases = {str(b).upper() for b in d.get("bases", [])}
+            if len(bases) >= UNIVERSE_MIN_TOKENS:
+                self.bases = bases
+                self.fetched_ts = float(d.get("ts", 0.0))
+                self.source = "coingecko (cached)"
+        except (OSError, json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+    def allowed(self) -> set[str]:
+        return self.bases if self.bases else set(MAJORS)
+
+    def age_s(self) -> float:
+        return time.time() - self.fetched_ts if self.fetched_ts else -1.0
+
+    async def maybe_refresh(self) -> bool:
+        now = time.time()
+        if now < self._next_try or (self.bases and now - self.fetched_ts < UNIVERSE_TTL_S):
+            return False
+        self._next_try = now + UNIVERSE_RETRY_S
+        try:
+            import aiohttp
+            headers = {"User-Agent": "bingxbot/1.0"}
+            key = os.getenv("COINGECKO_API_KEY", "").strip()
+            if key:
+                headers["x-cg-demo-api-key"] = key
+            async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=15), headers=headers) as s:
+                async with s.get(f"{COINGECKO_BASE}/coins/markets",
+                                 params={"vs_currency": "usd", "order": "market_cap_desc",
+                                         "per_page": "100", "page": "1",
+                                         "sparkline": "false"}) as r1:
+                    top = await r1.json() if r1.status == 200 else None
+        except Exception as e:  # noqa: BLE001 — the radar must survive CoinGecko
+            log.debug("universe fetch failed: %s", e)
+            return False
+        if not isinstance(top, list) or len(top) < 50:
+            log.debug("universe fetch rejected (top=%s)", type(top).__name__)
+            return False
+        bases = parse_coingecko_universe(top)
+        if len(bases) < UNIVERSE_MIN_TOKENS:
+            return False
+        self.bases = bases
+        self.fetched_ts = time.time()
+        self.source = "coingecko"
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps({"ts": self.fetched_ts, "bases": sorted(bases)}))
+        except OSError:
+            pass
+        log.info("radar universe refreshed: %d tokens (CoinGecko top-100 by market cap)",
+                 len(bases))
+        return True
 
 
 class MarketScanner:
@@ -163,6 +311,7 @@ class MarketScanner:
         self._task: asyncio.Task | None = None
         self.rows: list[dict] = []
         self.top_volume: list[str] = []   # the REAL top perps by 24h volume (tuner universe)
+        self.universe = DynamicUniverse()
         self.ts = 0.0
         self.demo = False
         self.scans = 0
@@ -191,8 +340,21 @@ class MarketScanner:
                 log.warning("radar scan failed: %s", e)
             await asyncio.sleep(SCAN_EVERY_S)
 
+    def _extra_allowed(self) -> set[str]:
+        """Base tickers admitted beyond the built-in MAJORS: the user's own
+        traded symbols plus the user-owned radar_extra setting — a deliberate
+        choice always overrides the allowlist."""
+        cfg = getattr(self.orch, "cfg", None)
+        raw = list(getattr(cfg, "symbols", []) or []) + list(getattr(cfg, "radar_extra", []) or [])
+        return {str(s).strip().upper().removesuffix("-USDT") for s in raw if str(s).strip()}
+
     async def scan(self) -> list[dict]:
         rest = getattr(self.orch, "rest", None)
+        if rest is not None:   # offline/synthetic runs stay fully offline
+            await self.universe.maybe_refresh()
+        # the admitted universe: the CoinGecko top-100 as-is (or built-in
+        # majors before the first fetch), plus the user's deliberate choices.
+        allowed = self.universe.allowed() | self._extra_allowed()
         if rest is None:
             premium, tickers = demo_universe(seed=int(time.time() // SCAN_EVERY_S))
             self.demo = True
@@ -204,13 +366,15 @@ class MarketScanner:
             self.demo = False
             premium = await rest.premium_index_all()
             tickers = await rest.tickers_24h()
-            # deep-dive 4h trend only on the interesting CLEAN few (one klines
-            # call each): harvestable-liquidity funding movers + the majors.
+            # deep-dive 4h trend only on the interesting ADMITTED few (one
+            # klines call each): harvestable-liquidity funding movers + majors —
+            # never spend a call probing a token the board won't show anyway.
             by_f = sorted(premium, key=lambda p: abs(p.get("funding_rate", 0.0)), reverse=True)
             vol_ok = {t["symbol"] for t in tickers
-                      if t.get("quote_volume", 0) >= CARRY_MIN_QVOL and clean_perp(t["symbol"])}
+                      if t.get("quote_volume", 0) >= CARRY_MIN_QVOL
+                      and reasonable_perp(t["symbol"], allowed)}
             focus = [p["symbol"] for p in by_f if p["symbol"] in vol_ok][:TOP_FUNDING]
-            focus += [s for s in top_volume_universe(tickers, TOP_VOLUME) if s not in focus]
+            focus += [s for s in top_volume_universe(tickers, TOP_VOLUME, allowed) if s not in focus]
             trend = {}
             for sym in focus:
                 try:
@@ -219,8 +383,8 @@ class MarketScanner:
                         trend[sym] = trend_read_4h(np.array([c.close for c in kl]))
                 except Exception as e:  # noqa: BLE001
                     log.debug("radar 4h read %s: %s", sym, e)
-        self.top_volume = top_volume_universe(tickers, 10)
-        self.rows = rank_universe(premium, tickers, trend)[:24]
+        self.top_volume = top_volume_universe(tickers, 10, allowed)
+        self.rows = rank_universe(premium, tickers, trend, allowed=allowed)[:24]
         self.ts = time.time()
         self.scans += 1
         self.error = ""
@@ -235,5 +399,9 @@ class MarketScanner:
         return self.rows
 
     def snapshot(self) -> dict:
+        age = self.universe.age_s()
         return {"ts": int(self.ts * 1000), "demo": self.demo, "scans": self.scans,
-                "error": self.error, "rows": self.rows, "top_volume": self.top_volume}
+                "error": self.error, "rows": self.rows, "top_volume": self.top_volume,
+                "universe": {"source": self.universe.source,
+                             "count": len(self.universe.allowed()),
+                             "age_min": int(age / 60) if age >= 0 else None}}

@@ -54,6 +54,7 @@ class SymbolCtx:
         self.entry_ctx: dict = {}     # decision context captured at the open (for the journal)
         self.gates: list[dict] = []   # live entry-gate X-ray [{n, ok, d}] for the UI
         self.busy = False  # guards against overlapping broker calls
+        self.pending_task: asyncio.Task | None = None  # resting pullback-limit entry
 
     def set_stage(self, stage: str) -> None:
         self.stage = stage
@@ -107,7 +108,9 @@ class TraderEngine:
 
     async def stop(self, flatten: bool = False) -> None:
         self.running = False
-        for t in (self._task, self._housekeeper, self._fast_pusher):
+        pending = [c.pending_task for c in self.ctx.values()
+                   if c.pending_task is not None and not c.pending_task.done()]
+        for t in (self._task, self._housekeeper, self._fast_pusher, *pending):
             if t:
                 t.cancel()
                 try:
@@ -224,6 +227,9 @@ class TraderEngine:
         """Release an adopted symbol (never with an open position)."""
         if sym not in self.adopted or self.portfolio.positions.get(sym) is not None:
             return False
+        c = self.ctx.get(sym)
+        if c is not None and c.pending_task is not None and not c.pending_task.done():
+            c.pending_task.cancel()   # a resting entry dies with the symbol
         self.ctx.pop(sym, None)
         self.adopted.discard(sym)
         rm = getattr(self.feed, "remove_symbol", None)
@@ -313,6 +319,9 @@ class TraderEngine:
     async def _try_enter(self, ctx: SymbolCtx, st: MarketState, row: dict, ev: dict) -> None:
         symbol = ctx.symbol
         edge, p_win = ev["edge"], ev["p_win"]
+        if ctx.pending_task is not None and not ctx.pending_task.done():
+            ctx.last_entry_block = "resting pullback limit"
+            return
         ctx.set_stage("SCAN")
         marks = {s: s_st.mark_price() for s, s_st in self.feed.states.items()}
         equity = self.portfolio.equity(marks)
@@ -335,7 +344,15 @@ class TraderEngine:
         side = LONG if edge > 0 else SHORT
         style = "scalp" if ev["regime"] == "RANGE" else "trend"
         price = st.mark_price() or row["close"]
-        bracket = self.exits.initial_bracket(price, side, row.get("atr", 0.0), row, ev["regime"], style)
+        atr = row.get("atr", 0.0)
+        # pullback entry: plan the trade AT the resting limit (bracket, sizing,
+        # exchange-side SL/TP all measured from where we'd actually fill), so
+        # the geometry matches the backtest's fill-price bracket exactly.
+        pull = self.cfg.strategy.entry_pullback_atr
+        entry_ref = price
+        if pull > 0 and style == "trend" and atr > 0:
+            entry_ref = price - (1 if side == LONG else -1) * pull * atr
+        bracket = self.exits.initial_bracket(entry_ref, side, atr, row, ev["regime"], style)
         if bracket is None:
             ctx.last_entry_block = "no volatility for bracket"
             return
@@ -352,14 +369,14 @@ class TraderEngine:
         if any(p.direction() == side_d for p in others):
             size_mult *= self.cfg.risk.correlation_haircut
         ctx.set_stage("SIZE")
-        sized = self.risk.size_entry(equity, price, bracket.init_risk, side, spec, size_mult)
+        sized = self.risk.size_entry(equity, entry_ref, bracket.init_risk, side, spec, size_mult)
         if sized is None:
             ctx.last_entry_block = "size below exchange minimum"
             return
         # net directional exposure cap across the whole account
         same_dir_notional = sum(p.qty * (marks.get(p.symbol, p.entry_price) or p.entry_price)
                                 for p in others if p.direction() == side_d)
-        if equity > 0 and (same_dir_notional + sized.qty * price) > equity * self.cfg.risk.max_net_exposure:
+        if equity > 0 and (same_dir_notional + sized.qty * entry_ref) > equity * self.cfg.risk.max_net_exposure:
             ctx.last_entry_block = "net exposure cap"
             return
         sized.stop_price = bracket.stop
@@ -371,18 +388,50 @@ class TraderEngine:
             ctx.last_entry_block = "position already open on this token"
             return
         ctx.set_stage("FILL")
+        if entry_ref != price:
+            # rest the pullback limit in the BACKGROUND: the brain keeps
+            # evaluating bars (and the UI stays live) while the limit waits for
+            # the retrace; unfilled in the window = entry abandoned, not chased.
+            sized.entry_limit = entry_ref
+            sized.entry_wait_s = max(1, self.cfg.strategy.maker_wait_bars) * self._interval_ms() / 1000.0
+            ctx.last_entry_block = f"resting pullback limit @ {entry_ref:.6g}"
+            ctx.pending_task = asyncio.create_task(
+                self._rest_entry(ctx, symbol, side, sized, reason, row, ev, style, bracket.init_risk, atr),
+                name=f"pullback-{symbol}")
+            return
         res = await self.broker.open_position(symbol, side, sized, reason, bar_ts=int(row["ts"]))
         ctx.last_entry_block = "" if res.ok else f"broker: {res.error}"
         if res.ok:
-            pos = self.portfolio.positions.get(symbol)
-            if pos is not None:
-                pos.style = style
-                self.exits.attach(pos, row.get("atr", 0.0), bracket.init_risk)
-            ctx.entry_ctx = self._entry_context(ctx, ev, row)
-            self._push_tape(symbol, "OPEN", side, res.filled_price,
-                            {"p_win": round(p_win, 3), "edge": round(edge, 3)})
-            if self.on_update:
-                await self.on_update("trade")
+            await self._finalize_open(ctx, symbol, side, res, ev, row, style, bracket.init_risk, atr)
+
+    async def _rest_entry(self, ctx: SymbolCtx, symbol: str, side: str, sized, reason: str,
+                          row: dict, ev: dict, style: str, init_risk: float, atr: float) -> None:
+        """Background pullback entry: the broker rests the limit (paper polls the
+        live tape; live rests post-only on the exchange) until touch or expiry."""
+        try:
+            res = await self.broker.open_position(symbol, side, sized, reason, bar_ts=int(row["ts"]))
+            if res.ok:
+                ctx.last_entry_block = ""
+                await self._finalize_open(ctx, symbol, side, res, ev, row, style, init_risk, atr)
+            else:
+                ctx.last_entry_block = f"pullback: {res.error}"
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — a failed entry task must never crash the engine
+            log.exception("pullback entry task failed for %s", symbol)
+            ctx.last_entry_block = "pullback entry error"
+
+    async def _finalize_open(self, ctx: SymbolCtx, symbol: str, side: str, res,
+                             ev: dict, row: dict, style: str, init_risk: float, atr: float) -> None:
+        pos = self.portfolio.positions.get(symbol)
+        if pos is not None:
+            pos.style = style
+            self.exits.attach(pos, atr, init_risk)
+        ctx.entry_ctx = self._entry_context(ctx, ev, row)
+        self._push_tape(symbol, "OPEN", side, res.filled_price,
+                        {"p_win": round(ev.get("p_win", 0.0), 3), "edge": round(ev.get("edge", 0.0), 3)})
+        if self.on_update:
+            await self.on_update("trade")
 
     @staticmethod
     def _entry_context(ctx: SymbolCtx, ev: dict, row: dict) -> dict:
