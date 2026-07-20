@@ -297,6 +297,94 @@ def test_backtest_runs_with_pullback_entries():
     assert res["stats"] == res2["stats"]
 
 
+# ------------------------------------------------- sizing honors risk budget
+
+def test_min_leverage_never_inflates_risk():
+    """The exact failure from live: with a wide ATR stop, risk sizing wants
+    LESS than min_leverage's worth of size; flooring size at the band minimum
+    doubled/tripled the realized loss at the stop. Size must follow
+    risk_per_trade exactly; min_leverage may only floor the exchange margin
+    setting."""
+    from bingxbot.risk.manager import RiskManager
+    cfg = RiskConfig(risk_per_trade=0.008, min_leverage=2, max_leverage=7)
+    rm = RiskManager(cfg)
+    spec = ContractSpec("BTC-USDT", qty_precision=6, min_qty=0.000001, min_notional_usdt=1.0)
+    equity, price = 10_000.0, 60_000.0
+    stop_dist = price * 0.015           # 1.5% stop -> implied leverage ~0.53x
+    sized = rm.size_entry(equity, price, stop_dist, LONG, spec)
+    assert sized is not None
+    loss_at_stop = sized.qty * stop_dist
+    assert loss_at_stop == pytest.approx(equity * 0.008, rel=0.02), \
+        f"loss at stop {loss_at_stop:.2f} must equal the 0.8% risk budget, not 2x it"
+    assert sized.notional / equity < 1.0, "size must not be inflated to the band floor"
+    assert sized.leverage >= cfg.min_leverage, "margin setting still respects the band floor"
+    # a $100 account behaves identically in percentage terms
+    small = rm.size_entry(100.0, price, stop_dist, LONG, spec)
+    assert small is not None
+    assert small.qty * stop_dist == pytest.approx(0.8, rel=0.05)
+
+
+def test_stop_out_shows_full_mae():
+    """An intrabar stop-out closed before any bar-close excursion update must
+    still journal ~1R of adverse excursion — the exit price is an extreme."""
+    pf = Portfolio(10_000.0, mode="paper")
+    pos = Position(symbol="BTC-USDT", side=LONG, qty=1.0, entry_price=100.0,
+                   opened_ts=1, stop_price=97.0)
+    pos.init_risk = 3.0
+    pf.positions["BTC-USDT"] = pos
+    tr = pf.close_position("BTC-USDT", 97.0, 2, exit_fee=0.0, reason="stop loss",
+                           planned_risk=3.0)
+    assert tr is not None
+    assert tr.mae_r == pytest.approx(1.0), "a 1R stop-out must show 1R of heat"
+
+
+# ------------------------------------------- anti-churn threshold + Kelly b
+
+def test_adaptive_threshold_never_loosens_below_base():
+    """The rate-targeting adaptor may only TIGHTEN the entry gate above the
+    OOS-validated base_threshold — loosening below base to chase a trade-rate
+    target was the marginal-entry churn generator."""
+    from bingxbot.strategy.brain import TradingBrain
+    brain = TradingBrain(base_threshold=0.30, threshold_adapt=True,
+                         target_trades_per_hour=6.0, bars_per_hour=4.0)
+    brain._score_hist.extend([0.05] * 300)   # edges far below base -> quantile tiny
+    brain._adapt_threshold()
+    assert brain.threshold >= 0.30 - 1e-9, \
+        f"threshold {brain.threshold} loosened below the validated base"
+    brain._score_hist.clear()
+    brain._score_hist.extend([0.8] * 300)    # edges running hot -> bar rises
+    brain._adapt_threshold()
+    assert brain.threshold > 0.30
+
+
+def test_kelly_payoff_ratio_is_measured_from_realized_trades():
+    from bingxbot.risk.manager import RiskManager
+    rm = RiskManager(RiskConfig(expected_rr=2.2))
+    assert rm.payoff_ratio("trend") == pytest.approx(2.2), "no sample -> prior"
+    # realized trades: winners +0.9R, losers -1.0R -> measured b ~0.9, far
+    # below the 2.2 assumption -> Kelly must size on the evidence
+    for _ in range(15):
+        rm.health.r_hist.append(0.9)
+        rm.health.r_hist.append(-1.0)
+    b = rm.payoff_ratio("trend")
+    assert 0.8 <= b <= 1.1, f"measured payoff {b} should reflect realized ~0.9"
+
+
+def test_react_tail_matches_full_tail_features():
+    """The reactive scanner's shorter tail must produce the same last-row
+    features as the full tail (exact for windowed indicators, negligible EMA
+    warmup drift) — speed must not change what the brain sees."""
+    candles = synthetic_candles("BTC-USDT", "15m", 1500, seed=5)
+    full = FeatureFrame(candles_to_arrays(candles), interval="15m")
+    short = FeatureFrame(candles_to_arrays(candles[-640:]), interval="15m")
+    for key in ("atr_pct", "atr_pctile", "bb_pctb", "bb_width_pctile", "rsi_14",
+                "vwap_dev", "eff_ratio", "mtf_bias", "mtf_align", "dc_pos"):
+        a, b = float(full.f[key][-1]), float(short.f[key][-1])
+        if np.isnan(a) and np.isnan(b):
+            continue
+        assert a == pytest.approx(b, rel=1e-3, abs=2e-3), f"{key}: full={a} short={b}"
+
+
 # ------------------------------------------------------- tunable clamping
 
 def test_apply_tunables_clamps_to_bounds():

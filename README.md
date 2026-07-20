@@ -129,7 +129,11 @@ firing ● vs dormant ○, so a resting alpha never looks broken).
    edge stops predicting, P(win) falls below 0.5 and the gate simply refuses.
 
 A cost gate (`β·|edge|·ATR%·√horizon` must clear round-trip fees × `cost_multiple`)
-and an order-flow veto sit in front of every entry.
+and an order-flow veto sit in front of every entry. The adaptive threshold may
+only **tighten** above the OOS-validated `base_threshold` (raising the bar when
+edges run hot) — it can never loosen below it to chase a trade-rate target;
+that one-way rule is what keeps the machine trading the fat part of the edge
+distribution instead of churning marginal P≈53% entries.
 
 ## Adaptive exits (the algorithm decides when the move is over)
 
@@ -157,14 +161,21 @@ payoff shape that survives fees:
 
 ## Leverage, sizing & auto-correction
 
-- **Volatility-targeted 2–7× leverage.** Risk-based sizing is expressed as a
-  *leverage* and clamped to your band `[min_leverage, max_leverage]` (default
-  2–7). Because the stop is ATR-based, leverage rises in calm markets and falls
-  in volatile ones — classic vol targeting — while per-trade risk stays roughly
-  constant. Conviction (Kelly) and the health governor move where in the band it
-  sits; a **hard per-trade risk cap** overrides the band in a storm. Live mode
+- **Volatility-targeted sizing, leverage as a consequence.** Quantity comes
+  from pure risk sizing — hitting the stop loses exactly `risk_per_trade` of
+  equity — capped by the band's **ceiling** (`max_leverage`) and the
+  liquidation guard. Because the stop is ATR-based, leverage rises in calm
+  markets and falls in volatile ones — classic vol targeting. `min_leverage`
+  floors only the **exchange margin setting** (capital efficiency); it never
+  inflates position size — flooring size at min leverage used to silently turn
+  a 0.8% risk intent into a 1.5–3% realized loss whenever risk sizing wanted
+  less than the floor. Conviction (Kelly) and the health governor scale the
+  risk budget; a **hard per-trade risk cap** backstops everything. Live mode
   sets the chosen leverage on the exchange per trade.
-- **Fractional-Kelly sizing** from calibrated P(win) and the trade's reward:risk.
+- **Fractional-Kelly sizing** from calibrated P(win) and a reward:risk that is
+  **measured from realized trades** (recent avg winning R vs avg losing R,
+  blended with the configured prior by sample size) — if the exits capture less
+  than assumed, Kelly's b falls and size falls with it, automatically.
 - **Health governor.** Tracks recent expectancy and drawdown and scales risk
   down when cold, back up as it recovers — hands-off auto-correction.
 - Exchange-side **STOP_MARKET** protection on every live entry, so the stop

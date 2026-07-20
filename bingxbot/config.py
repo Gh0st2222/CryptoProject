@@ -75,7 +75,8 @@ class StrategyConfig:
                                     # when the move runs — tuner-owned, so the
                                     # optimizer decides with data whether it pays.
     auto_tune: bool = True          # background walk-forward self-tuning
-    auto_tune_minutes: int = 90     # how often the auto-tuner re-evaluates
+                                    # (cadence is self-managed: fast after a
+                                    # promotion, duty-cycled on slow hosts)
     adopt_symbols: int = 3          # radar may adopt this many extra trending perps
                                     # (2 user symbols + 3 adopted = up to 5 brains
                                     # hunting, so the 3-position cap has real
@@ -85,8 +86,10 @@ class StrategyConfig:
 @dataclass
 class RiskConfig:
     risk_per_trade: float = 0.008       # target equity fraction at risk if the stop hits
-    min_leverage: int = 2               # operating leverage band (auto-adapted within)
-    max_leverage: int = 7
+    min_leverage: int = 2               # floor for the EXCHANGE margin setting only —
+                                        # it never inflates position size beyond what
+                                        # risk_per_trade allows (sizing is pure risk-based)
+    max_leverage: int = 7               # hard ceiling on size AND the margin setting
     max_risk_hard_pct: float = 0.035    # hard cap on any single trade's loss-at-stop
     margin_mode: str = "ISOLATED"
     # --- adaptive exit geometry (let winners run, cut losers) ---

@@ -28,7 +28,13 @@ from .portfolio import Portfolio
 
 log = logging.getLogger("trader")
 
-FEATURE_TAIL = 1400  # bars fed to FeatureFrame each close
+FEATURE_TAIL = 1400  # bars fed to FeatureFrame each bar close
+REACT_TAIL = 640     # bars for reactive intra-bar scans: the widest rolling
+                     # window is 240 bars (+~260 indicator warmup), so 640 gives
+                     # EXACT last-row values for every windowed feature and only
+                     # e^-10-scale EMA warmup drift — at ~2.2x less CPU per scan.
+                     # Used only when the base interval >= 5m; a 1m base keeps
+                     # the full tail so the 1h ladder rung stays populated.
 REACT_MS = 850       # min gap between reactive intra-bar scans, per symbol
 ADOPTED_FULL_GRADED = 30  # adopted symbols trade at reduced size until this many graded calls
 
@@ -388,16 +394,27 @@ class TraderEngine:
             ctx.last_entry_block = "position already open on this token"
             return
         ctx.set_stage("FILL")
+        # EVERY limit entry (pullback-depth or plain maker at the touch) rests
+        # in the BACKGROUND: the brain keeps evaluating bars and the UI stays
+        # live while the limit waits — the old inline await parked the symbol's
+        # whole event handling (including learning) for up to the full window.
+        # Paper now rests against the live tape exactly like live rests on the
+        # exchange and the backtest models: touched -> filled, else abandoned.
+        if entry_ref == price and self.cfg.strategy.entry_mode == "maker":
+            off = self.cfg.strategy.maker_offset_bps / 10_000.0
+            entry_ref = price * (1 - off) if side == LONG else price * (1 + off)
+            sized.allow_taker_fallback = True   # touch limit: a post-only reject means
+                                                # price came to us — taking is honest
         if entry_ref != price:
-            # rest the pullback limit in the BACKGROUND: the brain keeps
-            # evaluating bars (and the UI stays live) while the limit waits for
-            # the retrace; unfilled in the window = entry abandoned, not chased.
             sized.entry_limit = entry_ref
-            sized.entry_wait_s = max(1, self.cfg.strategy.maker_wait_bars) * self._interval_ms() / 1000.0
-            ctx.last_entry_block = f"resting pullback limit @ {entry_ref:.6g}"
+            # synthetic fast-forward compresses bar time; the resting window
+            # must live in the same clock or demo entries never resolve.
+            speed = max(1.0, float(getattr(self.feed, "speed", 1.0)))
+            sized.entry_wait_s = max(1, self.cfg.strategy.maker_wait_bars) * self._interval_ms() / 1000.0 / speed
+            ctx.last_entry_block = f"resting limit @ {entry_ref:.6g}"
             ctx.pending_task = asyncio.create_task(
                 self._rest_entry(ctx, symbol, side, sized, reason, row, ev, style, bracket.init_risk, atr),
-                name=f"pullback-{symbol}")
+                name=f"entry-{symbol}")
             return
         res = await self.broker.open_position(symbol, side, sized, reason, bar_ts=int(row["ts"]))
         ctx.last_entry_block = "" if res.ok else f"broker: {res.error}"
@@ -548,7 +565,8 @@ class TraderEngine:
         if n < self.cfg.strategy.warmup_bars:
             return
         t0 = time.perf_counter()
-        ff = FeatureFrame(st.candles.arrays_live(min(n + 1, FEATURE_TAIL)), interval=self.cfg.strategy.interval)
+        tail = REACT_TAIL if self._interval_ms() >= 300_000 else FEATURE_TAIL
+        ff = FeatureFrame(st.candles.arrays_live(min(n + 1, tail)), interval=self.cfg.strategy.interval)
         row = ff.row(-1)
         data_ctx = st.context_snapshot()
         row["funding_rate"] = data_ctx.get("funding_rate") or 0.0

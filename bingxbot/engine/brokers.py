@@ -195,10 +195,15 @@ class LiveBroker(Broker):
         await self._ensure_leverage(symbol, side, sized.leverage)
         spec = self.specs.get(symbol, ContractSpec(symbol))
         if sized.entry_limit > 0:
-            # pullback entry: rest the limit at its price; unfilled = abandoned,
-            # never fall through to a taker chase — that would defeat the point.
+            # resting entry: unfilled window = abandoned. A post-only PLACEMENT
+            # rejection (price moved into the limit) may fall through to taker
+            # only for touch-style limits — a deep pullback limit never chases.
             r = await self._open_maker(symbol, side, sized, reason, bar_ts, spec)
-            return r if r is not None else OrderResult(ok=False, error="pullback limit rejected")
+            if r is not None:
+                return r
+            if sized.allow_taker_fallback:
+                return await self._open_taker(symbol, side, sized, reason, bar_ts, spec)
+            return OrderResult(ok=False, error="pullback limit rejected")
         if self.cfg.strategy.entry_mode == "maker":
             # rest a post-only limit to pay the maker fee (~0.02%) instead of taker
             # (~0.05%) — on a fast strategy that halved round-trip cost is often the

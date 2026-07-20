@@ -225,11 +225,21 @@ class TradingBrain:
         if not self.threshold_adapt or len(self._score_hist) < 120:
             self.threshold = self.base_threshold
             return
-        p = clamp(1.0 - self.target_rate / self.bars_per_hour, 0.5, 0.995)
+        # the target rate can never exceed what the bar clock allows (asking for
+        # 3 trades/hour on 15m bars used to drive the quantile to its floor and
+        # pin the gate open)
+        rate = min(self.target_rate, 0.5 * self.bars_per_hour)
+        p = clamp(1.0 - rate / self.bars_per_hour, 0.5, 0.995)
         hist = sorted(self._score_hist)
         q = hist[min(int(p * len(hist)), len(hist) - 1)]
+        # the adaptive part may only TIGHTEN the gate above the OOS-validated
+        # base_threshold — when edges run hot, the bar rises so we keep taking
+        # only the fattest part of the distribution. It must never loosen BELOW
+        # base to chase a trade-rate target: that was the marginal-churn
+        # generator (P53% entries at thr 0.11), and it silently overrode the
+        # one number the tuner actually validates out-of-sample.
         self.threshold = clamp(0.5 * q + 0.5 * self.base_threshold,
-                               0.55 * self.base_threshold, 0.92)
+                               self.base_threshold, 0.92)
 
     # ------------------------------------------------------------- gating
 

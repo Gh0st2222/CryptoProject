@@ -75,14 +75,21 @@ class Portfolio:
         net = gross - fees
         # excursions in R: how far it went against us (MAE) and the best it
         # ever looked (MFE) — the raw material for tuning stops and exits.
+        # The exit price itself is folded into the extremes: an intrabar stop
+        # can fire before any bar close ever recorded the adverse extreme,
+        # which understated MAE (a stop-out must show ~1R of heat, not 0).
         d = pos.direction()
         risk = pos.init_risk if pos.init_risk > 0 else planned_risk
         mae_r = mfe_r = 0.0
         if risk > 0:
-            if pos.trough_price > 0:
-                mae_r = max(0.0, (pos.entry_price - pos.trough_price) * d / risk)
-            if pos.peak_price > 0:
-                mfe_r = max(0.0, (pos.peak_price - pos.entry_price) * d / risk)
+            adv = pos.trough_price if pos.trough_price > 0 else pos.entry_price
+            fav = pos.peak_price if pos.peak_price > 0 else pos.entry_price
+            if (exit_price - adv) * d < 0:
+                adv = exit_price
+            if (exit_price - fav) * d > 0:
+                fav = exit_price
+            mae_r = max(0.0, (pos.entry_price - adv) * d / risk)
+            mfe_r = max(0.0, (fav - pos.entry_price) * d / risk)
         tr = TradeRecord(
             symbol=symbol, side=pos.side, qty=pos.qty,
             entry_price=pos.entry_price, exit_price=exit_price,
