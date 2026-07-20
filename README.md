@@ -345,7 +345,14 @@ scalpers lose. PULSE attacks that on three fronts:
 
 1. **Maker entries** — resting post-only limit orders pay the maker fee
    (~0.02%) instead of taker (~0.05%), roughly halving round-trip cost. (Default
-   `entry_mode: "maker"`.)
+   `entry_mode: "maker"`.) The tuner also owns an optional **pullback entry**
+   depth (`entry_pullback_atr`): when > 0, trend entries rest the limit that
+   many ATRs *behind* the signal and let the retrace come to them — cheaper
+   fills on entries that pull back, missed trades when the move runs away
+   without one. Identical semantics in backtest, paper and live (limit rests
+   for `maker_wait_bars` signal bars, then the entry is abandoned, never
+   chased), so the optimizer decides with data whether waiting for dips beats
+   chasing.
 2. **Discipline gate** — it only trades where an edge can exist: confirmed,
    efficient, multi-timeframe-aligned trends. It sits out choppy/volatile
    regimes entirely (that's where accounts quietly bleed). Trading *less* is the

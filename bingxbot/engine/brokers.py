@@ -64,14 +64,8 @@ class PaperBroker(Broker):
             return px
         return px * (1 + self.slip) if is_buy else px * (1 - self.slip)
 
-    async def open_position(self, symbol: str, side: str, sized: SizedOrder,
-                            reason: str, bar_ts: int) -> OrderResult:
-        if symbol in self.portfolio.positions:
-            return OrderResult(ok=False, error=f"position already open on {symbol}")
-        maker = self.entry_mode == "maker"
-        px = self._fill_price(symbol, is_buy=(side == LONG), maker=maker)
-        if px <= 0:
-            return OrderResult(ok=False, error="no market price")
+    def _fill_open(self, symbol: str, side: str, sized: SizedOrder, reason: str,
+                   bar_ts: int, px: float, maker: bool) -> OrderResult:
         if maker:
             # honest adverse-selection penalty on the passive fill — a resting
             # limit gets filled when price moves through it, same as the backtest.
@@ -90,6 +84,36 @@ class PaperBroker(Broker):
                  side, symbol, sized.qty, px, sized.stop_price, sized.take_profit, reason)
         return OrderResult(ok=True, order_id=f"paper-{uuid.uuid4().hex[:10]}",
                            filled_price=px, filled_qty=sized.qty, fee=fee)
+
+    async def open_position(self, symbol: str, side: str, sized: SizedOrder,
+                            reason: str, bar_ts: int) -> OrderResult:
+        if symbol in self.portfolio.positions:
+            return OrderResult(ok=False, error=f"position already open on {symbol}")
+        if sized.entry_limit > 0:
+            return await self._open_resting(symbol, side, sized, reason, bar_ts)
+        maker = self.entry_mode == "maker"
+        px = self._fill_price(symbol, is_buy=(side == LONG), maker=maker)
+        if px <= 0:
+            return OrderResult(ok=False, error="no market price")
+        return self._fill_open(symbol, side, sized, reason, bar_ts, px, maker)
+
+    async def _open_resting(self, symbol: str, side: str, sized: SizedOrder,
+                            reason: str, bar_ts: int) -> OrderResult:
+        """Pullback entry: the limit RESTS until the live tape trades through it
+        or the window expires — mirroring exactly what the backtest models and
+        what the live broker does on the exchange. No touch, no trade."""
+        lim = sized.entry_limit
+        deadline = asyncio.get_running_loop().time() + max(sized.entry_wait_s, 5.0)
+        d = 1 if side == LONG else -1
+        while asyncio.get_running_loop().time() < deadline:
+            st = self.states.get(symbol)
+            px = st.last_price if st is not None else 0.0
+            if px > 0 and (px - lim) * d <= 0:      # tape touched/through the limit
+                return self._fill_open(symbol, side, sized, reason, bar_ts, lim, maker=True)
+            await asyncio.sleep(0.5)
+        log.info("[paper] pullback limit %s %s unfilled @ %.6g — entry abandoned",
+                 side, symbol, lim)
+        return OrderResult(ok=False, error="pullback limit unfilled")
 
     async def close_position(self, symbol: str, reason: str) -> OrderResult:
         pos = self.portfolio.positions.get(symbol)
@@ -170,6 +194,11 @@ class LiveBroker(Broker):
         await self.prepare_symbol(symbol)
         await self._ensure_leverage(symbol, side, sized.leverage)
         spec = self.specs.get(symbol, ContractSpec(symbol))
+        if sized.entry_limit > 0:
+            # pullback entry: rest the limit at its price; unfilled = abandoned,
+            # never fall through to a taker chase — that would defeat the point.
+            r = await self._open_maker(symbol, side, sized, reason, bar_ts, spec)
+            return r if r is not None else OrderResult(ok=False, error="pullback limit rejected")
         if self.cfg.strategy.entry_mode == "maker":
             # rest a post-only limit to pay the maker fee (~0.02%) instead of taker
             # (~0.05%) — on a fast strategy that halved round-trip cost is often the
@@ -223,7 +252,9 @@ class LiveBroker(Broker):
         ref = sized.notional / max(sized.qty, 1e-12)
         off = self.cfg.strategy.maker_offset_bps / 10_000.0
         d = 1 if side == LONG else -1
-        limit = round_step(ref * (1 - d * off), spec.price_precision)   # below for a buy, above for a sell
+        # pullback entries carry their own (deeper) limit; else rest just inside the touch
+        raw_limit = sized.entry_limit if sized.entry_limit > 0 else ref * (1 - d * off)
+        limit = round_step(raw_limit, spec.price_precision)
         qty = round_step(sized.qty, spec.qty_precision)
         if limit <= 0 or qty <= 0:
             return None

@@ -35,6 +35,8 @@ class SizedOrder:
     take_profit: float
     risk_amount: float
     size_mult: float = 1.0
+    entry_limit: float = 0.0   # >0: rest a limit at this price (pullback entry)
+    entry_wait_s: float = 0.0  # how long the resting limit stays alive
 
 
 @dataclass

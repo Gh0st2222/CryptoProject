@@ -356,6 +356,7 @@ let settingsDirty=false;
 const AUTO_PARAMS=[
   ["base_threshold","edge threshold","s"],["target_trades_per_hour","target trades/hr","s"],
   ["cost_multiple","cost multiple","s"],["min_p_win","min P(win)","s"],["kelly_fraction","Kelly fraction","s"],
+  ["entry_pullback_atr","pullback entry ×ATR","s"],
   ["min_efficiency","min trend efficiency","s"],["hedge_eta","hedge learn rate","s"],["horizon_bars","grade horizon","s"],
   ["risk_per_trade","risk per trade","r"],["sl_atr_min","stop min ×ATR","r"],["sl_atr_max","stop max ×ATR","r"],
   ["trail_atr_min","trail min ×ATR","r"],["trail_atr_max","trail max ×ATR","r"],["trail_tighten","trail tighten","r"],

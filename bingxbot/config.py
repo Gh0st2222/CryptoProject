@@ -68,6 +68,12 @@ class StrategyConfig:
     entry_mode: str = "maker"       # maker (post-only, pays maker fee) | taker
     maker_offset_bps: float = 1.0   # how far inside the touch to rest the limit
     maker_wait_bars: int = 2        # bars to wait for a maker fill before cancelling
+    entry_pullback_atr: float = 0.0  # trend entries: rest the limit this many ATRs
+                                    # BEHIND price and let the pullback come to us
+                                    # (0 = enter at the touch as before). Cheaper
+                                    # fills on entries that retrace, missed trades
+                                    # when the move runs — tuner-owned, so the
+                                    # optimizer decides with data whether it pays.
     auto_tune: bool = True          # background walk-forward self-tuning
     auto_tune_minutes: int = 90     # how often the auto-tuner re-evaluates
     adopt_symbols: int = 3          # radar may adopt this many extra trending perps

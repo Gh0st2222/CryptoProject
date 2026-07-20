@@ -275,7 +275,17 @@ class _SymSim:
                     size_mult *= self.risk_cfg.correlation_haircut
                 pend = {"side": side, "atr": row.get("atr", 0.0), "regime": regime, "style": style,
                         "size_mult": size_mult, "reason": f"{style} edge {edge:+.2f} P{p_win:.0%} {regime}"}
-                if self.is_maker:
+                pull = getattr(self.strat, "entry_pullback_atr", 0.0)
+                atr_now = row.get("atr", 0.0)
+                if pull > 0 and style == "trend" and atr_now > 0:
+                    # pullback entry: rest the limit DEEP behind the signal and
+                    # let the retrace come to us — a limit is maker by nature,
+                    # whatever entry_mode says. Unfilled in the window = the
+                    # move ran without us; the entry is abandoned, not chased.
+                    pend["mode"] = "maker"
+                    pend["limit"] = c[i] - (1 if side == LONG else -1) * pull * atr_now
+                    pend["expires_bar"] = i + self.strat.maker_wait_bars
+                elif self.is_maker:
                     pend["mode"] = "maker"
                     pend["limit"] = c[i] * (1 - self.maker_off) if side == LONG else c[i] * (1 + self.maker_off)
                     pend["expires_bar"] = i + self.strat.maker_wait_bars
@@ -571,6 +581,11 @@ TUNABLES: dict[str, tuple] = {
     "min_p_win":              (0.40, 0.60, "strategy", "float"),
     "kelly_fraction":         (0.15, 0.60, "strategy", "float"),
     "maker_offset_bps":       (0.0, 3.0, "strategy", "float"),
+    # pullback entries: rest the trend-entry limit this deep behind the signal
+    # (in ATRs) and let the retrace fill us — 0 = chase at the touch. The tuner
+    # owns the depth, so "wait for a dip" only survives if it beats "don't miss
+    # the move" out-of-sample.
+    "entry_pullback_atr":     (0.0, 1.2, "strategy", "float"),
     # range scalping is a tuner OPTION again (it was banned after it faded uptrends):
     # the hard MTF veto now blocks fading a decided 15m/1h trend, so an enabled range
     # scalp only takes the with-trend side of a range (or both sides in a truly flat
