@@ -120,12 +120,16 @@ class _SymSim:
     — that is what the portfolio backtest is."""
 
     def __init__(self, symbol, interval, candles, strat, risk_cfg, spec,
-                 taker_fee, slippage_bps, collect_series, ff=None):
+                 taker_fee, slippage_bps, collect_series, ff=None, pending_slots=None):
         self.symbol = symbol
         self.strat = strat
         self.spec = spec
         self.risk_cfg = risk_cfg
         self.collect = collect_series
+        # shared across the sims of a portfolio backtest: a pending entry is a
+        # RESERVED position slot, exactly as in the live engine — otherwise
+        # several symbols' pendings can all fill and exceed max_open_positions.
+        self._slots = pending_slots if pending_slots is not None else {"n": 0}
         if ff is not None:
             # reuse a precomputed FeatureFrame AND its OHLC arrays — this is what
             # lets the tuner score dozens of candidates on one fold without
@@ -217,6 +221,7 @@ class _SymSim:
                 self.open_at(i, pf, risk, side, o[i], p["atr"], p["regime"], p["style"],
                              p["size_mult"], p["reason"], False, marks)
                 self.pending = None
+                self._slots["n"] -= 1
             else:
                 lim = p["limit"]
                 hit = (l[i] <= lim) if side == LONG else (h[i] >= lim)
@@ -224,8 +229,10 @@ class _SymSim:
                     self.open_at(i, pf, risk, side, lim, p["atr"], p["regime"], p["style"],
                                  p["size_mult"], p["reason"], True, marks)
                     self.pending = None
+                    self._slots["n"] -= 1
                 elif i >= p["expires_bar"]:
                     self.pending = None
+                    self._slots["n"] -= 1
             pos = pf.positions.get(sym)
 
         # funding drag: crossing an 8h settlement while holding costs the assumed
@@ -259,9 +266,9 @@ class _SymSim:
             if reason:
                 self.close_at(i, pf, risk, c[i], reason, marks)
         elif self.pending is None:
-            # 5) entry decision for the next bar
+            # 5) entry decision for the next bar (pendings reserve slots)
             equity = pf.equity(marks)
-            ok, _ = risk.can_enter(equity, len(pf.positions), ASSUMED_SPREAD_BPS)
+            ok, _ = risk.can_enter(equity, len(pf.positions) + self._slots["n"], ASSUMED_SPREAD_BPS)
             if ok and _entry_signal_ok(self.brain, self.strat, edge, p_win, row, ev,
                                        self.fees_rt, self.slippage_bps):
                 style = "scalp" if regime == "RANGE" else "trend"
@@ -292,6 +299,7 @@ class _SymSim:
                 else:
                     pend["mode"] = "taker"
                 self.pending = pend
+                self._slots["n"] += 1
 
 
 def run_backtest(
@@ -391,8 +399,10 @@ def run_portfolio_backtest(
     syms = [s for s, cs in candles_by_symbol.items() if len(cs) >= warmup + 50]
     if len(syms) < 1:
         return {"error": "need at least one symbol with enough bars"}
+    shared_slots = {"n": 0}   # pendings reserve position slots account-wide
     sims = {s: _SymSim(s, interval, candles_by_symbol[s], strat, risk_cfg,
-                       specs.get(s, ContractSpec(s)), taker_fee, slippage_bps, True)
+                       specs.get(s, ContractSpec(s)), taker_fee, slippage_bps, True,
+                       pending_slots=shared_slots)
             for s in syms}
     # align on the intersection of timestamps
     ts_index = {s: {int(t): i for i, t in enumerate(sim.ts)} for s, sim in sims.items()}
@@ -572,7 +582,10 @@ TUNABLES: dict[str, tuple] = {
     # base_threshold, target rate AND min_efficiency at their old floors (it wanted
     # to explore looser gates but the box stopped it). Wider floors let OOS
     # validation decide what actually pays instead of the box deciding a priori.
-    "base_threshold":         (0.12, 0.46, "strategy", "float"),
+    # ceiling raised after the speaking-desks fusion fix: backtest edges now
+    # sit on the same (undiluted) scale live always had, so the search must be
+    # able to reach genuinely tight gates on that scale.
+    "base_threshold":         (0.12, 0.55, "strategy", "float"),
     "target_trades_per_hour": (0.2, 6.0, "strategy", "float"),
     "cost_multiple":          (1.2, 3.2, "strategy", "float"),
     "hedge_eta":              (0.15, 0.60, "strategy", "float"),

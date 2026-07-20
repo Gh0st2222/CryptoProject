@@ -95,7 +95,7 @@ class TradingBrain:
         regime, conf = detect_regime(row)
 
         alpha_scores = {nm: float(fn(row, micro, ctx)) for nm, fn in ALPHAS.items()}
-        desk_sig, desk_conf = {}, {}
+        desk_sig, desk_conf, desk_active = {}, {}, {}
         for desk, names in DESKS.items():
             num = den = 0.0
             active = same = 0
@@ -108,6 +108,7 @@ class TradingBrain:
                     active += 1
             sig = clamp(num / den if den > 0 else 0.0, -1, 1)
             desk_sig[desk] = sig
+            desk_active[desk] = active
             if active:
                 same = sum(1 for nm in names if abs(alpha_scores[nm]) > 0.05 and alpha_scores[nm] * sig > 0)
                 desk_conf[desk] = abs(sig) * (same / active)
@@ -118,6 +119,15 @@ class TradingBrain:
         rmult = REGIME_DESK_MULT[regime]
         num = den = 0.0
         for desk in DESK_ORDER:
+            # a desk with NO speaking alphas has no opinion — it must not sit in
+            # the denominator diluting the fused edge toward zero. Backtests run
+            # with the micro + carry desks dormant (no book/tape/funding data),
+            # which used to shrink every backtest edge ~40% vs live and break
+            # threshold comparability between validation and trading. A desk
+            # whose alphas speak but cancel is different: that IS an opinion
+            # ("flat") and it stays in the average.
+            if desk_active[desk] == 0:
+                continue
             w = alloc[desk] * rmult.get(desk, 1.0)
             num += w * desk_sig[desk]
             den += w

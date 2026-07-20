@@ -274,7 +274,8 @@ class LiveBroker(Broker):
             log.warning("live MAKER place %s %s failed (%s) — will try taker", side, symbol, e)
             return None
         order_id = str(resp.get("orderId", ""))
-        fill_px, filled_qty, fee = await self._await_limit_fill(symbol, order_id)
+        fill_px, filled_qty, fee = await self._await_limit_fill(symbol, order_id,
+                                                                window_s=sized.entry_wait_s)
         if filled_qty <= 0:
             try:
                 await self.rest.cancel_order(symbol, order_id)
@@ -296,16 +297,19 @@ class LiveBroker(Broker):
         return OrderResult(ok=True, order_id=order_id, filled_price=fill_px,
                            filled_qty=filled_qty, fee=fee, raw=resp if isinstance(resp, dict) else {})
 
-    async def _await_limit_fill(self, symbol: str, order_id: str) -> tuple[float, float, float]:
+    async def _await_limit_fill(self, symbol: str, order_id: str,
+                                window_s: float = 0.0) -> tuple[float, float, float]:
         """Poll a resting maker order for a fill within the wait window. The
         window matches what the backtest models: the limit rests for
         `maker_wait_bars` SIGNAL bars (e.g. 2 x 15m), not a fixed few seconds —
         the old 12s window abandoned nearly every maker entry the simulation
-        assumed would fill. Poll cadence stretches with the window so the number
-        of REST calls stays bounded. Returns (avg_price, filled_qty, fee);
-        filled_qty 0 => never filled."""
+        assumed would fill. The order's own entry_wait_s wins when provided so
+        the engine and broker can never disagree about the window. Poll cadence
+        stretches with the window so the number of REST calls stays bounded.
+        Returns (avg_price, filled_qty, fee); filled_qty 0 => never filled."""
         from ..util import interval_ms
-        window_s = max(1, self.cfg.strategy.maker_wait_bars) * interval_ms(self.cfg.strategy.interval) / 1000.0
+        if window_s <= 0:
+            window_s = max(1, self.cfg.strategy.maker_wait_bars) * interval_ms(self.cfg.strategy.interval) / 1000.0
         poll_gap = min(max(1.5, window_s / 40.0), 20.0)
         polls = max(2, int(window_s / poll_gap))
         for _ in range(polls):

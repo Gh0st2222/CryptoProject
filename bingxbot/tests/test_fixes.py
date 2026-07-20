@@ -297,6 +297,54 @@ def test_backtest_runs_with_pullback_entries():
     assert res["stats"] == res2["stats"]
 
 
+# --------------------------------------------- fusion over speaking desks only
+
+def test_dormant_desks_do_not_dilute_the_fused_edge(monkeypatch):
+    """Backtests run with the micro + carry desks dormant (no book/tape/funding
+    data). A desk with NO speaking alphas must drop out of the fusion — leaving
+    it in the denominator shrank every backtest edge ~40% vs live and broke
+    threshold comparability between validation and trading."""
+    from bingxbot.strategy import alphas as alpha_mod
+    from bingxbot.strategy.alphas import DESKS
+    from bingxbot.strategy.brain import TradingBrain
+    for nm in DESKS["trend"]:
+        monkeypatch.setitem(alpha_mod.ALPHAS, nm, lambda row, micro, ctx: 1.0)
+    brain = TradingBrain()
+    micro0 = {"obi": 0.0, "flow": 0.0, "cvd_slope": 0.0, "spread_bps": 1.0, "ticks_per_s": 0.0}
+    ev = brain.score({}, micro0, {})
+    # only the trend desk speaks (unanimous +1); every other desk is dormant.
+    # The fused edge must be that desk's opinion, not a fifth of it.
+    assert ev["edge"] == pytest.approx(1.0, abs=1e-9), \
+        f"dormant desks diluted the edge to {ev['edge']}"
+
+
+@pytest.mark.asyncio
+async def test_pending_entries_reserve_position_slots():
+    from bingxbot.config import BotConfig
+    from bingxbot.data.feed import SyntheticFeed
+    from bingxbot.engine.brokers import PaperBroker
+    from bingxbot.engine.trader import TraderEngine
+    from bingxbot.risk.manager import RiskManager
+
+    cfg = BotConfig()
+    cfg.symbols = ["BTC-USDT", "ETH-USDT"]
+    cfg.risk.max_open_positions = 1
+    feed = SyntheticFeed(cfg.symbols, "1m", warmup_bars=10, speed=1000.0, seed=2)
+    pf = Portfolio(10_000.0, mode="paper")
+    risk = RiskManager(cfg.risk)
+    engine = TraderEngine(cfg, feed, PaperBroker(pf, feed.states, {}, 0.0005, 0.0),
+                          pf, risk, {})
+    assert engine.pending_entries() == 0
+    engine.ctx["BTC-USDT"].pending_task = asyncio.get_running_loop().create_task(asyncio.sleep(5))
+    try:
+        assert engine.pending_entries() == 1
+        ok, why = risk.can_enter(10_000.0, len(pf.positions) + engine.pending_entries(), 1.0)
+        assert not ok and "max open positions" in why, \
+            "a resting entry must reserve a slot against the position cap"
+    finally:
+        engine.ctx["BTC-USDT"].pending_task.cancel()
+
+
 # ------------------------------------------------- sizing honors risk budget
 
 def test_min_leverage_never_inflates_risk():
