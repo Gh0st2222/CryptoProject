@@ -158,15 +158,20 @@ class RiskManager:
 
     def size_entry(self, equity: float, price: float, stop_dist: float, side: str,
                    spec: ContractSpec, size_mult: float = 1.0) -> SizedOrder | None:
-        """Volatility-targeted leverage sizing.
+        """Volatility-targeted risk sizing.
 
-        Risk-based sizing (lose `risk_per_trade` of equity if the initial stop
-        hits) is expressed as a *leverage*, then clamped into the operating band
-        [min_leverage, max_leverage]. Because the stop is ATR-based, this makes
-        leverage rise in calm markets and fall in volatile ones (classic vol
-        targeting) while per-trade risk stays ~constant. `size_mult` (Kelly x
-        health) pushes conviction/health into where in the band we sit. A hard
-        per-trade risk cap overrides the band in extreme volatility."""
+        Quantity comes from PURE risk sizing — lose exactly `risk_per_trade` of
+        equity if the initial stop hits — capped by the leverage band's CEILING
+        and the liquidation guard. The band's FLOOR is deliberately NOT applied
+        to size: flooring qty at min_leverage silently multiplied per-trade risk
+        by (min_leverage / implied) whenever risk sizing wanted less than the
+        floor — a 0.8% risk intent realized as a 1.5-3% loss at the stop, and
+        the tuner's risk_per_trade knob went dead whenever the floor bound.
+        min_leverage now floors only the exchange MARGIN setting (capital
+        efficiency), never the size. Vol targeting is preserved: an ATR stop
+        means calm markets -> tighter stop -> more size -> higher leverage,
+        and vice versa. `size_mult` (Kelly x health) scales conviction; the
+        hard per-trade risk cap backstops everything."""
         if price <= 0 or stop_dist <= 0 or equity <= 0:
             return None
         eff_mult = clamp(size_mult, 0.1, 2.0)
@@ -174,18 +179,18 @@ class RiskManager:
         lev_min, lev_max = self.cfg.min_leverage, self.cfg.max_leverage
 
         implied_lev = (risk_amount / stop_dist) * price / equity   # leverage risk-sizing wants
-        lev = clamp(implied_lev, lev_min, lev_max)
         # LIQUIDATION-DISTANCE GUARD: the stop must always sit within ~80% of the
         # distance to isolated-margin liquidation (liq_frac ~ 1/lev - maintenance
         # margin). A wick through liquidation is the one loss you can't iterate
-        # on — cap leverage so the stop fires first, with margin to spare.
+        # on — cap size so the stop fires first, with margin to spare.
         stop_frac = stop_dist / price
         lev_liq_cap = 1.0 / (stop_frac / LIQ_STOP_HEADROOM + MAINT_MARGIN_RATE)
-        lev = clamp(min(lev, lev_liq_cap), 1.0, lev_max)
+        lev = min(implied_lev, lev_max, lev_liq_cap)
+        if lev <= 0:
+            return None
         qty = lev * equity / price
 
-        # hard safety cap: no single trade may risk more than max_risk_hard_pct,
-        # even if that means dropping below the nominal min leverage in a storm.
+        # hard safety cap: no single trade may risk more than max_risk_hard_pct
         max_risk = equity * self.cfg.max_risk_hard_pct
         if qty * stop_dist > max_risk:
             qty = max_risk / stop_dist
@@ -194,7 +199,13 @@ class RiskManager:
         if qty < spec.min_qty or qty * price < spec.min_notional_usdt:
             return None
         notional = qty * price
-        leverage = int(clamp(round(notional / max(equity, 1e-9)), 1, lev_max))
+        # exchange margin setting: enough for the notional, at least the band
+        # floor (locks less margin, frees the rest) — but never so high that
+        # liquidation could move inside the stop.
+        margin_lev = math.ceil(notional / max(equity, 1e-9) - 1e-9)
+        leverage = int(clamp(max(margin_lev, lev_min), 1, lev_max))
+        if leverage > lev_liq_cap:
+            leverage = max(margin_lev, 1, int(lev_liq_cap))
         return SizedOrder(qty=qty, notional=notional, leverage=leverage,
                           stop_price=0.0, take_profit=0.0, risk_amount=qty * stop_dist,
                           size_mult=eff_mult)

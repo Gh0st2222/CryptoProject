@@ -297,6 +297,47 @@ def test_backtest_runs_with_pullback_entries():
     assert res["stats"] == res2["stats"]
 
 
+# ------------------------------------------------- sizing honors risk budget
+
+def test_min_leverage_never_inflates_risk():
+    """The exact failure from live: with a wide ATR stop, risk sizing wants
+    LESS than min_leverage's worth of size; flooring size at the band minimum
+    doubled/tripled the realized loss at the stop. Size must follow
+    risk_per_trade exactly; min_leverage may only floor the exchange margin
+    setting."""
+    from bingxbot.risk.manager import RiskManager
+    cfg = RiskConfig(risk_per_trade=0.008, min_leverage=2, max_leverage=7)
+    rm = RiskManager(cfg)
+    spec = ContractSpec("BTC-USDT", qty_precision=6, min_qty=0.000001, min_notional_usdt=1.0)
+    equity, price = 10_000.0, 60_000.0
+    stop_dist = price * 0.015           # 1.5% stop -> implied leverage ~0.53x
+    sized = rm.size_entry(equity, price, stop_dist, LONG, spec)
+    assert sized is not None
+    loss_at_stop = sized.qty * stop_dist
+    assert loss_at_stop == pytest.approx(equity * 0.008, rel=0.02), \
+        f"loss at stop {loss_at_stop:.2f} must equal the 0.8% risk budget, not 2x it"
+    assert sized.notional / equity < 1.0, "size must not be inflated to the band floor"
+    assert sized.leverage >= cfg.min_leverage, "margin setting still respects the band floor"
+    # a $100 account behaves identically in percentage terms
+    small = rm.size_entry(100.0, price, stop_dist, LONG, spec)
+    assert small is not None
+    assert small.qty * stop_dist == pytest.approx(0.8, rel=0.05)
+
+
+def test_stop_out_shows_full_mae():
+    """An intrabar stop-out closed before any bar-close excursion update must
+    still journal ~1R of adverse excursion — the exit price is an extreme."""
+    pf = Portfolio(10_000.0, mode="paper")
+    pos = Position(symbol="BTC-USDT", side=LONG, qty=1.0, entry_price=100.0,
+                   opened_ts=1, stop_price=97.0)
+    pos.init_risk = 3.0
+    pf.positions["BTC-USDT"] = pos
+    tr = pf.close_position("BTC-USDT", 97.0, 2, exit_fee=0.0, reason="stop loss",
+                           planned_risk=3.0)
+    assert tr is not None
+    assert tr.mae_r == pytest.approx(1.0), "a 1R stop-out must show 1R of heat"
+
+
 # ------------------------------------------------------- tunable clamping
 
 def test_apply_tunables_clamps_to_bounds():

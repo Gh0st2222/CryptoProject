@@ -85,8 +85,10 @@ class StrategyConfig:
 @dataclass
 class RiskConfig:
     risk_per_trade: float = 0.008       # target equity fraction at risk if the stop hits
-    min_leverage: int = 2               # operating leverage band (auto-adapted within)
-    max_leverage: int = 7
+    min_leverage: int = 2               # floor for the EXCHANGE margin setting only —
+                                        # it never inflates position size beyond what
+                                        # risk_per_trade allows (sizing is pure risk-based)
+    max_leverage: int = 7               # hard ceiling on size AND the margin setting
     max_risk_hard_pct: float = 0.035    # hard cap on any single trade's loss-at-stop
     margin_mode: str = "ISOLATED"
     # --- adaptive exit geometry (let winners run, cut losers) ---
