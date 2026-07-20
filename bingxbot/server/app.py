@@ -191,6 +191,18 @@ async def paper_reset():
     return orch.reset_paper()
 
 
+@app.get("/api/report")
+async def report():
+    """One-click diagnostic resume: a plain-text dump of the whole system state
+    (no secrets), downloadable for sharing/analysis."""
+    from fastapi.responses import PlainTextResponse
+    from .report import build_report
+    import time as _t
+    fname = f"pulse_resume_{_t.strftime('%Y%m%d_%H%M', _t.gmtime())}.txt"
+    return PlainTextResponse(build_report(orch), headers={
+        "Content-Disposition": f'attachment; filename="{fname}"'})
+
+
 @app.post("/api/apply_params")
 async def apply_params(req: ApplyParamsReq):
     orch.apply_params(req.params)

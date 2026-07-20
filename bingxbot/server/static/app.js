@@ -445,6 +445,16 @@ $("btn-kill").onclick=async()=>{ if(!confirm("Kill switch: flatten all and halt 
   try{ await api("/api/control",{action:"kill"}); toast("Kill switch engaged","warn"); }catch(e){ toast(e.message,"bad"); } };
 $("btn-flatten").onclick=async()=>{ try{ const r=await api("/api/control",{action:"flatten"}); toast(r.message,"good"); }catch(e){ toast(e.message,"bad"); } };
 $("btn-reset-kill").onclick=async()=>{ try{ const r=await api("/api/control",{action:"reset_kill"}); toast(r.message,"good"); }catch(e){ toast(e.message,"bad"); } };
+$("btn-report").onclick=async()=>{
+  try{
+    const res=await fetch("/api/report"); if(!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob=await res.blob(); const a=document.createElement("a");
+    a.href=URL.createObjectURL(blob);
+    a.download=`pulse_resume_${new Date().toISOString().slice(0,16).replace(/[-T:]/g,"")}.txt`;
+    a.click(); URL.revokeObjectURL(a.href);
+    toast("Resume downloaded — share the .txt for analysis","good");
+  }catch(e){ toast(`Report failed: ${e.message}`,"bad"); }
+};
 $("btn-paper-reset").onclick=async()=>{
   if(!confirm("Reset the paper account? The persisted session (positions, trades, equity history) is wiped.")) return;
   try{ await api("/api/paper_reset"); lastEqT=0; toast("Paper account reset — fresh balance","good"); }catch(e){ toast(e.message,"bad"); } };
