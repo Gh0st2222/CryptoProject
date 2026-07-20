@@ -59,18 +59,18 @@ def clean_perp(symbol: str) -> bool:
     return base.isalpha() and 2 <= len(base) <= 6
 
 
-# The radar's eligibility universe: popular, reasonable tokens only. Volume
-# floors cannot express this — a pumping memecoin out-trades ATOM every time,
-# and extreme funding (the carry column) is exactly where squeezed memes live —
-# so eligibility is an explicit allowlist, not a statistic.
+# The radar's eligibility universe: popular tokens only. Volume floors cannot
+# express this — a pumping micro-cap out-trades ATOM every time, and extreme
+# funding (the carry column) is exactly where squeezed junk lives — so
+# eligibility is an explicit allowlist, not a statistic.
 #
-# The LIVE list comes from CoinGecko: the top-100 by market cap MINUS
-# CoinGecko's own "meme-token" category (so DOGE/SHIB/PEPE, top-100 or not,
-# stay out) minus stablecoins/wrapped forms — refreshed every few hours and
-# cached to disk (see DynamicUniverse). MAJORS below is the OFFLINE FALLBACK
-# used until the first successful fetch or when CoinGecko is unreachable.
-# The user's configured symbols and the `radar_extra` setting are always
-# admitted on top, so any deliberate choice overrides the list.
+# The LIVE list is the CoinGecko top-100 by market cap, taken AS-IS (whatever
+# is big enough to be top-100 is admitted — the only rows dropped are ones
+# whose ticker can't match a clean BingX perp symbol anyway). Refreshed every
+# few hours and cached to disk (see DynamicUniverse). MAJORS below is the
+# OFFLINE FALLBACK used until the first successful fetch or when CoinGecko is
+# unreachable. The user's configured symbols and the `radar_extra` setting are
+# always admitted on top, so any deliberate choice extends the list.
 MAJORS: frozenset[str] = frozenset({
     # L1 / L2 / payments
     "BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX", "DOT", "ATOM", "NEAR",
@@ -85,16 +85,6 @@ MAJORS: frozenset[str] = frozenset({
     "RNDR", "RENDER", "FET", "AR", "ZRO", "EIGEN", "PENDLE",
     # gaming / consumer (established mid-caps, not memes)
     "THETA", "AXS", "SAND", "MANA", "GALA", "CHZ", "ENJ",
-})
-
-
-# stablecoins and wrapped/staked forms that ride high in market-cap rankings
-# but are not directional trading candidates
-STABLES_WRAPPED: frozenset[str] = frozenset({
-    "USDT", "USDC", "DAI", "USDS", "USDE", "FDUSD", "TUSD", "PYUSD", "BUSD",
-    "USD", "USDD", "USDX", "GHO", "FRAX", "SUSDE", "SUSDS", "BSCUSD",
-    "WBTC", "WETH", "STETH", "WSTETH", "WEETH", "WBETH", "CBBTC", "CBETH",
-    "RETH", "METH", "EZETH", "RSETH", "LBTC", "BNSOL", "JITOSOL", "MSOL",
 })
 
 
@@ -113,23 +103,19 @@ def reasonable_perp(symbol: str, allowed: set[str] | None = None) -> bool:
     return b in (allowed if allowed else MAJORS)
 
 
-def parse_coingecko_universe(top_rows: list[dict], meme_rows: list[dict]) -> set[str]:
-    """Pure: CoinGecko /coins/markets payloads -> admitted base-ticker set.
-    Top-100 by market cap, minus everything CoinGecko itself categorizes as a
-    meme token, minus stablecoins/wrapped forms, kept to the same 2-6 letter
-    format the perp filter enforces. Unit-testable without a network."""
-    memes = {str(r.get("symbol", "")).strip().upper() for r in (meme_rows or [])
-             if isinstance(r, dict)}
+def parse_coingecko_universe(top_rows: list[dict]) -> set[str]:
+    """Pure: CoinGecko /coins/markets payload -> admitted base-ticker set.
+    The top-100 by market cap, AS-IS — everything CoinGecko gives us. Rows are
+    only dropped when their ticker can't possibly match a clean BingX perp
+    symbol (non-alpha or outside 2-6 letters, same as clean_perp). Unit-testable
+    without a network."""
     out: set[str] = set()
     for r in top_rows or []:
         if not isinstance(r, dict):
             continue
         b = str(r.get("symbol", "")).strip().upper()
-        if not b or not b.isalpha() or not 2 <= len(b) <= 6:
-            continue
-        if b in memes or b in STABLES_WRAPPED:
-            continue
-        out.add(b)
+        if b and b.isalpha() and 2 <= len(b) <= 6:
+            out.add(b)
     return out
 
 
@@ -218,8 +204,8 @@ def rank_universe(premium: list[dict], tickers: list[dict],
 def top_volume_universe(tickers: list[dict], n: int = 10,
                         allowed: set[str] | None = None) -> list[str]:
     """The tuner's research universe: the ACTUAL top-N BingX perps by 24h USDT
-    volume among reasonable tokens (`allowed`; None -> built-in MAJORS —
-    never memecoins, no matter their volume). Falls back to relaxing the
+    volume among admitted tokens (`allowed`; None -> built-in MAJORS — never a
+    long-tail micro-cap, no matter its volume). Falls back to relaxing the
     VOLUME floor, never the eligibility list."""
     ok = [t for t in tickers if reasonable_perp(t["symbol"], allowed)]
     ok.sort(key=lambda t: t.get("quote_volume", 0.0), reverse=True)
@@ -249,10 +235,10 @@ def demo_universe(seed: int | None = None) -> tuple[list[dict], list[dict]]:
 
 
 class DynamicUniverse:
-    """The radar's live eligibility list: CoinGecko top-100 by market cap,
-    minus meme-token category and stables/wrapped, cached to disk so a restart
-    (or a CoinGecko outage) never leaves the radar blind — it falls back to the
-    last good fetch, and to the built-in MAJORS before the first one ever."""
+    """The radar's live eligibility list: the CoinGecko top-100 by market cap,
+    as-is, cached to disk so a restart (or a CoinGecko outage) never leaves the
+    radar blind — it falls back to the last good fetch, and to the built-in
+    MAJORS before the first one ever."""
 
     def __init__(self, path=UNIVERSE_PATH):
         self.path = path
@@ -290,27 +276,20 @@ class DynamicUniverse:
             key = os.getenv("COINGECKO_API_KEY", "").strip()
             if key:
                 headers["x-cg-demo-api-key"] = key
-            common = {"vs_currency": "usd", "order": "market_cap_desc",
-                      "page": "1", "sparkline": "false"}
             async with aiohttp.ClientSession(
                     timeout=aiohttp.ClientTimeout(total=15), headers=headers) as s:
                 async with s.get(f"{COINGECKO_BASE}/coins/markets",
-                                 params={**common, "per_page": "100"}) as r1:
+                                 params={"vs_currency": "usd", "order": "market_cap_desc",
+                                         "per_page": "100", "page": "1",
+                                         "sparkline": "false"}) as r1:
                     top = await r1.json() if r1.status == 200 else None
-                async with s.get(f"{COINGECKO_BASE}/coins/markets",
-                                 params={**common, "per_page": "250",
-                                         "category": "meme-token"}) as r2:
-                    memes = await r2.json() if r2.status == 200 else None
         except Exception as e:  # noqa: BLE001 — the radar must survive CoinGecko
             log.debug("universe fetch failed: %s", e)
             return False
-        # BOTH calls must succeed: a missing meme list would silently re-admit
-        # memecoins, which is the one thing this universe exists to prevent.
-        if not isinstance(top, list) or not isinstance(memes, list) or len(top) < 50:
-            log.debug("universe fetch rejected (top=%s memes=%s)",
-                      type(top).__name__, type(memes).__name__)
+        if not isinstance(top, list) or len(top) < 50:
+            log.debug("universe fetch rejected (top=%s)", type(top).__name__)
             return False
-        bases = parse_coingecko_universe(top, memes)
+        bases = parse_coingecko_universe(top)
         if len(bases) < UNIVERSE_MIN_TOKENS:
             return False
         self.bases = bases
@@ -321,7 +300,7 @@ class DynamicUniverse:
             self.path.write_text(json.dumps({"ts": self.fetched_ts, "bases": sorted(bases)}))
         except OSError:
             pass
-        log.info("radar universe refreshed: %d reasonable tokens (CoinGecko top-100, memes excluded)",
+        log.info("radar universe refreshed: %d tokens (CoinGecko top-100 by market cap)",
                  len(bases))
         return True
 
@@ -373,7 +352,7 @@ class MarketScanner:
         rest = getattr(self.orch, "rest", None)
         if rest is not None:   # offline/synthetic runs stay fully offline
             await self.universe.maybe_refresh()
-        # the admitted universe: CoinGecko top-100 minus memes (or built-in
+        # the admitted universe: the CoinGecko top-100 as-is (or built-in
         # majors before the first fetch), plus the user's deliberate choices.
         allowed = self.universe.allowed() | self._extra_allowed()
         if rest is None:
@@ -387,9 +366,9 @@ class MarketScanner:
             self.demo = False
             premium = await rest.premium_index_all()
             tickers = await rest.tickers_24h()
-            # deep-dive 4h trend only on the interesting REASONABLE few (one
+            # deep-dive 4h trend only on the interesting ADMITTED few (one
             # klines call each): harvestable-liquidity funding movers + majors —
-            # never spend a call probing a memecoin the board won't show anyway.
+            # never spend a call probing a token the board won't show anyway.
             by_f = sorted(premium, key=lambda p: abs(p.get("funding_rate", 0.0)), reverse=True)
             vol_ok = {t["symbol"] for t in tickers
                       if t.get("quote_volume", 0) >= CARRY_MIN_QVOL

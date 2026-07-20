@@ -93,18 +93,17 @@ def test_top_volume_universe_returns_actual_majors():
     assert "DOGE-USDT" in uni2
 
 
-def test_parse_coingecko_universe_drops_memes_and_stables():
-    """Top-100 by market cap INCLUDES big memecoins — the whole point of the
-    meme-category subtraction is that DOGE/SHIB/PEPE stay out even while they
-    sit in the top-100. Stables/wrapped forms and format-junk drop too."""
+def test_parse_coingecko_universe_takes_top100_as_is():
+    """Everything CoinGecko's top-100 gives us is admitted — including big
+    memecoins like DOGE/PEPE (top-100 by cap = popular enough). Only tickers
+    that can't match a clean BingX perp symbol (non-alpha, wrong length) drop."""
     top = [{"symbol": s} for s in
-           ("btc", "eth", "sol", "doge", "shib", "pepe", "usdt", "usdc", "wbtc",
-            "steth", "link", "avax", "1inch", "verylongname", "ton")]
-    memes = [{"symbol": s} for s in ("doge", "shib", "pepe", "wif", "bonk")]
-    bases = parse_coingecko_universe(top, memes)
-    assert {"BTC", "ETH", "SOL", "LINK", "AVAX", "TON"} <= bases
-    for junk in ("DOGE", "SHIB", "PEPE", "USDT", "USDC", "WBTC", "STETH",
-                 "1INCH", "VERYLONGNAME"):
+           ("btc", "eth", "sol", "doge", "shib", "pepe", "usdt", "wbtc",
+            "link", "avax", "1inch", "verylongname", "ton")]
+    bases = parse_coingecko_universe(top)
+    assert {"BTC", "ETH", "SOL", "LINK", "AVAX", "TON",
+            "DOGE", "SHIB", "PEPE", "USDT", "WBTC"} <= bases
+    for junk in ("1INCH", "VERYLONGNAME"):
         assert junk not in bases, junk
 
 
