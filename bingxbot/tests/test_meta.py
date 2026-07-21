@@ -49,6 +49,27 @@ def test_train_learns_a_planted_pattern():
     assert mm.ready and mm.blend_weight > 0.5
 
 
+def test_train_survives_allnan_columns():
+    """Offline training has 9 all-NaN columns BY DESIGN (micro/ctx features
+    don't exist in backtest context) — sklearn 1.9's binner crashes on columns
+    with zero finite values, which silently killed every live meta training.
+    The fit must survive, and the model must still predict on live rows where
+    those columns DO carry values."""
+    rng = np.random.default_rng(5)
+    n = 4000
+    X = rng.normal(0, 1, (n, len(FEATURE_NAMES))).astype(np.float32)
+    for name in ("micro_obi", "micro_flow", "micro_cvd_slope", "micro_spread_bps",
+                 "ctx_funding_rate", "ctx_funding_z", "ctx_oi_change_pct",
+                 "ctx_tide_dir", "ctx_tide_er"):
+        X[:, FEATURE_NAMES.index(name)] = np.nan
+    p = 1 / (1 + np.exp(-2.0 * X[:, 0]))
+    y = (rng.random(n) < p).astype(np.int8)
+    mm = train(X, y)
+    assert mm is not None and mm.auc > 0.65
+    live_x = np.nan_to_num(X[0], nan=0.5)   # live rows DO carry micro/ctx values
+    assert 0.05 <= mm.predict_one(live_x) <= 0.95
+
+
 def test_model_roundtrip_and_schema_guard(tmp_path):
     rng = np.random.default_rng(1)
     X = rng.normal(0, 1, (4000, len(FEATURE_NAMES))).astype(np.float32)

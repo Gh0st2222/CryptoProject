@@ -63,6 +63,30 @@ async def test_report_builds_with_running_engine(monkeypatch):
         await engine.stop()
 
 
+@pytest.mark.asyncio
+async def test_ws_client_reader_surfaces_disconnect():
+    """The websocket push loop's disconnect signal: the reader task must
+    finish when the client sends a disconnect frame OR the transport errors.
+    Without it, every closed/refreshed tab left a zombie push loop spamming
+    'socket.send() raised exception.' several times a second, forever."""
+    from bingxbot.server.app import _client_reader
+
+    class _WS:
+        def __init__(self, msgs, err=None):
+            self._msgs = list(msgs)
+            self._err = err
+
+        async def receive(self):
+            if self._msgs:
+                return self._msgs.pop(0)
+            raise (self._err or RuntimeError("closed"))
+
+    await asyncio.wait_for(_client_reader(_WS(
+        [{"type": "websocket.receive", "text": "ping"},
+         {"type": "websocket.disconnect"}])), 2.0)
+    await asyncio.wait_for(_client_reader(_WS([], ConnectionResetError())), 2.0)
+
+
 def test_journal_range_entry_analytics(tmp_path):
     """Direction-relative 24h-entry buckets: a LONG at the daily low and a
     SHORT at the daily high are both 'best-25%'; rows without the field are

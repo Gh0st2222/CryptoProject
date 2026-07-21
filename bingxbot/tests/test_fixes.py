@@ -418,6 +418,18 @@ def test_feed_seed_covers_24h_window():
     assert len(feed.states["BTC-USDT"].candles) >= 1441
 
 
+def test_oos_composite_resists_one_lucky_fold():
+    """Promotion fitness: one parabolic OOS fold must not buy the seat. The
+    exact fold fits from a live mispromotion — [+21.06, +0.94, -1.53] scored
+    3.7 under the mean blend and promoted a set whose newest window lost
+    money — must now score below a modestly consistent set."""
+    from bingxbot.engine.autotuner import _oos_composite
+    lucky = [21.06, 0.94, -1.53]
+    steady = [1.4, 1.1, 0.9]
+    assert _oos_composite(steady) > _oos_composite(lucky)
+    assert _oos_composite(lucky) < 1.0
+
+
 def test_entry_context_captures_24h_location():
     """The journal must record where in the 24h range each trade entered —
     finite values pass through, an unfilled window becomes None (never NaN,

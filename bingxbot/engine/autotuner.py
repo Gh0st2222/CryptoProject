@@ -24,6 +24,7 @@ import asyncio
 import logging
 import math
 import random
+import statistics
 import time
 
 from ..config import MODE_IDLE
@@ -76,6 +77,15 @@ def _current_params(cfg) -> dict:
         src = cfg.strategy if grp == "strategy" else cfg.risk
         p[name] = getattr(src, name)
     return p
+
+
+def _oos_composite(fits: list[float]) -> float:
+    """Blend of the TYPICAL fold (median) and the WORST fold. The old mean
+    blend let one parabolic window buy the seat: fold fits of [+21, +0.9,
+    -2.4] composited to 3.7 and promoted a set whose most recent window lost
+    money outright. The median demands profit in the typical window; the
+    worst-fold term keeps the tail priced in."""
+    return 0.7 * statistics.median(fits) + 0.3 * min(fits)
 
 
 # Brain-only scalars that may differ PER SYMBOL. Risk/exit geometry stays
@@ -365,8 +375,7 @@ class AutoTuner:
         def cand_fit(idx: int) -> tuple[float, dict, list[float]]:
             rs = val_res[idx * nf_oos:(idx + 1) * nf_oos]
             fits = [r["fitness"] for r in rs]
-            fit = 0.7 * sum(fits) / len(fits) + 0.3 * min(fits)
-            return fit, rs[-1]["stats"], fits    # stats from the most recent fold
+            return _oos_composite(fits), rs[-1]["stats"], fits    # stats from the most recent fold
 
         champ_fit, _, champ_folds = cand_fit(len(cands))
         best, best_i, best_adj, best_stats = None, -1, -1e18, {}
@@ -378,6 +387,12 @@ class AutoTuner:
             adj = oos - (OVERFIT_LAMBDA * max(0.0, c["train_fit"] - oos) if c["train_fit"] is not None else 0.0)
             if c["source"] == "vault" and c["cid"]:
                 self.orch.set_champion_current(c["cid"], oos, stats0)  # keep its CURRENT eval fresh
+            # absolute-profit veto: whatever the fitness composite says, a set
+            # whose validation on the MOST RECENT window loses money gross
+            # (PF < 1) cannot take the seat. PF 999 (no losing trades) passes;
+            # PF 0 (no trades) fails — an unverifiable candidate isn't promotable.
+            if float(stats0.get("profit_factor", 0.0) or 0.0) < 1.0:
+                continue
             if adj > best_adj:
                 best, best_i, best_adj, best_stats = c, i, adj, stats0
                 best_folds = fold_fits_oos
@@ -538,13 +553,24 @@ class AutoTuner:
                     tc = self._cache.get(tsym)
                     if tc and len(tc[0]) >= MIN_BARS:
                         cbs[tsym] = tc[0]
-                if cbs:
-                    res = (await self.orch.map_cpu(train_from_candles,
-                                                   [(cbs, interval, strat, risk)],
-                                                   research=True))[0]
+                if not cbs:
+                    self.last_meta = {"trained": False, "reason": "no cached history >= MIN_BARS",
+                                      "ts": int(time.time() * 1000)}
+                else:
+                    try:
+                        res = (await self.orch.map_cpu(train_from_candles,
+                                                       [(cbs, interval, strat, risk)],
+                                                       research=True))[0]
+                    except Exception as e:  # noqa: BLE001 — a pool hiccup must not cost the model
+                        log.warning("meta training on the research pool failed (%s) — in-process retry", e)
+                        res = await asyncio.to_thread(train_from_candles, cbs, interval, strat, risk)
                     self.last_meta = {**res, "ts": int(time.time() * 1000)}
                     log.info("meta-model training: %s", res)
             except Exception as e:  # noqa: BLE001 — ML must never break tuning
+                # ALWAYS leave a trace: a silent null in the snapshot hid five
+                # straight failed trainings from an entire live session's resume.
+                self.last_meta = {"trained": False, "error": f"{type(e).__name__}: {e}",
+                                  "ts": int(time.time() * 1000)}
                 log.warning("meta training failed: %s", e)
 
         self.last_cycle = {
