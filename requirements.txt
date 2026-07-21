@@ -5,6 +5,7 @@ numpy>=1.26
 pydantic>=2.6
 python-dotenv>=1.0
 scikit-learn>=1.4    # meta-labeling P(win) model (HistGradientBoosting)
+numba>=0.59          # compiled backtest kernel (tuner training folds; optional at runtime)
 
 # dev / tests
 pytest>=8.0
