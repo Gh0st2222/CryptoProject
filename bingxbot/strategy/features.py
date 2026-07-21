@@ -69,12 +69,13 @@ def mtf_from_row(row: dict, ladder) -> dict:
 
 
 class FeatureFrame:
-    __slots__ = ("n", "f", "ladder", "_rows", "_alpha")
+    __slots__ = ("n", "f", "ladder", "_rows", "_alpha", "_kmats")
 
     def __init__(self, arrays: dict[str, np.ndarray], interval: str | None = None):
         self.ladder: list[str] = []
         self._rows = None    # lazy per-bar row-dict cache (candidate-invariant)
         self._alpha = None   # lazy per-bar alpha-score cache (set by the backtester)
+        self._kmats = None   # lazy compiled-kernel matrices (features/alphas/regimes)
         o = arrays.get("open", arrays["close"])
         c, h, l, v = arrays["close"], arrays["high"], arrays["low"], arrays["volume"]
         self.n = len(c)

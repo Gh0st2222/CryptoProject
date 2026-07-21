@@ -257,10 +257,17 @@ on whichever is currently trading — and any champion can be re-applied with on
 The tuner also **hunts faster right after a promotion** (tight cadence while it's
 clearly improving, relaxed when stable).
 
-**It runs on other cores.** The heavy scoring — the continuous tuner and every
-Backtest / Optimizer / Portfolio job — runs in a **process pool** (spawn workers,
-cross-platform), so it never holds the GIL and never stalls the event loop. The
-UI stays responsive even while the research desk is grinding through candidates.
+**It runs on other cores — and on a compiled kernel.** The heavy scoring — the
+continuous tuner and every Backtest / Optimizer / Portfolio job — runs in a
+**process pool** (spawn workers, cross-platform), so it never holds the GIL and
+never stalls the event loop. Training-fold candidate ranking additionally runs
+on a **numba-compiled kernel**: a nopython port of the whole engine (brain
+learning, gates, adaptive exits, fills, risk, accounting) proven
+**trade-for-trade identical** to the Python engine by parity tests before it
+ranks anything (~5-15x more search per hour). The kernel ranks training
+candidates without the meta-labeling head (sklearn can't run in compiled
+code); OOS validation and promotion always use the full Python engine, meta
+included — the search proposes fast, the judge stays full-fidelity.
 
 ## Multi-symbol portfolio backtest (one shared account)
 

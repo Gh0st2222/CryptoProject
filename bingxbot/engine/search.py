@@ -38,10 +38,29 @@ def score_fold(fold_candles, symbol, interval, spec, taker, slip,
     """Score every param-set in `param_list` on ONE fold, building the fold's
     FeatureFrame once and reusing it for all of them. Module-level + picklable so
     it runs in a research-pool worker; the caller runs one of these per fold in
-    parallel."""
+    parallel.
+
+    When numba is available, candidates run on the COMPILED KERNEL — a
+    parity-tested nopython port of the whole engine (~15-20x per candidate).
+    The kernel ranks TRAINING candidates without the meta-labeling head
+    (sklearn can't run in nopython code); OOS validation and promotion always
+    use the full Python engine, meta included — the search proposes fast, the
+    judge stays full-fidelity. Set BOT_NO_KERNEL=1 to force the Python path."""
     if len(fold_candles) < 360:
         return [-1.0] * len(param_list)
     ff = FeatureFrame(candles_to_arrays(fold_candles), interval=interval)
+    import os
+    if os.getenv("BOT_NO_KERNEL", "") != "1":
+        try:
+            from .kernel import kernel_fitness
+            out = []
+            for p in param_list:
+                s, r = _apply_params(base_strat, base_risk, p)
+                st = kernel_fitness(ff, s, r, spec, taker, slip, interval)["stats"]
+                out.append(_fitness(st))
+            return out
+        except Exception:  # noqa: BLE001 — the kernel is an optimization, never a dependency
+            pass
     out = []
     for p in param_list:
         s, r = _apply_params(base_strat, base_risk, p)
