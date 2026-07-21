@@ -7,7 +7,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -218,14 +218,30 @@ FULL_MIN_GAP = 0.9    # seconds between heavy full-state pushes
 HOT_MIN_GAP = 0.25    # seconds between light hot pushes (≈ up to 4/s)
 
 
+async def _client_reader(ws: WebSocket) -> None:
+    """Consume client frames until the peer goes away. Starlette only learns
+    about a disconnect inside receive() — a push-only loop that never receives
+    keeps writing into the dead transport forever, and asyncio logs
+    'socket.send() raised exception.' several times a second for every
+    closed/refreshed tab. This task's completion IS the disconnect signal."""
+    try:
+        while True:
+            msg = await ws.receive()
+            if msg.get("type") == "websocket.disconnect":
+                return
+    except Exception:  # noqa: BLE001 — any transport error means the client is gone
+        return
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     q = orch.subscribe()
+    reader = asyncio.create_task(_client_reader(ws))
     try:
         await ws.send_text(json.dumps({"type": "state", "data": orch.status()}))
         last_full = last_hot = 0.0
-        while True:
+        while not reader.done():
             try:
                 kind = await asyncio.wait_for(q.get(), timeout=2.0)
             except asyncio.TimeoutError:
@@ -239,6 +255,8 @@ async def ws_endpoint(ws: WebSocket):
                     want_full = want_full or (k2 in FULL_EVENTS)
                 except asyncio.QueueEmpty:
                     break
+            if reader.done():      # client left while we were coalescing
+                break
             now = now_ms() / 1000.0
             if want_full and now - last_full > FULL_MIN_GAP:
                 await ws.send_text(json.dumps({"type": "state", "data": orch.status()}))
@@ -246,9 +264,10 @@ async def ws_endpoint(ws: WebSocket):
             elif now - last_hot > HOT_MIN_GAP:
                 await ws.send_text(json.dumps({"type": "hot", "data": orch.hot()}))
                 last_hot = now
-    except (WebSocketDisconnect, RuntimeError):
+    except Exception:  # noqa: BLE001 — a dying socket must never take the server down
         pass
     finally:
+        reader.cancel()
         orch.unsubscribe(q)
 
 

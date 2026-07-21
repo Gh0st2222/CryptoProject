@@ -209,6 +209,20 @@ class MetaModel:
                          float(d.get("trained_ts", 0.0)), d["feature_names"])
 
 
+def _fill_allnan_cols(X: np.ndarray) -> np.ndarray:
+    """sklearn's HGB binner (1.9) crashes on a column with ZERO finite values
+    (sliding_window_view over an empty distinct-value array). Offline training
+    legitimately has such columns — micro/ctx features are NaN by design in
+    backtest context — so fill them with a constant at FIT time only. A
+    no-information column stays no-information (the tree never splits on a
+    constant), and the live feature schema is untouched."""
+    allnan = ~np.isfinite(X).any(axis=0)
+    if allnan.any():
+        X = X.copy()
+        X[:, allnan] = 0.0
+    return X
+
+
 def train(X: np.ndarray, y: np.ndarray) -> MetaModel | None:
     """Walk-forward fit: train on the older 75%, credential on the newest 25%
     with a purge gap of one barrier horizon (overlapping labels can't leak)."""
@@ -226,11 +240,11 @@ def train(X: np.ndarray, y: np.ndarray) -> MetaModel | None:
         max_iter=150, max_leaf_nodes=15, learning_rate=0.08,
         l2_regularization=1.0, min_samples_leaf=60,
         early_stopping=False, random_state=7)
-    m.fit(Xtr, ytr)
+    m.fit(_fill_allnan_cols(Xtr), ytr)
     auc = float(roc_auc_score(yva, m.predict_proba(Xva)[:, 1]))
     # refit on everything so live uses all the data; the credential stays the
     # honest walk-forward number, never the refit's in-sample flattery.
-    m.fit(X, y)
+    m.fit(_fill_allnan_cols(X), y)
     return MetaModel(m, auc=auc, n=n, trained_ts=time.time(), feature_names=list(FEATURE_NAMES))
 
 
