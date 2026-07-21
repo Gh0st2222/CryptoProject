@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from pathlib import Path
 
 from ..config import ROOT
@@ -31,6 +32,25 @@ def _bucket_align(a: float) -> str:
     if a <= -0.1:
         return "counter-trend"
     return "neutral"
+
+
+def _bucket_range_entry(r: dict) -> str | None:
+    """Where in the 24h range the trade entered, RELATIVE TO ITS DIRECTION:
+    0 = the favorable extreme (a LONG at the daily low / a SHORT at the daily
+    high), 1 = the adverse extreme (chasing). Rows without the field (old
+    journal, unfilled window) are skipped."""
+    rp = r.get("rpos24")
+    if not isinstance(rp, (int, float)) or not math.isfinite(rp):
+        return None
+    loc = rp if r.get("side") == "LONG" else 1.0 - rp
+    loc = min(max(loc, 0.0), 1.0)
+    if loc < 0.25:
+        return "best-25%"
+    if loc < 0.50:
+        return "25-50%"
+    if loc < 0.75:
+        return "50-75%"
+    return "worst-25%"
 
 
 class TradeJournal:
@@ -104,6 +124,20 @@ class TradeJournal:
         avg_mfe = sum(r.get("mfe_r", 0.0) for r in exc) / len(exc) if exc else 0.0
         rs = sum(r.get("r", 0.0) for r in exc)
         mfes = sum(r.get("mfe_r", 0.0) for r in exc)
+
+        # R-multiple distribution: the shape of outcomes, not just their mean.
+        rvals = sorted(float(r["r"]) for r in rows
+                       if isinstance(r.get("r"), (int, float)) and math.isfinite(r.get("r")))
+        def pctl(p: float) -> float:
+            return round(rvals[min(int(p * (len(rvals) - 1) + 0.5), len(rvals) - 1)], 3)
+        r_wins = [v for v in rvals if v > 0]
+        r_loss = [v for v in rvals if v <= 0]
+        r_dist = {} if not rvals else {
+            "p10": pctl(0.10), "p25": pctl(0.25), "p50": pctl(0.50),
+            "p75": pctl(0.75), "p90": pctl(0.90),
+            "avg_win_r": round(sum(r_wins) / len(r_wins), 3) if r_wins else 0.0,
+            "avg_loss_r": round(sum(r_loss) / len(r_loss), 3) if r_loss else 0.0,
+        }
         return {
             "trades": len(rows),
             "win_rate": round(wins / len(rows), 4),
@@ -112,10 +146,14 @@ class TradeJournal:
             "avg_mfe_r": round(avg_mfe, 3),
             "mfe_capture": round(rs / mfes, 3) if mfes > 0 else 0.0,
             "profit_factor": round(gross_w / gross_l, 3) if gross_l > 0 else (999.0 if gross_w > 0 else 0.0),
+            "r_dist": r_dist,
             "by_regime": agg(lambda r: r.get("regime")),
             "by_alignment": agg(lambda r: _bucket_align(signed_align(r))),
+            "by_range_entry": agg(_bucket_range_entry),   # 24h-range location at entry
             "by_hour": agg(lambda r: r.get("hour")),
             "by_desk": agg(lambda r: r.get("desk")),
             "by_side": agg(lambda r: r.get("side")),
+            "by_symbol": agg(lambda r: r.get("symbol")),
             "by_exit": agg(lambda r: r.get("reason_close")),
+            "by_champion": agg(lambda r: r.get("champion_id")),
         }

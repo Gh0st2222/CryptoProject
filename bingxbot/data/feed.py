@@ -31,6 +31,11 @@ FLOW_WINDOW_S = 30.0
 MTF_SEED_MIN = 1200
 
 
+def bars_24h(interval: str) -> int:
+    """Base bars in a 24h window — the widest rolling feature (hi/lo/vwap 24h)."""
+    return max(4, int(round(86_400_000 / interval_ms(interval))))
+
+
 DISPLAY_MS = 60_000    # the UI chart always renders 1m bars, whatever the signal TF
 
 
@@ -208,7 +213,10 @@ class LiveFeed(BaseFeed):
         self._ctx_task: asyncio.Task | None = None
 
     async def _seed_symbol(self, s: str) -> None:
-        seed_n = min(max(self.warmup_bars + 60, MTF_SEED_MIN), 1440)
+        # cover the 24h range window too, so hi/lo/vwap_24h are live from bar
+        # one instead of NaN for hours; 1440 is the exchange's per-request cap.
+        seed_n = min(max(self.warmup_bars + 60, MTF_SEED_MIN,
+                         bars_24h(self.interval) + 1), 1440)
         candles = await self.rest.klines(s, self.interval, limit=seed_n)
         if candles:
             candles = candles[:-1]  # last row is the still-open bar
@@ -343,7 +351,7 @@ class SyntheticFeed(BaseFeed):
 
     def _seed_symbol(self, s: str) -> None:
         from .history import synthetic_candles
-        seed_n = max(self.warmup_bars, MTF_SEED_MIN)
+        seed_n = max(self.warmup_bars, MTF_SEED_MIN, bars_24h(self.interval) + 1)
         candles = synthetic_candles(s, self.interval, seed_n,
                                     seed=self._rng.randint(0, 10**9),
                                     start_price=self._px[s])

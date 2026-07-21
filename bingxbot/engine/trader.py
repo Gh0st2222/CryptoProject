@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from dataclasses import asdict as dc_asdict
 
@@ -31,7 +32,7 @@ log = logging.getLogger("trader")
 FEATURE_TAIL = 1500  # bars fed to FeatureFrame each bar close (covers a full
                      # 24h range window even on a 1m base: 1440 bars + warmup)
 REACT_TAIL = 640     # bars for reactive intra-bar scans: the widest rolling
-                     # window is 240 bars (+~260 indicator warmup), so 640 gives
+                     # window is 288 bars (24h on a 5m base), so 640 gives
                      # EXACT last-row values for every windowed feature and only
                      # e^-10-scale EMA warmup drift — at ~2.2x less CPU per scan.
                      # Used only when the base interval >= 5m; a 1m base keeps
@@ -41,6 +42,18 @@ ADOPTED_FULL_GRADED = 30  # adopted symbols trade at reduced size until this man
 
 # Execution-cycle stages surfaced to the UI pipeline.
 STAGES = ("SCAN", "DETECT", "VALIDATE", "SIZE", "FILL", "MANAGE", "SETTLE")
+
+
+def _fin(x, nd: int, default=0.0):
+    """Round a feature for JSON transport; non-finite becomes `default`.
+    Rolling 24h features are NaN until their window fills (young listings,
+    short seeds), and a bare NaN in the websocket payload is invalid JSON —
+    the browser drops the whole message and the dashboard freezes."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return default
+    return round(v, nd) if math.isfinite(v) else default
 
 
 class SymbolCtx:
@@ -555,6 +568,13 @@ class TraderEngine:
             "mtf": dict(ctx.mtf),
             "desk": desk,
             "funding_rate": round(row.get("funding_rate", 0.0), 6),
+            # where in the 24h landscape the entry happened (None if the
+            # window hasn't filled) — lets analysis split "bought the low"
+            # from "chased the high" after the fact.
+            "rpos24": _fin(row.get("range_pos_24h"), 4, None),
+            "dist_hi24": _fin(row.get("dist_hi_24h"), 3, None),
+            "dist_lo24": _fin(row.get("dist_lo_24h"), 3, None),
+            "vwap24_dev": _fin(row.get("vwap24_dev"), 3, None),
         }
 
     def _block_reason(self, brain, edge, p_win, row, ev, fees_rt, spread, slip) -> str:
@@ -727,6 +747,8 @@ class TraderEngine:
             "p_win": entry_ctx.get("p_win", 0.0), "mtf_align": entry_ctx.get("mtf_align", 0.0),
             "mtf_bias": entry_ctx.get("mtf_bias", 0.0), "desk": entry_ctx.get("desk", ""),
             "funding_rate": entry_ctx.get("funding_rate", 0.0), "mtf": entry_ctx.get("mtf", {}),
+            "rpos24": entry_ctx.get("rpos24"), "dist_hi24": entry_ctx.get("dist_hi24"),
+            "dist_lo24": entry_ctx.get("dist_lo24"), "vwap24_dev": entry_ctx.get("vwap24_dev"),
             "champion_id": self.active_champion_id,  # which vault champion took this trade
         }
         try:
@@ -762,9 +784,9 @@ class TraderEngine:
                     "stage": c.stage,
                     "eval_ms": round(c.eval_ms, 2),
                     "mtf": c.mtf,
-                    "hi24": round(c.last_row.get("hi_24h", 0.0), 8),
-                    "lo24": round(c.last_row.get("lo_24h", 0.0), 8),
-                    "rpos24": round(c.last_row.get("range_pos_24h", 0.0), 4),
+                    "hi24": _fin(c.last_row.get("hi_24h"), 8),
+                    "lo24": _fin(c.last_row.get("lo_24h"), 8),
+                    "rpos24": _fin(c.last_row.get("range_pos_24h"), 4),
                     "gates": c.gates,
                     "overlay": sym in self.overlays,
                 }
@@ -818,9 +840,9 @@ class TraderEngine:
                     "regime": c.last_eval.get("regime", ""),
                     "bars_held": c.bars_held,
                     "mtf": c.mtf,
-                    "hi24": round(c.last_row.get("hi_24h", 0.0), 8),
-                    "lo24": round(c.last_row.get("lo_24h", 0.0), 8),
-                    "rpos24": round(c.last_row.get("range_pos_24h", 0.0), 4),
+                    "hi24": _fin(c.last_row.get("hi_24h"), 8),
+                    "lo24": _fin(c.last_row.get("lo_24h"), 8),
+                    "rpos24": _fin(c.last_row.get("range_pos_24h"), 4),
                     "candle": self._live_candle(sym),
                     "gates": c.gates,
                 }
