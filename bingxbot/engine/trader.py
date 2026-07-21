@@ -244,6 +244,28 @@ class TraderEngine:
         log.info("DROPPED %s (trend gone)", sym)
         return True
 
+    def _corr_haircut_for(self, symbol: str, held_syms: list[str]) -> float:
+        """Worst (smallest) measured-correlation haircut vs the held book."""
+        import numpy as np
+        from ..risk.manager import corr_haircut
+        fallback = self.cfg.risk.correlation_haircut
+        st_a = self.feed.states.get(symbol)
+        if st_a is None or not hasattr(st_a.candles, "arrays") or len(st_a.candles) < 80:
+            return fallback
+        ca = st_a.candles.arrays(200)["close"]
+        ra = np.diff(ca) / np.maximum(ca[:-1], 1e-9)
+        h = 1.0
+        for sym_b in held_syms:
+            st_b = self.feed.states.get(sym_b)
+            if st_b is None or not hasattr(getattr(st_b, "candles", None), "arrays") \
+                    or len(st_b.candles) < 80:
+                h = min(h, fallback)
+                continue
+            cb = st_b.candles.arrays(200)["close"]
+            rb = np.diff(cb) / np.maximum(cb[:-1], 1e-9)
+            h = min(h, corr_haircut(ra, rb, fallback))
+        return h
+
     def _market_tide(self) -> dict:
         """BTC's higher-TF read as market context for every brain: alts rarely
         fight the tide, and the meta-model can learn exactly when that matters.
@@ -336,10 +358,34 @@ class TraderEngine:
         moved, reason = self.exits.manage(
             pos, row["close"], row["high"], row["low"], row.get("atr", 0.0),
             row, ev["edge"], ev["threshold"], ev["regime"], ctx.bars_held)
-        if reason:
+        if reason == "scale out":
+            await self._scale_out(symbol)
+        elif reason:
             await self._close(symbol, reason)
         elif moved:
             log.info("%s stop -> %.6g (adaptive trail)", symbol, pos.stop_price)
+
+    async def _scale_out(self, symbol: str) -> None:
+        """Bank scaleout_frac of the position, trail the rest. The broker may
+        degrade a dust-sized partial into a full close; both outcomes journal."""
+        ctx = self.ctx.get(symbol)
+        res = await self.broker.close_position(symbol, "scale out",
+                                               frac=self.cfg.risk.scaleout_frac)
+        if not res.ok:
+            return
+        self.settle_risk()
+        pos = self.portfolio.positions.get(symbol)   # None => degraded to full close
+        trades = self.portfolio.trades
+        if trades:
+            t = trades[-1]
+            self._push_tape(symbol, "SCALE" if pos is not None else "CLOSE", t.side,
+                            t.exit_price, {"pnl": round(t.pnl, 4), "reason": t.reason_close})
+            self._journal_trade(t, ctx.entry_ctx if ctx else {}, ctx.bars_held if ctx else 0)
+        if pos is None and ctx:
+            ctx.bars_held = 0
+            ctx.entry_ctx = {}
+        if self.on_update:
+            await self.on_update("trade")
 
     async def _try_enter(self, ctx: SymbolCtx, st: MarketState, row: dict, ev: dict) -> None:
         symbol = ctx.symbol
@@ -388,12 +434,15 @@ class TraderEngine:
         # evidence — adoption gives it a seat, not full conviction on day one.
         if symbol in self.adopted and getattr(ctx.brain, "graded", 0) < ADOPTED_FULL_GRADED:
             size_mult *= 0.6
-        # correlation haircut: shrink a same-direction add across symbols (BTC/ETH
-        # move together — don't quietly double the same directional bet).
+        # correlation haircut: shrink a same-direction add across symbols by the
+        # MEASURED recent return correlation with what's already held (corr 1 ->
+        # 0.4x, corr 0 -> full size — an uncorrelated add is diversification,
+        # not stacking). Configured constant is the fallback without data.
         side_d = 1 if side == LONG else -1
         others = [p for s, p in self.portfolio.positions.items() if s != symbol]
-        if any(p.direction() == side_d for p in others):
-            size_mult *= self.cfg.risk.correlation_haircut
+        same_dir = [p.symbol for p in others if p.direction() == side_d]
+        if same_dir:
+            size_mult *= self._corr_haircut_for(symbol, same_dir)
         ctx.set_stage("SIZE")
         sized = self.risk.size_entry(equity, entry_ref, bracket.init_risk, side, spec, size_mult)
         if sized is None:

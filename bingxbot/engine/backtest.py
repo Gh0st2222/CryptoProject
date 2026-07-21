@@ -164,6 +164,7 @@ class _SymSim:
         self.pending = None
         self.bars_held = 0
         self.planned_risk = 0.0
+        self.corr_map: dict | None = None   # set by the portfolio backtest
         self.markers: list[dict] = []
         self.regime_counts: dict[str, int] = {}
         self.last_ev: dict = {}
@@ -189,6 +190,36 @@ class _SymSim:
         if self.collect:
             self.markers.append({"ts": int(self.ts[i]), "kind": "entry", "side": side,
                                  "price": round(eff, 8), "reason": reason})
+
+    def _pair_haircut(self, other: str) -> float:
+        cm = self.corr_map
+        if cm is None:
+            return self.risk_cfg.correlation_haircut
+        c = cm.get((self.symbol, other), cm.get((other, self.symbol)))
+        if c is None:
+            return self.risk_cfg.correlation_haircut
+        return clamp(1.0 - 0.6 * max(c, 0.0), 0.4, 1.0)
+
+    def scale_at(self, i, pf, risk, px, marks):
+        """Bank scaleout_frac at the close (taker, slipped) and trail the rest;
+        a dust-sized partial degrades to a full close."""
+        pos = pf.positions.get(self.symbol)
+        if pos is None:
+            return
+        frac = self.risk_cfg.scaleout_frac
+        qty_out = pos.qty * frac
+        if qty_out < self.spec.min_qty or (pos.qty - qty_out) < self.spec.min_qty:
+            self.close_at(i, pf, risk, px, "scale out (full)", marks)
+            return
+        eff = px * (1 - self.slip) if pos.side == LONG else px * (1 + self.slip)
+        fee = qty_out * eff * self.taker
+        tr = pf.scale_out(self.symbol, frac, eff, int(self.ts[i]), fee, "scale out")
+        if tr:
+            risk.on_trade_closed(tr, pf.equity(marks))
+            if self.collect:
+                self.markers.append({"ts": int(self.ts[i]), "kind": "exit", "side": pos.side,
+                                     "price": round(eff, 8), "pnl": round(tr.pnl, 6),
+                                     "reason": "scale out"})
 
     def close_at(self, i, pf, risk, px, reason, marks, maker=False):
         pos = pf.positions.get(self.symbol)
@@ -263,7 +294,9 @@ class _SymSim:
             self.bars_held += 1
             _, reason = self.exits.manage(pos, c[i], h[i], l[i], row.get("atr", 0.0),
                                           row, edge, ev["threshold"], regime, self.bars_held)
-            if reason:
+            if reason == "scale out":
+                self.scale_at(i, pf, risk, c[i], marks)
+            elif reason:
                 self.close_at(i, pf, risk, c[i], reason, marks)
         elif self.pending is None:
             # 5) entry decision for the next bar (pendings reserve slots)
@@ -276,10 +309,13 @@ class _SymSim:
                 size_mult = kelly * risk.health.scalar
                 side = LONG if edge > 0 else SHORT
                 side_d = 1 if side == LONG else -1
-                # correlation haircut: shrink a same-direction add while others are
-                # already on (BTC/ETH move together — don't stack the same bet).
-                if any(pp.direction() == side_d for pp in pf.positions.values()):
-                    size_mult *= self.risk_cfg.correlation_haircut
+                # correlation haircut: shrink a same-direction add by the measured
+                # pair correlation (portfolio backtests precompute it; single-
+                # symbol runs have no siblings and never hit this).
+                held_same = [s for s, pp in pf.positions.items()
+                             if s != sym and pp.direction() == side_d]
+                if held_same:
+                    size_mult *= min(self._pair_haircut(s) for s in held_same)
                 pend = {"side": side, "atr": row.get("atr", 0.0), "regime": regime, "style": style,
                         "size_mult": size_mult, "reason": f"{style} edge {edge:+.2f} P{p_win:.0%} {regime}"}
                 pull = getattr(self.strat, "entry_pullback_atr", 0.0)
@@ -410,6 +446,20 @@ def run_portfolio_backtest(
     if len(common) < warmup + 50:
         return {"error": f"symbols share only {len(common)} aligned bars"}
     common = common[warmup:]   # every symbol has >= warmup bars before this point
+
+    # measured pair correlations over the aligned grid feed the same-direction
+    # size haircut (live measures rolling; here the window is the measurement)
+    if len(syms) >= 2:
+        aligned = {s: np.array([sims[s].c[ts_index[s][t]] for t in common], dtype=np.float64)
+                   for s in syms}
+        rets_by = {s: np.diff(a) / np.maximum(a[:-1], 1e-9) for s, a in aligned.items()}
+        corr_map: dict = {}
+        for ai in range(len(syms)):
+            for bi in range(ai + 1, len(syms)):
+                a, b = syms[ai], syms[bi]
+                corr_map[(a, b)] = float(np.corrcoef(rets_by[a], rets_by[b])[0, 1])
+        for s in syms:
+            sims[s].corr_map = corr_map
 
     sim_ts = {"v": float(common[0]) / 1000.0}
     risk = RiskManager(risk_cfg, clock=lambda: sim_ts["v"])
@@ -615,6 +665,13 @@ TUNABLES: dict[str, tuple] = {
     "be_rr":                  (0.5, 1.6, "risk", "float"),
     "giveback_rr":            (1.6, 3.6, "risk", "float"),
     "giveback_frac":          (0.35, 0.70, "risk", "float"),
+    # regime-conditional exit geometry: the tuner can finally express "let it
+    # run in trends, keep it tight in chop" instead of one compromise trail.
+    "trail_scale_trend":      (0.7, 1.5, "risk", "float"),
+    "trail_scale_chop":       (0.7, 1.5, "risk", "float"),
+    # partial scale-out: bank half at this R, trail the rest (0 = off) — the
+    # measured fix for "showed +0.6R and round-tripped to the stop".
+    "scaleout_rr":            (0.0, 2.5, "risk", "float"),
     "hold_edge_frac":         (0.5, 1.0, "risk", "float"),
     "expected_rr":            (1.6, 3.0, "risk", "float"),
     "time_stop_bars":         (60, 200, "risk", "int"),

@@ -103,6 +103,11 @@ class RiskConfig:
     be_offset_atr: float = 0.15         # breakeven sits entry + this x ATR (covers fees)
     giveback_rr: float = 2.5            # once past this R, protect the open profit
     giveback_frac: float = 0.5          # ...exit if price retraces this fraction of MFE
+    scaleout_rr: float = 0.0            # bank scaleout_frac of a trend trade at this R
+                                        # (0 = off; tuner-owned — variance reducer)
+    scaleout_frac: float = 0.5          # fraction banked when the scale-out fires
+    trail_scale_trend: float = 1.0      # regime-conditional trail width scales
+    trail_scale_chop: float = 1.0       # (tuner-owned: wide in trends, tight in chop)
     hold_edge_frac: float = 0.7         # exit if brain edge flips past this x threshold
     expected_rr: float = 2.2            # assumed winner:loser ratio for Kelly sizing (trend)
     time_stop_bars: int = 120           # long backstop; trends need room to develop

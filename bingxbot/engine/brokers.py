@@ -27,7 +27,7 @@ class Broker:
                             reason: str, bar_ts: int) -> OrderResult:
         raise NotImplementedError
 
-    async def close_position(self, symbol: str, reason: str) -> OrderResult:
+    async def close_position(self, symbol: str, reason: str, frac: float | None = None) -> OrderResult:
         raise NotImplementedError
 
     async def flatten_all(self, reason: str) -> None:
@@ -115,13 +115,25 @@ class PaperBroker(Broker):
                  side, symbol, lim)
         return OrderResult(ok=False, error="pullback limit unfilled")
 
-    async def close_position(self, symbol: str, reason: str) -> OrderResult:
+    async def close_position(self, symbol: str, reason: str, frac: float | None = None) -> OrderResult:
         pos = self.portfolio.positions.get(symbol)
         if pos is None:
             return OrderResult(ok=False, error="no position")
         px = self._fill_price(symbol, is_buy=(pos.side == SHORT))
         if px <= 0:
             return OrderResult(ok=False, error="no market price")
+        spec = self.specs.get(symbol, ContractSpec(symbol))
+        if frac is not None and 0.0 < frac < 1.0:
+            qty_out = pos.qty * frac
+            # dust guard: if either leg would violate exchange minimums, the
+            # partial degenerates to a full close rather than stranding dust.
+            if qty_out >= spec.min_qty and (pos.qty - qty_out) >= spec.min_qty:
+                fee = qty_out * px * self.taker_fee
+                tr = self.portfolio.scale_out(symbol, frac, px, now_ms(), fee, reason)
+                if tr:
+                    log.info("[paper] SCALE-OUT %s %s %.0f%% @ %.6g pnl=%.4f (%s)",
+                             pos.side, symbol, frac * 100, px, tr.pnl, reason)
+                    return OrderResult(ok=True, filled_price=px, filled_qty=qty_out, fee=fee)
         fee = pos.qty * px * self.taker_fee
         planned_risk = abs(pos.entry_price - pos.stop_price) * pos.qty if pos.stop_price > 0 else 0.0
         tr = self.portfolio.close_position(symbol, px, now_ms(), fee, reason, planned_risk)
@@ -337,18 +349,25 @@ class LiveBroker(Broker):
             pass
         return 0.0, 0.0, 0.0
 
-    async def close_position(self, symbol: str, reason: str) -> OrderResult:
+    async def close_position(self, symbol: str, reason: str, frac: float | None = None) -> OrderResult:
         pos = self.portfolio.positions.get(symbol)
         if pos is None:
             return OrderResult(ok=False, error="no position")
         spec = self.specs.get(symbol, ContractSpec(symbol))
+        partial = frac is not None and 0.0 < frac < 1.0
+        close_qty = round_step(pos.qty * frac, spec.qty_precision) if partial else \
+            round_step(pos.qty, spec.qty_precision)
+        # dust guard: degrade a partial to a full close if either leg would
+        # violate exchange minimums.
+        if partial and (close_qty < spec.min_qty or (pos.qty - close_qty) < spec.min_qty):
+            partial, close_qty = False, round_step(pos.qty, spec.qty_precision)
         try:
             resp = await self.rest.place_order(
                 symbol=symbol,
                 side=SELL if pos.side == LONG else BUY,
                 position_side=pos.side,
                 order_type="MARKET",
-                quantity=round_step(pos.qty, spec.qty_precision),
+                quantity=close_qty,
             )
         except BingXAPIError as e:
             if "position" in e.msg.lower() or e.code in (80012, 101205, 101400):
@@ -363,7 +382,14 @@ class LiveBroker(Broker):
         order_id = str(resp.get("orderId", ""))
         fill_px, fee = await self._await_fill(symbol, order_id, fallback=pos.entry_price)
         if fee <= 0:
-            fee = pos.qty * fill_px * spec.taker_fee
+            fee = close_qty * fill_px * spec.taker_fee
+        if partial:
+            tr = self.portfolio.scale_out(symbol, close_qty / pos.qty, fill_px, now_ms(), fee, reason)
+            if tr:
+                log.info("[LIVE] SCALE-OUT %s %s qty=%.6g @ %.6g pnl=%.4f (%s)",
+                         pos.side, symbol, close_qty, fill_px, tr.pnl, reason)
+            return OrderResult(ok=True, order_id=order_id, filled_price=fill_px,
+                               filled_qty=close_qty, fee=fee)
         planned_risk = abs(pos.entry_price - pos.stop_price) * pos.qty if pos.stop_price > 0 else 0.0
         tr = self.portfolio.close_position(symbol, fill_px, now_ms(), fee, reason, planned_risk)
         try:

@@ -63,6 +63,40 @@ class Portfolio:
         self.cash -= amount
         self.funding_paid += amount
 
+    def scale_out(self, symbol: str, frac: float, exit_price: float, exit_ts: int,
+                  exit_fee: float, reason: str) -> TradeRecord | None:
+        """Realize `frac` of a position at exit_price, keeping the rest open.
+        The banked portion becomes its own TradeRecord (with its share of the
+        entry fee); qty and entry_fee shrink proportionally on the remainder."""
+        pos = self.positions.get(symbol)
+        if pos is None or not 0.0 < frac < 1.0:
+            return None
+        qty_out = pos.qty * frac
+        gross = (exit_price - pos.entry_price) * qty_out * pos.direction()
+        fee_part = pos.entry_fee * frac
+        self.cash += gross - exit_fee       # entry fee already left cash at open
+        net = gross - exit_fee - fee_part
+        risk_money = pos.init_risk * qty_out if pos.init_risk > 0 else 0.0
+        d = pos.direction()
+        adv = pos.trough_price if pos.trough_price > 0 else pos.entry_price
+        fav = pos.peak_price if pos.peak_price > 0 else pos.entry_price
+        tr = TradeRecord(
+            symbol=symbol, side=pos.side, qty=qty_out,
+            entry_price=pos.entry_price, exit_price=exit_price,
+            entry_ts=pos.opened_ts, exit_ts=exit_ts,
+            pnl=round(net, 8), fees=round(fee_part + exit_fee, 8),
+            reason_open=pos.entry_reason, reason_close=reason,
+            r_multiple=round(net / risk_money, 3) if risk_money > 0 else 0.0,
+            mode=self.mode,
+            mae_r=round(max(0.0, (pos.entry_price - adv) * d / pos.init_risk), 3) if pos.init_risk > 0 else 0.0,
+            mfe_r=round(max(0.0, (fav - pos.entry_price) * d / pos.init_risk), 3) if pos.init_risk > 0 else 0.0,
+        )
+        pos.qty -= qty_out
+        pos.entry_fee -= fee_part
+        pos.scaled_out = True
+        self.trades.append(tr)
+        return tr
+
     def close_position(self, symbol: str, exit_price: float, exit_ts: int,
                        exit_fee: float, reason: str, planned_risk: float = 0.0) -> TradeRecord | None:
         pos = self.positions.pop(symbol, None)
