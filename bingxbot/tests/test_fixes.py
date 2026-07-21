@@ -406,6 +406,38 @@ def test_24h_range_features():
         assert k in FEATURE_NAMES
 
 
+def test_feed_seed_covers_24h_window():
+    """Seeds must fill the widest rolling window (24h) or the features stay
+    NaN for hours after a fresh start — 1m needs 1440 bars, not just 1200."""
+    from bingxbot.data.feed import SyntheticFeed, bars_24h
+    assert bars_24h("1m") == 1440
+    assert bars_24h("5m") == 288
+    assert bars_24h("1h") == 24
+    feed = SyntheticFeed(["BTC-USDT"], "1m", warmup_bars=20, speed=1000.0, seed=3)
+    feed._seed_symbol("BTC-USDT")
+    assert len(feed.states["BTC-USDT"].candles) >= 1441
+
+
+def test_entry_context_captures_24h_location():
+    """The journal must record where in the 24h range each trade entered —
+    finite values pass through, an unfilled window becomes None (never NaN,
+    which would poison both the JSONL and the bucketed analytics)."""
+    import types
+
+    from bingxbot.engine.trader import TraderEngine
+    ctx = types.SimpleNamespace(mtf={})
+    ev = {"regime": "TREND_UP", "edge": 0.5, "p_win": 0.6, "alloc": {}, "desk_sig": {}}
+    row = {"range_pos_24h": 0.8125, "dist_hi_24h": 1.5, "dist_lo_24h": 6.5,
+           "vwap24_dev": 0.75, "mtf_align": 0.2, "mtf_bias": 0.3, "funding_rate": 0.0001}
+    ec = TraderEngine._entry_context(ctx, ev, row)
+    assert ec["rpos24"] == pytest.approx(0.8125)
+    assert ec["dist_hi24"] == pytest.approx(1.5)
+    assert ec["vwap24_dev"] == pytest.approx(0.75)
+    nan_row = dict(row, range_pos_24h=float("nan"), dist_hi_24h=float("nan"))
+    ec2 = TraderEngine._entry_context(ctx, ev, nan_row)
+    assert ec2["rpos24"] is None and ec2["dist_hi24"] is None
+
+
 # --------------------------------------------- brain learning survives restarts
 
 def test_brain_state_roundtrip():
