@@ -386,6 +386,63 @@ def test_stop_out_shows_full_mae():
     assert tr.mae_r == pytest.approx(1.0), "a 1R stop-out must show 1R of heat"
 
 
+# --------------------------------------------- 24h range context features
+
+def test_24h_range_features():
+    candles = synthetic_candles("BTC-USDT", "15m", 800, seed=13)
+    ff = FeatureFrame(candles_to_arrays(candles), interval="15m")
+    w24 = 96                                  # 24h of 15m bars
+    import numpy as np_
+    h = np_.array([c.high for c in candles])
+    l = np_.array([c.low for c in candles])
+    assert float(ff.f["hi_24h"][-1]) == pytest.approx(h[-w24:].max())
+    assert float(ff.f["lo_24h"][-1]) == pytest.approx(l[-w24:].min())
+    rp = float(ff.f["range_pos_24h"][-1])
+    assert 0.0 <= rp <= 1.0, "price sits inside its own 24h range by construction"
+    assert float(ff.f["dist_hi_24h"][-1]) >= 0.0 and float(ff.f["dist_lo_24h"][-1]) >= 0.0
+    # and they feed the meta-model feature vector
+    from bingxbot.ml.meta import FEATURE_NAMES
+    for k in ("range_pos_24h", "dist_hi_24h", "dist_lo_24h", "vwap24_dev"):
+        assert k in FEATURE_NAMES
+
+
+# --------------------------------------------- brain learning survives restarts
+
+def test_brain_state_roundtrip():
+    from bingxbot.strategy.brain import TradingBrain
+    ff = FeatureFrame(candles_to_arrays(synthetic_candles("BTC-USDT", "5m", 1200, seed=6)),
+                      interval="5m")
+    micro0 = {"obi": 0.0, "flow": 0.0, "cvd_slope": 0.0, "spread_bps": 1.0, "ticks_per_s": 0.0}
+    a = TradingBrain()
+    for i in range(300, ff.n):
+        a.evaluate(ff.row(i), micro0, {})
+    assert a.graded > 100
+    b = TradingBrain()
+    assert b.load_state(a.state_dict()) is True
+    assert b.graded == a.graded
+    assert b.alpha_w == pytest.approx(a.alpha_w)
+    assert b.calibrator.n == a.calibrator.n and b.calibrator.w == pytest.approx(a.calibrator.w)
+    assert b.allocator.weights() == pytest.approx(a.allocator.weights())
+    assert b.beta == pytest.approx(a.beta, abs=1e-6)
+    # a changed alpha roster refuses the stale state
+    st = a.state_dict()
+    st["alphas"] = st["alphas"][:-1]
+    assert TradingBrain().load_state(st) is False
+
+
+def test_de_population_growth_on_load(tmp_path):
+    from bingxbot.engine.search import DEOptimizer
+    p = tmp_path / "tuner_state.json"
+    small = DEOptimizer(pop_size=8, seed=1, state_path=p)
+    small.seed_population()
+    small.save()
+    big = DEOptimizer(pop_size=16, seed=2, state_path=p)
+    assert big.load() is True
+    assert len(big.pop) == 16 and len(big.fitness) == 16
+    assert big.pop[:8] == small.pop, "saved members survive; growth adds explorers"
+    assert all(f <= -1e8 for f in big.fitness[8:]), "new members start unscored"
+
+
 # ------------------------------------------- anti-churn threshold + Kelly b
 
 def test_adaptive_threshold_never_loosens_below_base():

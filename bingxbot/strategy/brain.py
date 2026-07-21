@@ -333,6 +333,74 @@ class TradingBrain:
         lean = 0.6 * micro.get("flow", 0.0) + 0.4 * micro.get("obi", 0.0)
         return not (abs(lean) > 0.35 and lean * edge < 0)
 
+    # ------------------------------------------------------------- persistence
+
+    def state_dict(self) -> dict:
+        """Everything the online learning has earned — hedge weights, desk
+        performance, calibrator, beta, threshold history. Restarts used to
+        reset all of it to uniform, throwing away days of adaptation."""
+        return {
+            "ver": 1, "alphas": list(ALPHAS),
+            "alpha_w": {nm: round(w, 8) for nm, w in self.alpha_w.items()},
+            "stats": {nm: [st.calls, st.hits, round(st.payoff_sum, 6)]
+                      for nm, st in self.alpha_stats.items()},
+            "alloc_log_w": {d: round(w, 8) for d, w in self.allocator._log_w.items()},
+            "alloc_w": {d: round(p.weight, 8) for d, p in self.allocator.perf.items()},
+            "alloc_perf": {d: [round(p.ew_payoff, 8), round(p.ew_win, 8),
+                               round(p.ew_var, 8), p.graded, p.disabled]
+                           for d, p in self.allocator.perf.items()},
+            "cal": {"w": [round(x, 8) for x in self.calibrator.w],
+                    "b": round(self.calibrator.b, 8), "n": self.calibrator.n},
+            "beta": round(self.beta, 6), "threshold": round(self.threshold, 6),
+            "graded": self.graded,
+            "score_hist": [round(x, 4) for x in list(self._score_hist)[-240:]],
+        }
+
+    def load_state(self, d: dict) -> bool:
+        """Restore a persisted learning state. Refuses (returns False) when the
+        alpha roster changed between builds — stale weights for a different
+        floor would be worse than a fresh start."""
+        if not isinstance(d, dict) or d.get("ver") != 1 or d.get("alphas") != list(ALPHAS):
+            return False
+        try:
+            for nm, w in d.get("alpha_w", {}).items():
+                if nm in self.alpha_w:
+                    self.alpha_w[nm] = float(w)
+            # saved weights are already desk-normalized; re-normalizing here
+            # would apply an extra shrink toward uniform. The next graded bar
+            # renormalizes naturally.
+            for nm, s in d.get("stats", {}).items():
+                if nm in self.alpha_stats:
+                    st = self.alpha_stats[nm]
+                    st.calls, st.hits, st.payoff_sum = int(s[0]), int(s[1]), float(s[2])
+            for dk, lw in d.get("alloc_log_w", {}).items():
+                if dk in self.allocator._log_w:
+                    self.allocator._log_w[dk] = float(lw)
+            for dk, pv in d.get("alloc_perf", {}).items():
+                perf = self.allocator.perf.get(dk)
+                if perf is not None:
+                    perf.ew_payoff, perf.ew_win = float(pv[0]), float(pv[1])
+                    perf.ew_var, perf.graded = float(pv[2]), int(pv[3])
+                    perf.disabled = bool(pv[4])
+            # restore the exact stored weights — recomputing from the (already
+            # decayed) log-weights would drift them; the next graded call
+            # recomputes naturally anyway.
+            for dk, w in d.get("alloc_w", {}).items():
+                if dk in self.allocator.perf:
+                    self.allocator.perf[dk].weight = float(w)
+            cal = d.get("cal", {})
+            if len(cal.get("w", [])) == len(self.calibrator.w):
+                self.calibrator.w = [float(x) for x in cal["w"]]
+                self.calibrator.b = float(cal.get("b", 0.0))
+                self.calibrator.n = int(cal.get("n", 0))
+            self.beta = float(d.get("beta", 1.0))
+            self.threshold = float(d.get("threshold", self.base_threshold))
+            self.graded = int(d.get("graded", 0))
+            self._score_hist.extend(float(x) for x in d.get("score_hist", []))
+            return True
+        except (TypeError, ValueError, KeyError, IndexError):
+            return False
+
     # ------------------------------------------------------------- exposure
 
     def alpha_state(self, name: str, score: float) -> str:

@@ -554,6 +554,8 @@ class Orchestrator:
         self.engine.active_champion_id = self.active_champion_id
         for sym, ov in self.symbol_overlays.items():   # overlays survive restarts
             self.engine.set_overlay(sym, ov.get("params"))
+        if mode == MODE_PAPER and snap:                # learning survives restarts too
+            self.engine.load_brain_states(snap.get("brains"))
         await self.engine.start()
 
         from ..engine.autotuner import AutoTuner

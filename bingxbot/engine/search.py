@@ -289,5 +289,13 @@ class DEOptimizer:
         if len(self.fitness) != len(self.pop):
             self.fitness = [-1e9] * len(self.pop)
         self.generation = int(d.get("generation", 0))
-        self.pop_size = len(self.pop)
+        if len(self.pop) < self.pop_size:
+            # the configured population grew (e.g. the compiled kernel made
+            # bigger gene pools cheap): keep every saved member and top up with
+            # fresh explorers, marked unscored so they're evaluated next cycle.
+            while len(self.pop) < self.pop_size:
+                self.pop.append(self._rand_vec())
+                self.fitness.append(-1e9)
+        else:
+            self.pop_size = len(self.pop)
         return True
