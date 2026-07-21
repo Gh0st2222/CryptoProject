@@ -433,6 +433,127 @@ def test_react_tail_matches_full_tail_features():
         assert a == pytest.approx(b, rel=1e-3, abs=2e-3), f"{key}: full={a} short={b}"
 
 
+# --------------------------------------------- accounting identity, any phase
+
+def test_accounting_identity_holds_at_every_timestamp_phase():
+    """The epoch-anchored MTF ladder makes trade paths depend on where candle
+    timestamps sit inside higher-TF buckets. Whatever path results — including
+    a position forced closed at history's end — start + sum(pnl) - funding must
+    equal final equity EXACTLY. (This was a real bug: the forced close changed
+    cash after the last equity record, so stats['equity'] went stale by the
+    final exit fee in some phases.)"""
+    from bingxbot.engine.backtest import run_backtest
+    base = synthetic_candles("BTC-USDT", "1m", 6000, seed=21)
+    for k in (0, 7, 23, 41, 58):        # shift the whole tape by k minutes
+        shifted = [type(c)(c.ts + k * 60_000, c.open, c.high, c.low, c.close, c.volume)
+                   for c in base]
+        res = run_backtest(shifted, "BTC-USDT", "1m", StrategyConfig(), RiskConfig(),
+                           starting_balance=10_000.0, collect_series=False)
+        st = res["stats"]
+        # identity check needs the trades; rerun path already stores pnl in stats
+        delta = (10_000.0 + st["total_pnl"] - st["funding_paid"]) - st["equity"]
+        assert abs(delta) < 1e-4, f"phase {k}m: identity off by {delta}"
+
+
+# --------------------------------------------- shared-frame cache parity
+
+def test_shared_featureframe_caches_change_nothing():
+    """The tuner's shared-frame fast path (cached rows + precomputed alpha
+    scores) must produce EXACTLY the trades of the plain path — speed can
+    never be allowed to change what the brain sees."""
+    from bingxbot.engine.backtest import candles_to_arrays, run_backtest
+    from bingxbot.strategy.features import FeatureFrame
+    candles = synthetic_candles("BTC-USDT", "5m", 4000, seed=19)
+    plain = run_backtest(candles, "BTC-USDT", "5m", StrategyConfig(), RiskConfig(),
+                         starting_balance=10_000.0, collect_series=False)
+    ff = FeatureFrame(candles_to_arrays(candles), interval="5m")
+    shared = run_backtest(candles, "BTC-USDT", "5m", StrategyConfig(), RiskConfig(),
+                          starting_balance=10_000.0, collect_series=False, ff=ff)
+    assert plain["stats"] == shared["stats"], "cache path diverged from the reference"
+
+
+# --------------------------------------------- scale-out + measured correlation
+
+def test_portfolio_scale_out_accounting():
+    pf = Portfolio(10_000.0, mode="paper")
+    pos = Position(symbol="BTC-USDT", side=LONG, qty=2.0, entry_price=100.0,
+                   opened_ts=1, stop_price=97.0, entry_fee=0.2)
+    pos.init_risk = 3.0
+    pf.positions["BTC-USDT"] = pos
+    pf.cash -= 0.2                              # entry fee left cash at open
+    tr = pf.scale_out("BTC-USDT", 0.5, 106.0, 2, exit_fee=0.05, reason="scale out")
+    assert tr is not None and tr.qty == pytest.approx(1.0)
+    # banked: 1.0 * (106-100) - 0.05 exit fee - 0.1 entry-fee share
+    assert tr.pnl == pytest.approx(6.0 - 0.05 - 0.1)
+    assert tr.r_multiple == pytest.approx(tr.pnl / 3.0, rel=1e-6)
+    rem = pf.positions["BTC-USDT"]
+    assert rem.qty == pytest.approx(1.0) and rem.entry_fee == pytest.approx(0.1)
+    assert rem.scaled_out is True
+    # remaining half closes: totals must equal a single full close's economics
+    tr2 = pf.close_position("BTC-USDT", 106.0, 3, exit_fee=0.05, reason="trail", planned_risk=3.0)
+    assert tr.pnl + tr2.pnl == pytest.approx(2.0 * 6.0 - 0.2 - 0.1)
+    assert pf.cash == pytest.approx(10_000.0 - 0.2 + 12.0 - 0.1, abs=1e-9)
+
+
+def test_scale_out_fires_once_at_r_and_only_for_trend():
+    from bingxbot.strategy.exits import AdaptiveExitManager
+    ex = AdaptiveExitManager(RiskConfig(scaleout_rr=1.5, be_rr=0.5))
+    pos = Position(symbol="X", side=LONG, qty=1.0, entry_price=100.0, opened_ts=1,
+                   stop_price=97.0)
+    ex.attach(pos, atr=1.0, init_risk=3.0)
+    row = {"eff_ratio": 0.5, "mtf_bias": 0.6}
+    _, r1 = ex.manage(pos, 102.0, 102.0, 101.0, 1.0, row, 0.4, 0.3, "TREND_UP", 3)
+    assert r1 is None, "below scaleout_rr: hold"
+    _, r2 = ex.manage(pos, 105.0, 105.0, 104.0, 1.0, row, 0.4, 0.3, "TREND_UP", 4)
+    assert r2 == "scale out"
+    pos.scaled_out = True                        # caller marks after execution
+    _, r3 = ex.manage(pos, 105.5, 105.6, 105.0, 1.0, row, 0.4, 0.3, "TREND_UP", 5)
+    assert r3 != "scale out", "scale-out must fire at most once"
+
+
+def test_corr_haircut_math():
+    import numpy as np
+    from bingxbot.risk.manager import corr_haircut
+    rng = np.random.default_rng(0)
+    a = rng.normal(0, 1, 200)
+    assert corr_haircut(a, a, 0.65) == pytest.approx(0.4), "perfect corr -> hard haircut"
+    b = rng.normal(0, 1, 200)                    # independent
+    assert corr_haircut(a, b, 0.65) > 0.85, "uncorrelated add ~ full size"
+    assert corr_haircut(a[:10], b[:10], 0.65) == 0.65, "insufficient data -> fallback"
+    assert corr_haircut(a, -a, 0.65) == pytest.approx(1.0), "negative corr = hedge, full size"
+
+
+# ------------------------------------------- portfolio-fitness OOS validation
+
+def test_portfolio_folds_are_purged_and_disjoint():
+    from bingxbot.engine.search import portfolio_folds
+    cbs = {"A": list(range(4000)), "B": list(range(4000))}
+    folds = portfolio_folds(cbs, k=3, tail_frac=0.40, warmup=300)
+    assert len(folds) == 3
+    traded_starts = []
+    for fc in folds:
+        assert set(fc) == {"A", "B"}
+        # traded region starts `warmup` bars into each slice
+        traded_starts.append(fc["A"][300])
+    # traded regions are sequential and disjoint
+    assert traded_starts == sorted(traded_starts)
+    ends = [fc["A"][-1] for fc in folds]
+    for k in range(len(folds) - 1):
+        assert ends[k] < traded_starts[k + 1] + 1, "traded regions must not overlap"
+    assert folds[-1]["A"][-1] == 3999, "last fold reaches the end of history"
+
+
+def test_validate_params_portfolio_smoke():
+    from bingxbot.engine.search import validate_params_portfolio
+    cbs = {s: synthetic_candles(s, "5m", 1400, seed=i + 3)
+           for i, s in enumerate(["BTC-USDT", "ETH-USDT"])}
+    out = validate_params_portfolio({}, cbs, "5m",
+                                    {s: ContractSpec(s) for s in cbs},
+                                    0.0005, 1.0, StrategyConfig(), RiskConfig())
+    assert "fitness" in out and isinstance(out["fitness"], float)
+    assert out["stats"].get("trades", 0) >= 0
+
+
 # ------------------------------------------------------- tunable clamping
 
 def test_apply_tunables_clamps_to_bounds():

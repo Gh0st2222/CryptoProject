@@ -30,8 +30,9 @@ from ..config import MODE_IDLE
 from ..exchange.models import ContractSpec
 from ..util import clamp
 from .backtest import TUNABLES
-from .search import (DEOptimizer, recency_weights, robust_aggregate, score_fold,
-                     validate_params)
+from .search import (DEOptimizer, portfolio_folds, recency_weights,
+                     robust_aggregate, score_fold, validate_params,
+                     validate_params_portfolio)
 
 log = logging.getLogger("autotuner")
 
@@ -44,6 +45,7 @@ DEFLATE_CAP = 0.10          # never demand more than +10% extra margin
 MIN_ABS_FITNESS = 0.3       # ...and be clearly profitable (positive risk-adjusted score)
 OVERFIT_LAMBDA = 0.5        # penalty weight on the in-sample -> OOS drop
 TOP_K_VALIDATE = 5          # validate this many training-best members OOS, keep the best generalizer
+OOS_FOLDS = 3               # purged sequential portfolio folds a champion must earn across
 VAULT_CANDIDATES = 4        # also re-validate this many top vault champions each cycle (candidate pool, not graveyard)
 STALL_REINJECT = 20         # cycles without a promotion before a diversity restart
 DEMOTE_FLOOR = -1.0         # incumbent scoring below this on the TRADED basket is toxic...
@@ -59,6 +61,7 @@ DUTY_CYCLE = 0.35           # research may use at most ~this fraction of wall ti
                             # the sleep stretches with the measured cycle length so
                             # a slow host isn't pinned wall-to-wall by the tuner
 VAULT_REVAL_EVERY = 15      # re-validate the champion vault every N cycles
+META_TRAIN_EVERY = 12       # retrain the meta-labeling model every N cycles
 MIN_BARS = 3000
 MIN_FOLD_BARS = 450         # a training fold below this can't produce a meaningful
                             # backtest (warmup + a real trading tail)
@@ -138,6 +141,7 @@ class AutoTuner:
         self.next_run_ts = 0.0
         self.champion_fitness = 0.0
         self.last_cycle: dict | None = None
+        self.last_meta: dict | None = None   # latest meta-model training result
         self.history: list[dict] = []
 
     def start(self) -> None:
@@ -332,31 +336,40 @@ class AutoTuner:
                 uniq.append(c)
         cands = uniq
 
-        # every candidate × every basket symbol, one parallel batch; a candidate's
-        # OOS fitness is its MEAN across the basket (must earn on the board).
-        nb = len(basket)
+        # OOS validation is now PORTFOLIO fitness across purged sequential
+        # folds: every candidate runs the shared-account simulator over the
+        # traded basket for each of the last K disjoint windows. Promotion
+        # answers "does this make the ACCOUNT richer, consistently" — not
+        # "does it flatter one symbol in one lucky window".
+        cbs_full: dict[str, list] = {}
+        for tsym in self._traded_symbols()[:4]:
+            hit = self._cache.get(tsym)
+            if hit and len(hit[0]) >= MIN_BARS:
+                cbs_full[tsym] = hit[0]
+        if not cbs_full:
+            cbs_full = {symbol: candles}
+        folds_cbs = portfolio_folds(cbs_full, k=OOS_FOLDS)
+        if not folds_cbs:
+            return False
+        nf_oos = len(folds_cbs)
+        specs_map = {s: self.orch.specs.get(s, ContractSpec(s)) for s in cbs_full}
         val_args = []
         for c in cands + [{"params": champ}]:
-            for bsym, bvalid in basket:
-                bspec = self.orch.specs.get(bsym, ContractSpec(bsym))
-                val_args.append((c["params"], bvalid, bsym, interval, bspec,
-                                 bspec.taker_fee, slip, strat, risk))
-        val_res = await self.orch.map_cpu(validate_params, val_args, research=True)
+            for fc in folds_cbs:
+                val_args.append((c["params"], fc, interval, specs_map, taker, slip, strat, risk))
+        val_res = await self.orch.map_cpu(validate_params_portfolio, val_args, research=True)
 
-        def basket_fit(idx: int) -> tuple[float, dict]:
-            rs = val_res[idx * nb:(idx + 1) * nb]
+        def cand_fit(idx: int) -> tuple[float, dict, list[float]]:
+            rs = val_res[idx * nf_oos:(idx + 1) * nf_oos]
             fits = [r["fitness"] for r in rs]
-            mean = sum(fits) / max(len(fits), 1)
-            # mean blended with the WORST symbol: a set brilliant on three
-            # symbols and toxic on the fourth must not average its way into
-            # promotion — it has to be at least tolerable everywhere we trade.
-            fit = 0.7 * mean + 0.3 * min(fits) if fits else -1.0
-            return fit, rs[0]["stats"]          # stats shown from the research symbol
+            fit = 0.7 * sum(fits) / len(fits) + 0.3 * min(fits)
+            return fit, rs[-1]["stats"], fits    # stats from the most recent fold
 
-        champ_fit, _ = basket_fit(len(cands))
+        champ_fit, _, champ_folds = cand_fit(len(cands))
         best, best_i, best_adj, best_stats = None, -1, -1e18, {}
+        best_folds: list[float] = []
         for i, c in enumerate(cands):
-            oos, stats0 = basket_fit(i)
+            oos, stats0, fold_fits_oos = cand_fit(i)
             # DE members carry an overfit penalty (in-sample -> OOS drop); vault
             # champions are scored raw — they've already proven out-of-sample.
             adj = oos - (OVERFIT_LAMBDA * max(0.0, c["train_fit"] - oos) if c["train_fit"] is not None else 0.0)
@@ -364,6 +377,7 @@ class AutoTuner:
                 self.orch.set_champion_current(c["cid"], oos, stats0)  # keep its CURRENT eval fresh
             if adj > best_adj:
                 best, best_i, best_adj, best_stats = c, i, adj, stats0
+                best_folds = fold_fits_oos
 
         self.cycles += 1
         self.champion_fitness = round(champ_fit, 3)
@@ -375,7 +389,12 @@ class AutoTuner:
         # thousands of tries is selection bias, not signal.
         self._tested_oos += len(cands)
         margin = IMPROVE_MARGIN + min(DEFLATE_CAP, DEFLATE_K * math.log10(1 + self._tested_oos / 10))
-        if different and best_adj > max(champ_fit * margin, MIN_ABS_FITNESS):
+        # rank stability: beyond beating the champion's blended score, the
+        # challenger must beat it in a MAJORITY of the purged folds — a set
+        # that wins on average but loses most windows is one lucky window.
+        beat = sum(1 for a, b in zip(best_folds, champ_folds) if a > b)
+        if (different and best_adj > max(champ_fit * margin, MIN_ABS_FITNESS)
+                and beat * 2 > nf_oos):
             self.orch.apply_params(best_params)
             self.improvements += 1
             promoted = True
@@ -389,6 +408,8 @@ class AutoTuner:
             self.history.append({
                 "ts": int(time.time() * 1000),
                 "from_fitness": round(champ_fit, 3), "to_fitness": round(best_adj, 3),
+                "folds_beaten": f"{beat}/{nf_oos}",
+                "fold_fits": [round(f, 2) for f in best_folds],
                 "valid_wr": round(vs.get("win_rate", 0), 3), "valid_pf": round(vs.get("profit_factor", 0), 3),
                 "gen": self.de.generation, "source": best["source"], "champion_id": cid,
                 "params": {k: best_params[k] for k in ("base_threshold", "risk_per_trade", "sl_atr_min",
@@ -438,11 +459,20 @@ class AutoTuner:
         # globally applied set on one specific traded symbol, that symbol's brain
         # gets the winner's scalars as an overlay (risk geometry stays global).
         try:
-            per_sym = [[val_res[i * nb + j]["fitness"] for j in range(nb)]
-                       for i in range(len(cands))]
-            applied_row = best_i if promoted else len(cands)
-            applied_fits = [val_res[applied_row * nb + j]["fitness"] for j in range(nb)]
+            # overlays still need per-symbol evidence: one single-symbol batch
+            # (cands + the applied set) on the most recent held-out window.
+            nb = len(basket)
+            ov_args = []
             applied_params = best_params if promoted else champ
+            for c in cands + [{"params": applied_params}]:
+                for bsym, bvalid in basket:
+                    bspec = self.orch.specs.get(bsym, ContractSpec(bsym))
+                    ov_args.append((c["params"], bvalid, bsym, interval, bspec,
+                                    bspec.taker_fee, slip, strat, risk))
+            ov_res = await self.orch.map_cpu(validate_params, ov_args, research=True)
+            per_sym = [[ov_res[i * nb + j]["fitness"] for j in range(nb)]
+                       for i in range(len(cands))]
+            applied_fits = [ov_res[len(cands) * nb + j]["fitness"] for j in range(nb)]
             overlays = select_overlays([c["params"] for c in cands], per_sym,
                                        applied_fits, applied_params, [s for s, _ in basket])
             self.orch.update_symbol_overlays(overlays, traded=[s for s, _ in basket])
@@ -493,6 +523,26 @@ class AutoTuner:
 
         if self.cycles % VAULT_REVAL_EVERY == 0:
             await self._revalidate_vault(basket, interval, slip, strat, risk)
+
+        # meta-labeling research: retrain the P(win) model on the basket's full
+        # history every so often (walk-forward credentialed; persists only if
+        # it beats the incumbent's held-out AUC). Runs on the research pool.
+        if self.cycles % META_TRAIN_EVERY == 0:
+            try:
+                from ..ml.meta import train_from_candles
+                cbs = {}
+                for tsym in self._traded_symbols()[:4]:
+                    tc = self._cache.get(tsym)
+                    if tc and len(tc[0]) >= MIN_BARS:
+                        cbs[tsym] = tc[0]
+                if cbs:
+                    res = (await self.orch.map_cpu(train_from_candles,
+                                                   [(cbs, interval, strat, risk)],
+                                                   research=True))[0]
+                    self.last_meta = {**res, "ts": int(time.time() * 1000)}
+                    log.info("meta-model training: %s", res)
+            except Exception as e:  # noqa: BLE001 — ML must never break tuning
+                log.warning("meta training failed: %s", e)
 
         self.last_cycle = {
             "ts": int(time.time() * 1000), "symbol": symbol,
@@ -548,8 +598,22 @@ class AutoTuner:
             "research_symbol": self.research_symbol,
             "next_run_ts": int(self.next_run_ts * 1000),
             "last_cycle": self.last_cycle,
+            "meta": self._meta_status(),
             "history": self.history[-12:][::-1],
         }
+
+    def _meta_status(self) -> dict:
+        try:
+            from ..ml.meta import get_meta
+            m = get_meta()
+            if m is None:
+                return {"model": None, "last_training": self.last_meta}
+            return {"model": {"auc": round(m.auc, 4), "n": m.n, "ready": m.ready,
+                              "weight": round(m.blend_weight, 3),
+                              "age_h": round((time.time() - m.trained_ts) / 3600, 1)},
+                    "last_training": self.last_meta}
+        except Exception as e:  # noqa: BLE001
+            return {"model": None, "error": str(e)}
 
 
 class _NullJob:

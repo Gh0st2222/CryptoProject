@@ -4,6 +4,7 @@ uvicorn[standard]>=0.29
 numpy>=1.26
 pydantic>=2.6
 python-dotenv>=1.0
+scikit-learn>=1.4    # meta-labeling P(win) model (HistGradientBoosting)
 
 # dev / tests
 pytest>=8.0

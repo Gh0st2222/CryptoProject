@@ -25,7 +25,7 @@ from pathlib import Path
 from ..config import ROOT, RiskConfig, StrategyConfig
 from ..util import clamp
 from .backtest import (TUNABLES, _apply_params, _coerce, _fitness,
-                       candles_to_arrays, run_backtest)
+                       candles_to_arrays, run_backtest, run_portfolio_backtest)
 from ..strategy.features import FeatureFrame
 
 STATE_PATH = ROOT / "data_cache" / "tuner_state.json"
@@ -63,6 +63,44 @@ def validate_params(params, valid_candles, symbol, interval, spec, taker, slip,
                        slippage_bps=slip, collect_series=False, ff=ff)
     st = res.get("stats", {})
     return {"fitness": _fitness(st) if "error" not in res else -1.0, "stats": st}
+
+
+def validate_params_portfolio(params, candles_by_symbol: dict, interval, specs: dict,
+                              taker, slip, base_strat: StrategyConfig,
+                              base_risk: RiskConfig) -> dict:
+    """Score one param-set the way the ACCOUNT actually experiences it: a
+    shared-portfolio backtest over the traded basket's window — one equity
+    pool, one position cap, correlation haircut, one kill switch. This is the
+    promotion gate's unit of evidence; a single-symbol run can flatter a set
+    that the portfolio (which is what compounds) would reject."""
+    s, r = _apply_params(base_strat, base_risk, params)
+    res = run_portfolio_backtest(candles_by_symbol, interval, s, r, specs,
+                                 taker_fee=taker, slippage_bps=slip, warmup=300)
+    if "error" in res:
+        return {"fitness": -1.0, "stats": {}}
+    st = res.get("stats", {})
+    return {"fitness": _fitness(st), "stats": st}
+
+
+def portfolio_folds(cbs: dict[str, list], k: int = 3, tail_frac: float = 0.40,
+                    warmup: int = 300) -> list[dict[str, list]]:
+    """Sequential purged OOS folds over the basket's most recent `tail_frac`:
+    each fold's TRADED region is disjoint (the warmup lead-in overlaps earlier
+    data as indicator warmup only, never as traded bars), so one lucky window
+    can't promote a champion — it must earn across all of them."""
+    folds: list[dict[str, list]] = []
+    for j in range(k):
+        fc: dict[str, list] = {}
+        for sym, cs in cbs.items():
+            n = len(cs)
+            a = 1.0 - tail_frac + j * tail_frac / k
+            b = 1.0 - tail_frac + (j + 1) * tail_frac / k
+            lo = int(n * a)
+            hi = n if j == k - 1 else int(n * b)
+            fc[sym] = cs[max(0, lo - warmup):hi]
+        if fc and all(len(v) >= warmup + 60 for v in fc.values()):
+            folds.append(fc)
+    return folds
 
 
 def robust_aggregate(fold_fits: list[float], weights: list[float] | None = None) -> float:

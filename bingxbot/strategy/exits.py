@@ -156,16 +156,26 @@ class AdaptiveExitManager:
 
         # 3) profit-scaled chandelier trail: wide early so a trend can breathe,
         #    ratcheting tighter as the trade gains so a runner banks its move
-        #    instead of round-tripping back to breakeven.
+        #    instead of round-tripping back to breakeven. The regime scale is
+        #    tuner-owned: geometry that's right for trends is wrong for chop.
         er = row.get("eff_ratio", 0.3)
         ex = REGIME_EXIT_MULT.get(regime, {"trail": 1.0})
+        rscale = (getattr(cfg, "trail_scale_trend", 1.0) if regime in ("TREND_UP", "TREND_DOWN")
+                  else getattr(cfg, "trail_scale_chop", 1.0))
         k_base = cfg.trail_atr_min + (cfg.trail_atr_max - cfg.trail_atr_min) * clamp(er / 0.5, 0, 1)
         tighten = 1.0 - cfg.trail_tighten * clamp((rr - cfg.be_rr) / 3.0, 0.0, 1.0)
-        k = k_base * ex["trail"] * tighten
+        k = k_base * ex["trail"] * tighten * rscale
         chand = pos.peak_price - d * k * atr
         if pos.breakeven_moved and (chand - pos.stop_price) * d > 0:
             pos.stop_price = chand
             moved = True
+
+        # 3b) partial scale-out: bank a fraction at scaleout_rr and trail the
+        #     rest — the caller executes the partial close and marks the
+        #     position, so a failed order can simply retry next bar.
+        so = getattr(cfg, "scaleout_rr", 0.0)
+        if so > 0 and not pos.scaled_out and rr >= so:
+            return moved, "scale out"
 
         # 4) give-back lock: protect a large open profit
         if rr >= cfg.giveback_rr:

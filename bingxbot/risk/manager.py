@@ -26,6 +26,25 @@ LIQ_STOP_HEADROOM = 0.8      # the stop must sit within this fraction of the liq
 from ..strategy.regime import REGIME_EXIT_MULT  # noqa: E402
 
 
+def corr_haircut(rets_a, rets_b, fallback: float) -> float:
+    """Size haircut for a same-direction add from MEASURED return correlation:
+    corr 1.0 -> 0.4x, corr 0.5 -> 0.7x, corr <= 0 -> full size (an
+    uncorrelated add is diversification, not stacking the same bet). Falls
+    back to the configured constant without enough overlapping data."""
+    import numpy as np
+    n = min(len(rets_a), len(rets_b))
+    if n < 60:
+        return fallback
+    a = np.asarray(rets_a[-n:], dtype=np.float64)
+    b = np.asarray(rets_b[-n:], dtype=np.float64)
+    if a.std() <= 0 or b.std() <= 0:
+        return fallback
+    c = float(np.corrcoef(a, b)[0, 1])
+    if not math.isfinite(c):
+        return fallback
+    return clamp(1.0 - 0.6 * max(c, 0.0), 0.4, 1.0)
+
+
 @dataclass
 class SizedOrder:
     qty: float
