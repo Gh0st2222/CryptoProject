@@ -25,6 +25,13 @@ from .allocator import MetaAllocator
 from .calibration import ProbabilityCalibrator
 from .regime import REGIME_DESK_MULT, detect_regime
 
+try:  # meta-labeling layer (optional: no sklearn / no trained model => no-op)
+    from ..ml.meta import features_from as _meta_features
+    from ..ml.meta import get_meta as _get_meta
+except Exception:  # noqa: BLE001 — the brain must run without the ML stack
+    _get_meta = None
+    _meta_features = None
+
 
 @dataclass
 class AlphaStat:
@@ -77,6 +84,8 @@ class TradingBrain:
         self._pending: deque[_Pending] = deque()
         self._score_hist: deque[float] = deque(maxlen=720)
         self._idx = 0
+        self.use_meta = True       # the ML dataset builder disables this on its
+        self.meta_p = None         # own brain so the model never labels itself
         self.beta = 1.0
         self.threshold = base_threshold
         self.graded = 0
@@ -134,6 +143,24 @@ class TradingBrain:
         edge = clamp(num / den if den > 0 else 0.0, -1, 1)
         atr_pctile = row.get("atr_pctile", 0.5)
         p_win = self.calibrator.predict(edge, regime, atr_pctile)
+        # meta-labeling second opinion: a walk-forward-credentialed GBM over the
+        # FULL feature row (interactions the linear fusion can't represent).
+        # Consulted only near the gate zone (where P(win) can change a decision
+        # — keeps backtests fast), weighted by its measured held-out AUC, and
+        # silently absent when there's no trained model. Same model file loads
+        # in live brains and backtest workers, so validation and trading gate
+        # with the same head.
+        self.meta_p = None
+        if (self.use_meta and _get_meta is not None
+                and abs(edge) >= 0.75 * self.threshold):
+            try:
+                m = _get_meta()
+                if m is not None and m.ready:
+                    self.meta_p = m.predict_one(_meta_features(row, micro, ctx, edge, regime))
+                    w = m.blend_weight
+                    p_win = clamp(w * self.meta_p + (1 - w) * p_win, 0.05, 0.95)
+            except Exception:  # noqa: BLE001 — a broken model must never block trading
+                pass
 
         # stash exactly what observe() needs to grade this bar later
         self._sc = {"alpha_scores": alpha_scores, "desk_sig": desk_sig,
@@ -343,6 +370,7 @@ class TradingBrain:
             "beta": round(self.beta, 3),
             "graded": self.graded,
             "expected_move": round(last.get("expected_move", 0.0), 6),
+            "meta_p": round(self.meta_p, 4) if self.meta_p is not None else None,
             "calibration": self.calibrator.snapshot(),
             "alphas": alphas,
             "desks": desks,

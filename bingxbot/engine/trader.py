@@ -244,6 +244,17 @@ class TraderEngine:
         log.info("DROPPED %s (trend gone)", sym)
         return True
 
+    def _market_tide(self) -> dict:
+        """BTC's higher-TF read as market context for every brain: alts rarely
+        fight the tide, and the meta-model can learn exactly when that matters.
+        Feeds the ML feature vector only (NaN when absent — e.g. backtests), so
+        the linear brain's parity between modes is untouched."""
+        btc = self.ctx.get("BTC-USDT")
+        if btc is None or not btc.last_row:
+            return {}
+        r = btc.last_row
+        return {"tide_dir": r.get("mtf_bias", 0.0), "tide_er": r.get("eff_ratio", 0.0)}
+
     def pending_entries(self) -> int:
         """Resting limit entries currently waiting for a fill. Each one is a
         RESERVED position slot: counting only open positions at decision time
@@ -289,6 +300,7 @@ class TraderEngine:
         row = ff.row(-1)
         micro = st.micro_snapshot()
         data_ctx = st.context_snapshot()
+        data_ctx.update(self._market_tide())
         row["funding_rate"] = data_ctx.get("funding_rate") or 0.0
         ev = ctx.brain.evaluate(row, micro, data_ctx)
         ctx.eval_ms = (time.perf_counter() - t0) * 1000.0
@@ -578,6 +590,7 @@ class TraderEngine:
         ff = FeatureFrame(st.candles.arrays_live(min(n + 1, tail)), interval=self.cfg.strategy.interval)
         row = ff.row(-1)
         data_ctx = st.context_snapshot()
+        data_ctx.update(self._market_tide())
         row["funding_rate"] = data_ctx.get("funding_rate") or 0.0
         micro = st.micro_snapshot()
         ev = ctx.brain.score(row, micro, data_ctx)   # score only, no learning

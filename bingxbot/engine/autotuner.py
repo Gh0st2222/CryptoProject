@@ -59,6 +59,7 @@ DUTY_CYCLE = 0.35           # research may use at most ~this fraction of wall ti
                             # the sleep stretches with the measured cycle length so
                             # a slow host isn't pinned wall-to-wall by the tuner
 VAULT_REVAL_EVERY = 15      # re-validate the champion vault every N cycles
+META_TRAIN_EVERY = 12       # retrain the meta-labeling model every N cycles
 MIN_BARS = 3000
 MIN_FOLD_BARS = 450         # a training fold below this can't produce a meaningful
                             # backtest (warmup + a real trading tail)
@@ -138,6 +139,7 @@ class AutoTuner:
         self.next_run_ts = 0.0
         self.champion_fitness = 0.0
         self.last_cycle: dict | None = None
+        self.last_meta: dict | None = None   # latest meta-model training result
         self.history: list[dict] = []
 
     def start(self) -> None:
@@ -494,6 +496,26 @@ class AutoTuner:
         if self.cycles % VAULT_REVAL_EVERY == 0:
             await self._revalidate_vault(basket, interval, slip, strat, risk)
 
+        # meta-labeling research: retrain the P(win) model on the basket's full
+        # history every so often (walk-forward credentialed; persists only if
+        # it beats the incumbent's held-out AUC). Runs on the research pool.
+        if self.cycles % META_TRAIN_EVERY == 0:
+            try:
+                from ..ml.meta import train_from_candles
+                cbs = {}
+                for tsym in self._traded_symbols()[:4]:
+                    tc = self._cache.get(tsym)
+                    if tc and len(tc[0]) >= MIN_BARS:
+                        cbs[tsym] = tc[0]
+                if cbs:
+                    res = (await self.orch.map_cpu(train_from_candles,
+                                                   [(cbs, interval, strat, risk)],
+                                                   research=True))[0]
+                    self.last_meta = {**res, "ts": int(time.time() * 1000)}
+                    log.info("meta-model training: %s", res)
+            except Exception as e:  # noqa: BLE001 — ML must never break tuning
+                log.warning("meta training failed: %s", e)
+
         self.last_cycle = {
             "ts": int(time.time() * 1000), "symbol": symbol,
             "generation": self.de.generation, "population": len(self.de.pop),
@@ -548,8 +570,22 @@ class AutoTuner:
             "research_symbol": self.research_symbol,
             "next_run_ts": int(self.next_run_ts * 1000),
             "last_cycle": self.last_cycle,
+            "meta": self._meta_status(),
             "history": self.history[-12:][::-1],
         }
+
+    def _meta_status(self) -> dict:
+        try:
+            from ..ml.meta import get_meta
+            m = get_meta()
+            if m is None:
+                return {"model": None, "last_training": self.last_meta}
+            return {"model": {"auc": round(m.auc, 4), "n": m.n, "ready": m.ready,
+                              "weight": round(m.blend_weight, 3),
+                              "age_h": round((time.time() - m.trained_ts) / 3600, 1)},
+                    "last_training": self.last_meta}
+        except Exception as e:  # noqa: BLE001
+            return {"model": None, "error": str(e)}
 
 
 class _NullJob:
