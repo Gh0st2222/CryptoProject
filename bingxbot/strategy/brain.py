@@ -94,16 +94,21 @@ class TradingBrain:
 
     # ------------------------------------------------------------- evaluate
 
-    def score(self, row: dict, micro: dict, ctx: dict | None = None) -> dict:
+    def score(self, row: dict, micro: dict, ctx: dict | None = None,
+              alpha_scores: dict | None = None) -> dict:
         """Pure decision pass: features -> alphas -> desks -> fused edge -> P(win).
         No learning state is touched, so this can run **as often as we like**
         between bar closes (on every tick / order-book update) to react to live
         price, flow and the multi-timeframe context without corrupting the online
-        weights. Returns the decision snapshot (also stored on ``self.last``)."""
+        weights. `alpha_scores` may be supplied precomputed (they depend on the
+        data, never on this brain's parameters — the backtester computes them
+        once per fold and reuses them for every tuner candidate). Returns the
+        decision snapshot (also stored on ``self.last``)."""
         ctx = ctx or {}
         regime, conf = detect_regime(row)
 
-        alpha_scores = {nm: float(fn(row, micro, ctx)) for nm, fn in ALPHAS.items()}
+        if alpha_scores is None:
+            alpha_scores = {nm: float(fn(row, micro, ctx)) for nm, fn in ALPHAS.items()}
         desk_sig, desk_conf, desk_active = {}, {}, {}
         for desk, names in DESKS.items():
             num = den = 0.0
@@ -193,10 +198,11 @@ class TradingBrain:
         self._idx += 1
         self._adapt_threshold()
 
-    def evaluate(self, row: dict, micro: dict, ctx: dict | None = None) -> dict:
+    def evaluate(self, row: dict, micro: dict, ctx: dict | None = None,
+                 alpha_scores: dict | None = None) -> dict:
         """Score **and** learn from one closed bar (backtest + the live bar-close
         path). Identical behaviour to before the score/observe split."""
-        self.score(row, micro, ctx)
+        self.score(row, micro, ctx, alpha_scores=alpha_scores)
         self.observe(row)
         return self.last
 

@@ -433,6 +433,45 @@ def test_react_tail_matches_full_tail_features():
         assert a == pytest.approx(b, rel=1e-3, abs=2e-3), f"{key}: full={a} short={b}"
 
 
+# --------------------------------------------- accounting identity, any phase
+
+def test_accounting_identity_holds_at_every_timestamp_phase():
+    """The epoch-anchored MTF ladder makes trade paths depend on where candle
+    timestamps sit inside higher-TF buckets. Whatever path results — including
+    a position forced closed at history's end — start + sum(pnl) - funding must
+    equal final equity EXACTLY. (This was a real bug: the forced close changed
+    cash after the last equity record, so stats['equity'] went stale by the
+    final exit fee in some phases.)"""
+    from bingxbot.engine.backtest import run_backtest
+    base = synthetic_candles("BTC-USDT", "1m", 6000, seed=21)
+    for k in (0, 7, 23, 41, 58):        # shift the whole tape by k minutes
+        shifted = [type(c)(c.ts + k * 60_000, c.open, c.high, c.low, c.close, c.volume)
+                   for c in base]
+        res = run_backtest(shifted, "BTC-USDT", "1m", StrategyConfig(), RiskConfig(),
+                           starting_balance=10_000.0, collect_series=False)
+        st = res["stats"]
+        # identity check needs the trades; rerun path already stores pnl in stats
+        delta = (10_000.0 + st["total_pnl"] - st["funding_paid"]) - st["equity"]
+        assert abs(delta) < 1e-4, f"phase {k}m: identity off by {delta}"
+
+
+# --------------------------------------------- shared-frame cache parity
+
+def test_shared_featureframe_caches_change_nothing():
+    """The tuner's shared-frame fast path (cached rows + precomputed alpha
+    scores) must produce EXACTLY the trades of the plain path — speed can
+    never be allowed to change what the brain sees."""
+    from bingxbot.engine.backtest import candles_to_arrays, run_backtest
+    from bingxbot.strategy.features import FeatureFrame
+    candles = synthetic_candles("BTC-USDT", "5m", 4000, seed=19)
+    plain = run_backtest(candles, "BTC-USDT", "5m", StrategyConfig(), RiskConfig(),
+                         starting_balance=10_000.0, collect_series=False)
+    ff = FeatureFrame(candles_to_arrays(candles), interval="5m")
+    shared = run_backtest(candles, "BTC-USDT", "5m", StrategyConfig(), RiskConfig(),
+                          starting_balance=10_000.0, collect_series=False, ff=ff)
+    assert plain["stats"] == shared["stats"], "cache path diverged from the reference"
+
+
 # --------------------------------------------- scale-out + measured correlation
 
 def test_portfolio_scale_out_accounting():

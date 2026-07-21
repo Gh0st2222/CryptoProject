@@ -29,6 +29,20 @@ from .portfolio import Portfolio
 
 NO_MICRO = {"obi": 0.0, "flow": 0.0, "cvd_slope": 0.0, "spread_bps": 0.0, "ticks_per_s": 0.0}
 NO_CTX: dict = {}
+
+
+def _alpha_cache(ff) -> list[dict]:
+    """Per-bar alpha scores for a SHARED FeatureFrame, computed once and reused
+    by every tuner candidate: alphas are pure functions of the data (rows +
+    the constant offline micro/ctx) — never of the parameters being tuned. On a
+    28-member + 28-trial cycle this removes ~19 alpha calls x bars x candidates
+    of redundant work, the biggest single cost in a tuner fold."""
+    if getattr(ff, "_alpha", None) is None:
+        from ..strategy.alphas import ALPHAS
+        fns = list(ALPHAS.items())
+        ff._alpha = [{nm: float(fn(ff.row_cached(i), NO_MICRO, NO_CTX)) for nm, fn in fns}
+                     for i in range(ff.n)]
+    return ff._alpha
 ASSUMED_SPREAD_BPS = 1.0
 TREND_REGIMES = {"TREND_UP", "TREND_DOWN"}
 FUNDING_MS = 8 * 3600 * 1000        # perp funding settles every 8h
@@ -130,10 +144,13 @@ class _SymSim:
         # RESERVED position slot, exactly as in the live engine — otherwise
         # several symbols' pendings can all fill and exceed max_open_positions.
         self._slots = pending_slots if pending_slots is not None else {"n": 0}
+        self._shared_ff = ff is not None
         if ff is not None:
             # reuse a precomputed FeatureFrame AND its OHLC arrays — this is what
             # lets the tuner score dozens of candidates on one fold without
-            # rebuilding indicators (or even the arrays) each time.
+            # rebuilding indicators (or even the arrays) each time. Row dicts
+            # and alpha scores are also cached ON the frame (candidate-invariant)
+            # so they too are computed once per fold, not once per candidate.
             self.ff = ff
             f = ff.f
             self.o, self.h, self.l = f["open"], f["high"], f["low"]
@@ -172,7 +189,8 @@ class _SymSim:
     def open_at(self, i, pf, risk, side, px, atr, regime, style, size_mult, reason, maker, marks):
         d = 1 if side == LONG else -1
         eff = px * (1 + d * self.maker_adv) if maker else px * (1 + d * self.slip)
-        br = self.exits.initial_bracket(eff, side, atr, self.ff.row(i), regime, style)
+        row_i = self.ff.row_cached(i) if self._shared_ff else self.ff.row(i)
+        br = self.exits.initial_bracket(eff, side, atr, row_i, regime, style)
         if br is None:
             return
         sized = risk.size_entry(pf.equity(marks), eff, br.init_risk, side, self.spec, size_mult)
@@ -241,7 +259,7 @@ class _SymSim:
     def step(self, i, pf, risk, marks):
         sym = self.symbol
         o, h, l, c = self.o, self.h, self.l, self.c
-        row = self.ff.row(i)
+        row = self.ff.row_cached(i) if self._shared_ff else self.ff.row(i)
         pos = pf.positions.get(sym)
 
         # 1) resolve a pending entry from the previous close
@@ -283,8 +301,9 @@ class _SymSim:
                 self.close_at(i, pf, risk, tp, "target", marks, maker=True)
             pos = pf.positions.get(sym)
 
-        # 3) brain
-        ev = self.brain.evaluate(row, NO_MICRO, NO_CTX)
+        # 3) brain (precomputed alpha scores when the frame is shared)
+        ev = self.brain.evaluate(row, NO_MICRO, NO_CTX,
+                                 alpha_scores=_alpha_cache(self.ff)[i] if self._shared_ff else None)
         self.last_ev = ev
         edge, p_win, regime = ev["edge"], ev["p_win"], ev["regime"]
         self.regime_counts[regime] = self.regime_counts.get(regime, 0) + 1
@@ -380,6 +399,10 @@ def run_backtest(
 
     if pf.positions.get(symbol) is not None:
         sim.close_at(n - 1, pf, risk, c[n - 1], "backtest end", {symbol: c[n - 1]})
+        # the forced close changed cash AFTER the last curve point — re-record,
+        # or stats["equity"] is stale by the final exit fee and the accounting
+        # identity (start + sum(pnl) - funding == equity) silently breaks.
+        pf.record_equity(int(ts[-1]), {symbol: c[n - 1]}, min_gap_ms=0)
 
     stats = pf.stats()
     curve = list(pf.equity_curve)
@@ -478,9 +501,13 @@ def run_portfolio_backtest(
 
     last_t = common[-1]
     last_marks = {s: sims[s].c[ts_index[s][last_t]] for s in syms}
+    forced = False
     for s in syms:
         if pf.positions.get(s) is not None:
             sims[s].close_at(ts_index[s][last_t], pf, risk, last_marks[s], "backtest end", last_marks)
+            forced = True
+    if forced:   # keep the equity curve's final point in sync with the closes
+        pf.record_equity(int(last_t), last_marks, min_gap_ms=0)
 
     # portfolio + per-symbol stats
     stats = pf.stats()

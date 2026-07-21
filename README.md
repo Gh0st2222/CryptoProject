@@ -127,6 +127,16 @@ firing ● vs dormant ○, so a resting alpha never looks broken).
 4. **Probability calibration.** Online logistic regression maps the fused edge
    to a calibrated **P(win)** (Brier-scored). It's also auto-correction: if the
    edge stops predicting, P(win) falls below 0.5 and the gate simply refuses.
+5. **Meta-labeling (the learned second opinion).** A small gradient-boosted
+   model over the full feature row — including funding, hour, and **BTC's tide**
+   as market context — is trained on **triple-barrier labels** (which barrier a
+   candidate actually hit first: profit, stop, or time) strictly walk-forward,
+   and blends into P(win) **only in proportion to its measured held-out AUC**.
+   Below-skill models get no vote; no model at all means the calibrator runs
+   alone. This is the layer that can learn the conditional structure a weighted
+   average of alphas can't ("momentum works when funding is flat and BTC
+   agrees"). The tuner retrains it periodically on the traded basket, and the
+   same model file gates backtests and live identically.
 
 A cost gate (`β·|edge|·ATR%·√horizon` must clear round-trip fees × `cost_multiple`)
 and an order-flow veto sit in front of every entry. The adaptive threshold may
@@ -201,6 +211,16 @@ The objective is **risk-adjusted profit**, not trade count: total R earned
 behavior matters more. That means it rewards higher frequency *only* when the
 extra trades actually make risk-adjusted money — the honest fix for "trade more"
 that can't regress into the fee-bleeding over-trading it used to reward.
+
+**Promotion is judged on the PORTFOLIO, across purged folds.** Candidates are
+validated by the shared-account simulator over the traded basket (one equity
+pool, one position cap, measured correlation haircut, one kill switch) on the
+**3 most recent disjoint out-of-sample windows**; the score is 0.7·mean +
+0.3·worst across folds, and a challenger must additionally beat the incumbent
+in a **majority of folds** — one lucky window can no longer promote. Exit
+geometry is regime-conditional (tuner-owned trail scales for trend vs chop)
+and a tuner-owned **partial scale-out** can bank half at a chosen R and trail
+the rest.
 
 **Cores are allocated to the host.** On startup it reads the CPU's logical core
 count and splits it: one core for the event loop, a small slice for on-demand

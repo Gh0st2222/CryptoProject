@@ -69,10 +69,12 @@ def mtf_from_row(row: dict, ladder) -> dict:
 
 
 class FeatureFrame:
-    __slots__ = ("n", "f", "ladder")
+    __slots__ = ("n", "f", "ladder", "_rows", "_alpha")
 
     def __init__(self, arrays: dict[str, np.ndarray], interval: str | None = None):
         self.ladder: list[str] = []
+        self._rows = None    # lazy per-bar row-dict cache (candidate-invariant)
+        self._alpha = None   # lazy per-bar alpha-score cache (set by the backtester)
         o = arrays.get("open", arrays["close"])
         c, h, l, v = arrays["close"], arrays["high"], arrays["low"], arrays["volume"]
         self.n = len(c)
@@ -197,6 +199,20 @@ class FeatureFrame:
         if i < 0:
             i += self.n
         return {k: float(a[i]) for k, a in self.f.items()}
+
+    def row_cached(self, i: int) -> dict[str, float]:
+        """Same values as row(i), but built ONCE for every bar and reused.
+        Rows depend on price only — never on strategy parameters — so a frame
+        shared across tuner candidates pays this cost once instead of once per
+        candidate. Callers must treat cached rows as read-only."""
+        if self._rows is None:
+            keys = list(self.f)
+            cols = [self.f[k] for k in keys]
+            self._rows = [dict(zip(keys, (float(c[j]) for c in cols)))
+                          for j in range(self.n)]
+        if i < 0:
+            i += self.n
+        return self._rows[i]
 
     def ready(self, i: int | None = None) -> bool:
         i = self.n - 1 if i is None else i
