@@ -36,7 +36,10 @@ from .search import (DEOptimizer, portfolio_folds, recency_weights,
 
 log = logging.getLogger("autotuner")
 
-POP_SIZE = 28
+POP_SIZE = 56               # doubled once the compiled kernel made candidate
+                            # scoring ~an order of magnitude cheaper: a wider
+                            # gene pool searches more of the space per cycle
+                            # and resists premature convergence
 IMPROVE_MARGIN = 1.06       # OOS challenger must beat champion OOS x this
 DEFLATE_K = 0.03            # margin inflation per decade of candidates tried on this
                             # OOS window — multiple-testing honesty: after thousands

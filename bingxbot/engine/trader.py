@@ -28,7 +28,8 @@ from .portfolio import Portfolio
 
 log = logging.getLogger("trader")
 
-FEATURE_TAIL = 1400  # bars fed to FeatureFrame each bar close
+FEATURE_TAIL = 1500  # bars fed to FeatureFrame each bar close (covers a full
+                     # 24h range window even on a 1m base: 1440 bars + warmup)
 REACT_TAIL = 640     # bars for reactive intra-bar scans: the widest rolling
                      # window is 240 bars (+~260 indicator warmup), so 640 gives
                      # EXACT last-row values for every windowed feature and only
@@ -128,7 +129,8 @@ class TraderEngine:
             await self.broker.flatten_all("engine stop")
         if self.portfolio.mode == "paper":
             from .persist import save_paper_state
-            save_paper_state(self.portfolio, self.risk.state)   # the session survives
+            save_paper_state(self.portfolio, self.risk.state,
+                             brains=self.brain_states())   # the session AND the learning survive
         await self.feed.stop()
         log.info("trader stopped")
 
@@ -187,7 +189,7 @@ class TraderEngine:
                     log.warning("track record roll failed: %s", e)
             if self.portfolio.mode == "paper" and beat % 6 == 0:   # every 30s
                 from .persist import save_paper_state
-                save_paper_state(self.portfolio, self.risk.state)
+                save_paper_state(self.portfolio, self.risk.state, brains=self.brain_states())
             if self.on_update:
                 await self.on_update("state")
 
@@ -276,6 +278,24 @@ class TraderEngine:
             return {}
         r = btc.last_row
         return {"tide_dir": r.get("mtf_bias", 0.0), "tide_er": r.get("eff_ratio", 0.0)}
+
+    def brain_states(self) -> dict:
+        """Per-symbol online-learning state for paper persistence."""
+        return {sym: c.brain.state_dict() for sym, c in self.ctx.items()}
+
+    def load_brain_states(self, states: dict | None) -> int:
+        """Restore persisted learning into matching symbol brains (a restart no
+        longer lobotomizes days of hedge/allocator/calibrator adaptation)."""
+        if not states:
+            return 0
+        n = 0
+        for sym, d in states.items():
+            c = self.ctx.get(sym)
+            if c is not None and c.brain.load_state(d):
+                n += 1
+        if n:
+            log.info("restored learning state for %d brains", n)
+        return n
 
     def pending_entries(self) -> int:
         """Resting limit entries currently waiting for a fill. Each one is a
@@ -742,6 +762,9 @@ class TraderEngine:
                     "stage": c.stage,
                     "eval_ms": round(c.eval_ms, 2),
                     "mtf": c.mtf,
+                    "hi24": round(c.last_row.get("hi_24h", 0.0), 8),
+                    "lo24": round(c.last_row.get("lo_24h", 0.0), 8),
+                    "rpos24": round(c.last_row.get("range_pos_24h", 0.0), 4),
                     "gates": c.gates,
                     "overlay": sym in self.overlays,
                 }
@@ -795,6 +818,9 @@ class TraderEngine:
                     "regime": c.last_eval.get("regime", ""),
                     "bars_held": c.bars_held,
                     "mtf": c.mtf,
+                    "hi24": round(c.last_row.get("hi_24h", 0.0), 8),
+                    "lo24": round(c.last_row.get("lo_24h", 0.0), 8),
+                    "rpos24": round(c.last_row.get("range_pos_24h", 0.0), 4),
                     "candle": self._live_candle(sym),
                     "gates": c.gates,
                 }

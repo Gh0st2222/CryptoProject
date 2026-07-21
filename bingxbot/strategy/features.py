@@ -138,8 +138,24 @@ class FeatureFrame:
         f["vwap_z"] = ta.zscore(c - vwap_filled, 60)
         f["vol_z"] = ta.zscore(v, 96)
 
+        base_min = _base_minutes(interval, arrays["ts"])
+
+        # --- 24h range context: where price sits inside the day's high/low/
+        # average — the daily extremes are the levels the whole market watches,
+        # so proximity to them (in ATRs) and the range position are real
+        # context for both the brain's consumers and the meta-model.
+        w24 = max(4, int(round(1440 / base_min)))
+        f["hi_24h"] = ta.rolling_max(h, w24)
+        f["lo_24h"] = ta.rolling_min(l, w24)
+        rng24 = f["hi_24h"] - f["lo_24h"]
+        f["range_pos_24h"] = (c - f["lo_24h"]) / np.maximum(rng24, 1e-12)
+        f["vwap_24h"] = ta.rolling_vwap(c, v, w24)
+        f["dist_hi_24h"] = (f["hi_24h"] - c) / np.maximum(f["atr"], 1e-12)
+        f["dist_lo_24h"] = (c - f["lo_24h"]) / np.maximum(f["atr"], 1e-12)
+        f["vwap24_dev"] = (c - f["vwap_24h"]) / np.maximum(f["atr"], 1e-12)
+
         # --- true multi-timeframe ladder (1m/5m/15m/1h relative to the base)
-        self._add_mtf(f, o, h, l, c, v, _base_minutes(interval, arrays["ts"]))
+        self._add_mtf(f, o, h, l, c, v, base_min)
 
         self.f = f
 

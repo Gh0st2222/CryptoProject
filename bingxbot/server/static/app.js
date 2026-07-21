@@ -186,7 +186,8 @@ function renderBrain(){
   const b=es.brain, micro=es.micro, ctx=es.context||{};
   const fund=ctx.funding_rate!=null?` · fund ${(ctx.funding_rate*100).toFixed(4)}%`:"";
   const tf=S?.engine?.interval||"";
-  $("px-meta").textContent=`1m chart · ${tf} signals · spread ${micro.spread_bps.toFixed(1)}bp · OBI ${fmt.signed(micro.obi,2)} · flow ${fmt.signed(micro.flow,2)}${fund}`;
+  const r24=(es.hi24&&es.lo24)?` · 24h ${fmt.px(es.lo24)}–${fmt.px(es.hi24)} (pos ${Math.round((es.rpos24||0)*100)}%)`:"";
+  $("px-meta").textContent=`1m chart · ${tf} signals${r24} · spread ${micro.spread_bps.toFixed(1)}bp · OBI ${fmt.signed(micro.obi,2)} · flow ${fmt.signed(micro.flow,2)}${fund}`;
   $("brain-graded").textContent=`${b.graded} graded`;
 
   // edge + p(win) gauges (also driven by the fast 'hot' channel)
@@ -399,6 +400,7 @@ function applyHot(h){
   for(const [sym,hs] of Object.entries(he.symbols||{})){
     const s=S.engine.symbols?.[sym]; if(!s) continue;
     s.price=hs.price; s.stage=hs.stage; s.eval_ms=hs.eval_ms; s.entry_block=hs.entry_block; s.bars_held=hs.bars_held;
+    if(hs.hi24){ s.hi24=hs.hi24; s.lo24=hs.lo24; s.rpos24=hs.rpos24; }
     if(hs.mtf) s.mtf=hs.mtf;
     if(hs.gates) s.gates=hs.gates;
     if(hs.candle) s.candle=hs.candle;

@@ -58,6 +58,9 @@ ROW_FEATURES = (
     "ema55_slope", "macd_hist", "macd_line", "roc_3", "roc_12", "roc_accel",
     "vwap_dev", "vwap_z", "vol_z", "mtf_align", "mtf_bias", "squeeze_on",
     "linreg_slope", "ret_1",
+    # 24h range context: position within the day's high/low, ATR-distance to
+    # each extreme, deviation from the 24h volume-weighted average
+    "range_pos_24h", "dist_hi_24h", "dist_lo_24h", "vwap24_dev",
 )
 MICRO_FEATURES = ("obi", "flow", "cvd_slope", "spread_bps")
 CTX_FEATURES = ("funding_rate", "funding_z", "oi_change_pct", "tide_dir", "tide_er")
