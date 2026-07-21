@@ -433,6 +433,37 @@ def test_react_tail_matches_full_tail_features():
         assert a == pytest.approx(b, rel=1e-3, abs=2e-3), f"{key}: full={a} short={b}"
 
 
+# ------------------------------------------- portfolio-fitness OOS validation
+
+def test_portfolio_folds_are_purged_and_disjoint():
+    from bingxbot.engine.search import portfolio_folds
+    cbs = {"A": list(range(4000)), "B": list(range(4000))}
+    folds = portfolio_folds(cbs, k=3, tail_frac=0.40, warmup=300)
+    assert len(folds) == 3
+    traded_starts = []
+    for fc in folds:
+        assert set(fc) == {"A", "B"}
+        # traded region starts `warmup` bars into each slice
+        traded_starts.append(fc["A"][300])
+    # traded regions are sequential and disjoint
+    assert traded_starts == sorted(traded_starts)
+    ends = [fc["A"][-1] for fc in folds]
+    for k in range(len(folds) - 1):
+        assert ends[k] < traded_starts[k + 1] + 1, "traded regions must not overlap"
+    assert folds[-1]["A"][-1] == 3999, "last fold reaches the end of history"
+
+
+def test_validate_params_portfolio_smoke():
+    from bingxbot.engine.search import validate_params_portfolio
+    cbs = {s: synthetic_candles(s, "5m", 1400, seed=i + 3)
+           for i, s in enumerate(["BTC-USDT", "ETH-USDT"])}
+    out = validate_params_portfolio({}, cbs, "5m",
+                                    {s: ContractSpec(s) for s in cbs},
+                                    0.0005, 1.0, StrategyConfig(), RiskConfig())
+    assert "fitness" in out and isinstance(out["fitness"], float)
+    assert out["stats"].get("trades", 0) >= 0
+
+
 # ------------------------------------------------------- tunable clamping
 
 def test_apply_tunables_clamps_to_bounds():
