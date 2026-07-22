@@ -930,8 +930,11 @@ const cortex=(()=>{
     if(!w||!h) return;
     cv.width=Math.round(w*DPR); cv.height=Math.round(h*DPR);
     g.setTransform(DPR,0,0,DPR,0,0);
+    // soft radial sprites don't need bilinear filtering — and the Firefox
+    // profiler showed every filtered blit being rasterized on the CPU
+    g.imageSmoothingEnabled=false;
     W=w; H=h; cx=W*0.5; cy=H*0.52;
-    R=Math.min(W*0.335,(cy-16)/1.16);
+    R=Math.min(W*0.335,(cy-24)/1.16);
     if(!motes.length) for(let i=0;i<26;i++) motes.push({x:Math.random()*w,y:Math.random()*h,
       vx:(Math.random()-0.5)*5,vy:-3-Math.random()*5,ph:Math.random()*TAU});
     layout(); bgDirty=true;
@@ -966,13 +969,15 @@ const cortex=(()=>{
     }
     bgDirty=true;
   }
+  const fscale=()=>Math.max(0.85,Math.min(2.0,R/165));
   function drawBg(){
     bg.width=Math.round(W*DPR); bg.height=Math.round(H*DPR);
     const b=bg.getContext("2d"); b.setTransform(DPR,0,0,DPR,0,0);
+    const F=fscale();
     // regime wash — a deep tinted atmosphere behind everything
     const tint=REGIME_TINT[bgRegime]||REGIME_TINT.RANGE;
     const wash=b.createRadialGradient(cx,cy,R*0.1,cx,cy,Math.max(W,H)*0.75);
-    wash.addColorStop(0,tint+"14"); wash.addColorStop(0.55,tint+"07"); wash.addColorStop(1,"#00000000");
+    wash.addColorStop(0,tint+"16"); wash.addColorStop(0.55,tint+"08"); wash.addColorStop(1,"#00000000");
     b.fillStyle=wash; b.fillRect(0,0,W,H);
     // guide rings + desk sector spokes
     b.strokeStyle="rgba(0,210,255,0.05)"; b.lineWidth=1;
@@ -983,16 +988,17 @@ const cortex=(()=>{
       b.beginPath(); b.moveTo(cx+Math.cos(h.ang)*R*0.18,cy+Math.sin(h.ang)*R*0.18);
       b.lineTo(cx+Math.cos(h.ang)*R*1.06,cy+Math.sin(h.ang)*R*1.06); b.stroke(); }
     b.setLineDash([]);
-    // alpha name labels around the outer ring
-    b.font="7.5px ui-monospace,monospace"; b.textAlign="center"; b.fillStyle="rgba(89,99,122,0.75)";
-    for(const nd of nodes){
-      b.fillText(nd.short,cx+Math.cos(nd.ang)*R*1.10,cy+Math.sin(nd.ang)*R*1.10+2.5);
+    // HUD text — dark-outlined so it reads over any glow
+    const btxt=(s,x,y,fill,font)=>{ b.font=font; b.lineWidth=3;
+      b.strokeStyle="rgba(3,5,9,0.9)"; b.strokeText(s,x,y); b.fillStyle=fill; b.fillText(s,x,y); };
+    b.textAlign="center";
+    for(const nd of nodes){   // alpha names on the outer ring
+      btxt(nd.short,cx+Math.cos(nd.ang)*R*1.115,cy+Math.sin(nd.ang)*R*1.115+3*F,
+           "rgba(150,165,190,0.95)",`700 ${Math.round(9*F)}px ui-monospace,monospace`);
     }
-    // desk labels sit inside their sector
-    b.font="8px ui-monospace,monospace";
-    for(const d of DESK_ORDER){ const h=hubs[d]; if(!h) continue;
-      b.fillStyle=h.col+"aa";
-      b.fillText(DESK_LABEL[d],cx+Math.cos(h.ang)*R*0.70,cy+Math.sin(h.ang)*R*0.70+3); }
+    for(const d of DESK_ORDER){ const h=hubs[d]; if(!h) continue;   // desk names
+      btxt(DESK_LABEL[d],cx+Math.cos(h.ang)*R*0.71,cy+Math.sin(h.ang)*R*0.71+3.5*F,
+           h.col,`700 ${Math.round(11*F)}px ui-monospace,monospace`); }
     bgDirty=false;
   }
   function data(viz,extra){
@@ -1019,13 +1025,19 @@ const cortex=(()=>{
   function frame(t){
     requestAnimationFrame(frame);
     if(document.hidden||!W){ lastT=t; return; }
-    const dt=Math.min(0.05,Math.max(0.001,(t-lastT)/1000)); lastT=t;
+    // 30fps cap: half the raster work, visually identical for glow physics —
+    // the profiler showed this canvas competing with the page for one core
+    const dtRaw=(t-lastT)/1000;
+    if(dtRaw<0.030) return;
+    const dt=Math.min(0.08,Math.max(0.001,dtRaw)); lastT=t;
     const k=Math.min(1,dt*5);
-    // trail fade, then blit the static layer (rings/labels/wash stay crisp)
+    // trail fade, then blit the static layer 1:1 (a SCALED blit was being
+    // bilinear-filtered on the CPU every frame)
     g.globalCompositeOperation="source-over";
-    g.fillStyle="rgba(5,7,12,0.30)"; g.fillRect(0,0,W,H);
+    g.fillStyle="rgba(5,7,12,0.42)"; g.fillRect(0,0,W,H);
     if(bgDirty) drawBg();
-    g.globalAlpha=0.6; g.drawImage(bg,0,0,W,H); g.globalAlpha=1;
+    g.save(); g.setTransform(1,0,0,1,0,0); g.globalAlpha=0.6; g.drawImage(bg,0,0); g.restore();
+    g.globalAlpha=1;
     if(!tgt||!nodes.length){
       g.fillStyle="#59637a"; g.font="10px ui-monospace,monospace"; g.textAlign="center";
       g.fillText("cortex warming up — waiting for the first evaluation…",cx,cy);
@@ -1035,14 +1047,14 @@ const cortex=(()=>{
     e.edge=lerp(e.edge,ex.edge,k); e.p_win=lerp(e.p_win,ex.p_win,k);
     e.charge=lerp(e.charge,clamp(Math.abs(e.edge)/Math.max(thr,0.01),0,1.35),k);
     spin+=dt*(0.5+e.charge*2.4);
-    // ambient motes — depth without cost
+    // ambient motes — depth without cost (integer coords: no CPU filtering)
     g.globalCompositeOperation="lighter";
     for(const m of motes){
       m.x+=m.vx*dt; m.y+=m.vy*dt;
       if(m.y<-4) { m.y=H+4; m.x=Math.random()*W; }
       if(m.x<-4) m.x=W+4; else if(m.x>W+4) m.x=-4;
       g.globalAlpha=0.05+0.05*Math.sin(t*0.0011+m.ph);
-      g.drawImage(sprite(C.accent),m.x-3,m.y-3,6,6);
+      g.drawImage(sprite(C.accent),m.x-3|0,m.y-3|0,6,6);
     }
     g.globalAlpha=1; g.globalCompositeOperation="source-over";
     // curved axons — brightness follows live strength
@@ -1074,8 +1086,8 @@ const cortex=(()=>{
       const u=1-p.p;
       const x=u*u*p.x0+2*u*p.p*p.cx+p.p*p.p*p.x1;
       const y=u*u*p.y0+2*u*p.p*p.cy+p.p*p.p*p.y1;
-      const s=p.size*4*(1-p.p*0.35);
-      g.globalAlpha=0.85; g.drawImage(sprite(p.col),x-s/2,y-s/2,s,s);
+      const s=Math.max(2,p.size*4*(1-p.p*0.35))|0;
+      g.globalAlpha=0.85; g.drawImage(sprite(p.col),x-s/2|0,y-s/2|0,s,s);
     }
     for(let i=ripples.length-1;i>=0;i--){
       const r=ripples[i]; r.r+=dt*46;
@@ -1084,21 +1096,22 @@ const cortex=(()=>{
       g.beginPath(); g.arc(r.x,r.y,r.r,0,TAU); g.stroke();
     }
     // neuron + hub glows
+    const F=fscale();
     for(const nd of nodes){
       const s=Math.min(1,Math.abs(nd.sc));
       const breathe=0.5+0.5*Math.sin(t*0.001+nd.ph);
-      const sz=7+26*s+3*breathe*(0.3+s);
+      const sz=(7+26*s+3*breathe*(0.3+s))*F|0;
       g.globalAlpha=0.26+0.62*s;
-      g.drawImage(sprite(s>0.05?dirCol(nd.sc):nd.col),nd.x-sz/2,nd.y-sz/2,sz,sz);
+      g.drawImage(sprite(s>0.05?dirCol(nd.sc):nd.col),nd.x-sz/2|0,nd.y-sz/2|0,sz,sz);
     }
     for(const d of DESK_ORDER){
-      const h=hubs[d]; const sz=15+32*h.alloc+15*Math.min(1,Math.abs(h.sig));
-      g.globalAlpha=0.55; g.drawImage(sprite(h.col),h.x-sz/2,h.y-sz/2,sz,sz);
+      const h=hubs[d]; const sz=(15+32*h.alloc+15*Math.min(1,Math.abs(h.sig)))*F|0;
+      g.globalAlpha=0.55; g.drawImage(sprite(h.col),h.x-sz/2|0,h.y-sz/2|0,sz,sz);
     }
     const coreCol=dirCol(e.edge);
-    const coreSz=R*0.60*(0.75+0.45*e.charge);
+    const coreSz=R*0.60*(0.75+0.45*e.charge)|0;
     g.globalAlpha=0.28+0.45*Math.min(1,e.charge);
-    g.drawImage(sprite(coreCol),cx-coreSz/2,cy-coreSz/2,coreSz,coreSz);
+    g.drawImage(sprite(coreCol),cx-coreSz/2|0,cy-coreSz/2|0,coreSz,coreSz);
     g.globalAlpha=1; g.globalCompositeOperation="source-over";
     // crisp marks: neurons, hub cores + allocation arcs
     for(const nd of nodes){
@@ -1114,46 +1127,61 @@ const cortex=(()=>{
     }
     // the core: threshold ring, |edge| arc, p(win) inner arc, ARMED reticle
     const cr=R*0.285;
-    g.lineWidth=3; g.strokeStyle="#141827";
+    g.lineWidth=3+F; g.strokeStyle="#141827";
     g.beginPath(); g.arc(cx,cy,cr,0,TAU); g.stroke();
     g.strokeStyle=coreCol;
     g.beginPath(); g.arc(cx,cy,cr,-Math.PI/2,-Math.PI/2+clamp(Math.abs(e.edge),0,1)*TAU*(e.edge>=0?1:-1),e.edge<0); g.stroke();
-    g.lineWidth=2; g.strokeStyle="#1d2436";
-    g.beginPath(); g.arc(cx,cy,cr-6,0,TAU); g.stroke();
+    g.lineWidth=2+F*0.6; g.strokeStyle="#1d2436";
+    g.beginPath(); g.arc(cx,cy,cr-7*F,0,TAU); g.stroke();
     g.strokeStyle=C.accent+"cc";
-    g.beginPath(); g.arc(cx,cy,cr-6,-Math.PI/2,-Math.PI/2+clamp(e.p_win,0,1)*TAU); g.stroke();
+    g.beginPath(); g.arc(cx,cy,cr-7*F,-Math.PI/2,-Math.PI/2+clamp(e.p_win,0,1)*TAU); g.stroke();
     for(const s of [-1,1]){   // threshold ticks on the edge ring
       const a=-Math.PI/2+s*clamp(thr,0,1)*TAU;
-      g.strokeStyle="#59637a"; g.lineWidth=2;
-      g.beginPath(); g.moveTo(cx+Math.cos(a)*(cr-3),cy+Math.sin(a)*(cr-3));
-      g.lineTo(cx+Math.cos(a)*(cr+4),cy+Math.sin(a)*(cr+4)); g.stroke();
+      g.strokeStyle="#8a97ad"; g.lineWidth=2.5;
+      g.beginPath(); g.moveTo(cx+Math.cos(a)*(cr-4),cy+Math.sin(a)*(cr-4));
+      g.lineTo(cx+Math.cos(a)*(cr+5),cy+Math.sin(a)*(cr+5)); g.stroke();
     }
     if(e.charge>=1){          // ARMED: twin counter-rotating reticles
       g.strokeStyle=coreCol; g.lineWidth=1.5;
       g.setLineDash([5,10]); g.lineDashOffset=-spin*30;
-      g.beginPath(); g.arc(cx,cy,cr+7,0,TAU); g.stroke();
+      g.beginPath(); g.arc(cx,cy,cr+8,0,TAU); g.stroke();
       g.setLineDash([2,12]); g.lineDashOffset=spin*44;
-      g.beginPath(); g.arc(cx,cy,cr+12,0,TAU); g.stroke();
+      g.beginPath(); g.arc(cx,cy,cr+14,0,TAU); g.stroke();
       g.setLineDash([]);
     }
+    // HUD text — dark-outlined, scaled with the canvas, readable over glow
+    const txt=(s,x,y,fill,font)=>{ g.font=font; g.lineWidth=4;
+      g.strokeStyle="rgba(3,5,9,0.9)"; g.strokeText(s,x,y); g.fillStyle=fill; g.fillText(s,x,y); };
     g.textAlign="center";
-    g.fillStyle=coreCol; g.font="700 17px ui-monospace,monospace";
-    g.fillText((e.edge>=0?"+":"−")+Math.abs(e.edge).toFixed(2),cx,cy-2);
-    g.fillStyle="#a6b3c2"; g.font="8.5px ui-monospace,monospace";
-    g.fillText(`P ${Math.round(e.p_win*100)}%${tgt.meta_p!=null?` · ML ${Math.round(tgt.meta_p*100)}%`:""}`,cx,cy+11);
+    txt((e.edge>=0?"+":"−")+Math.abs(e.edge).toFixed(2),cx,cy-4*F,coreCol,
+        `700 ${Math.round(24*F)}px ui-monospace,monospace`);
+    txt(`P ${Math.round(e.p_win*100)}%${tgt.meta_p!=null?`  ·  ML ${Math.round(tgt.meta_p*100)}%`:""}`,
+        cx,cy+15*F,"#d5e3f0",`700 ${Math.round(11*F)}px ui-monospace,monospace`);
     const rm=REGIME_META[ex.regime]||REGIME_META.RANGE;
-    g.fillStyle=REGIME_TINT[ex.regime]||"#59637a"; g.fillText(`${rm.g} ${ex.regime.replace("_"," ")}`,cx,cy+23);
+    txt(`${rm.g} ${ex.regime.replace("_"," ")}`,cx,cy+30*F,
+        REGIME_TINT[ex.regime]||"#8a97ad",`700 ${Math.round(10.5*F)}px ui-monospace,monospace`);
+    if(e.charge>=1) txt("⚡ ARMED",cx,cy-cr-10*F,coreCol,`700 ${Math.round(11*F)}px ui-monospace,monospace`);
+    // firing alphas light their names up in direction color
+    for(const nd of nodes){
+      const s=Math.abs(nd.sc);
+      if(s>0.35) txt(nd.short,cx+Math.cos(nd.ang)*R*1.115,cy+Math.sin(nd.ang)*R*1.115+3*F,
+                     dirCol(nd.sc),`700 ${Math.round(9.5*F)}px ui-monospace,monospace`);
+    }
     // edge EKG — the last minute of conviction, breathing along the bottom
     if(ekg.length>2){
-      const eh=13, ey=H-8, x0=8, x1=W-8;
-      g.strokeStyle="rgba(0,210,255,0.10)"; g.lineWidth=1;
+      const eh=15, ey=H-10, x0=10, x1=W-10;
+      g.strokeStyle="rgba(0,210,255,0.12)"; g.lineWidth=1;
       g.beginPath(); g.moveTo(x0,ey); g.lineTo(x1,ey); g.stroke();
       g.beginPath();
       for(let i=0;i<ekg.length;i++){
         const x=x0+(x1-x0)*(i/(ekg.length-1)), y=ey-ekg[i]*eh;
         i?g.lineTo(x,y):g.moveTo(x,y);
       }
-      g.strokeStyle=dirCol(ekg[ekg.length-1])+"99"; g.lineWidth=1.2; g.stroke();
+      g.strokeStyle=dirCol(ekg[ekg.length-1])+"bb"; g.lineWidth=1.5; g.stroke();
+      g.textAlign="left";
+      txt("edge · last 60s",x0,ey-eh-6,"rgba(120,135,160,0.9)",
+          `700 ${Math.round(8.5*F)}px ui-monospace,monospace`);
+      g.textAlign="center";
     }
     // caption (DOM text, 2 Hz is plenty)
     if(t-capT>500){ capT=t;
