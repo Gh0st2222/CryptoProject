@@ -91,6 +91,21 @@ def test_build_samples_produces_labeled_candidates():
     assert 0.05 < float(y.mean()) < 0.95, "labels must not be degenerate"
 
 
+def test_build_samples_decoupled_from_live_threshold():
+    """The dataset must mean the same thing whatever champion is running:
+    labeling through the LIVE config's base_threshold starved training to
+    ~1.4k samples ('insufficient data' forever) the moment a conservative
+    set (thr 0.30) held the seat."""
+    candles = synthetic_candles("BTC-USDT", "5m", 6000, seed=8)
+    tight = StrategyConfig()
+    tight.base_threshold = 0.5
+    loose = StrategyConfig()
+    loose.base_threshold = 0.1
+    _, y1 = build_samples(candles, "5m", tight, RiskConfig())
+    _, y2 = build_samples(candles, "5m", loose, RiskConfig())
+    assert len(y1) == len(y2) > 200, "sample count must not depend on the live entry threshold"
+
+
 def test_brain_blends_meta_when_ready(monkeypatch, tmp_path):
     """With a ready model on disk the brain's P(win) must move toward the
     model's opinion near the gate zone; use_meta=False must bypass it."""

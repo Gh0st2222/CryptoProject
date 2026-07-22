@@ -210,13 +210,17 @@ class TraderEngine:
                     log.warning("track record roll failed: %s", e)
             if self.portfolio.mode == "paper" and beat % 6 == 0:   # every 30s
                 from .persist import save_paper_state
-                save_paper_state(self.portfolio, self.risk.state,
-                                 brains=self.brain_states(),
-                                 entry_ctx=self.entry_contexts())
-            # full-state refresh every 30s only — prices/uPnL/stage already ride
-            # the 0.4s hot channel, and this used to force a heavy full push
-            # (serialize + whole-page re-render) every 5 seconds around the clock.
-            if self.on_update and beat % 6 == 0:
+                # the state dicts are built on the loop (cheap); the multi-MB
+                # json.dumps + disk write run on a thread — doing them inline
+                # froze the event loop (ws pushes, ticks, everything) for up to
+                # ~100ms every 30s: the exact cyclic stutter on the dashboard.
+                await asyncio.to_thread(save_paper_state, self.portfolio, self.risk.state,
+                                        brains=self.brain_states(),
+                                        entry_ctx=self.entry_contexts())
+            # full-state refresh every 30s — prices/uPnL/stage already ride the
+            # 0.4s hot channel. OFFSET from the save beat by 15s so the two
+            # heaviest periodic jobs never land in the same instant.
+            if self.on_update and beat % 6 == 3:
                 await self.on_update("state")
 
     async def _fast_push_loop(self) -> None:
