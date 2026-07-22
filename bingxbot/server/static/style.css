@@ -49,14 +49,9 @@ body {
     linear-gradient(90deg, rgba(0,210,255,0.022) 1px, transparent 1px);
   background-size: auto, auto, 44px 44px, 44px 44px;
 }
-/* CRT scanlines — static texture. NO blend mode: mix-blend-mode forced the
-   compositor to re-blend the entire page every frame the cortex animated,
-   which is exactly the whole-app stutter it caused. A plain translucent
-   overlay reads the same and composites for free. */
-body::before {
-  content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 200;
-  background: repeating-linear-gradient(0deg, rgba(0,0,0,0.10) 0 1px, transparent 1px 3px);
-}
+/* CRT scanlines: REMOVED. A fixed full-viewport overlay sits in every display
+   list Firefox rebuilds, and the profiler showed display-list churn as the #1
+   main-thread cost. Not worth a texture. */
 button, input, select { font: inherit; color: inherit; }
 .num { font-variant-numeric: tabular-nums; font-family: var(--mono); }
 .mono { font-family: var(--mono); }
@@ -139,22 +134,28 @@ input.field:focus, select.btn:focus { outline: none; border-color: var(--accent)
 input.field { width: 100%; font-family: var(--mono); }
 
 /* ---------------------------------------------------------------- layout */
-.wrap { padding: 10px 14px 18px; max-width: 2460px; margin: 0 auto; }
+.wrap { padding: 10px 14px 8px; max-width: 2460px; margin: 0 auto; }
 /* default: two columns (market | machine); the third column auto-flows under
    the second so mid-size screens stay sane */
 .grid { display: grid; grid-template-columns: minmax(0,1.5fr) minmax(0,1fr); gap: 12px; }
 .col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 @media (max-width: 1200px) { .grid { grid-template-columns: 1fr; } }
-@media (max-width: 1899px) and (min-width: 1201px) { .col-c { grid-column: 2; } }
+@media (max-width: 1559px) and (min-width: 1201px) { .col-c { grid-column: 2; } }
+/* reflow containment: these widgets mutate width/left several times a second;
+   without containment each mutation dirtied layout for the WHOLE page and
+   Firefox rebuilt the full display list every frame (profiler-confirmed) */
+.gauge-box, .desk, .mtf-cell, .health-meter, .pipe, .gate-list, .tape,
+.tstats .tstat, .price-read { contain: layout paint; }
 #chart-main { height: 384px; }
 #chart-equity { height: 118px; }
-/* ≥1900px (1440p and up): everything on one screen, no page scroll needed —
-   three columns, the cortex as the centerpiece, tab content scrolls inside */
-@media (min-width: 1900px) {
-  .grid { grid-template-columns: minmax(0,1.04fr) minmax(0,0.86fr) minmax(0,0.92fr); }
+/* ≥1560px CSS (covers 1440p at 125%/150% Windows scaling): one screen, no
+   page scroll — three columns with the cortex as the centerpiece, tab
+   content scrolls inside its panel */
+@media (min-width: 1560px) {
+  .grid { grid-template-columns: minmax(0,1.04fr) minmax(0,0.9fr) minmax(0,0.92fr); }
   #chart-main { height: 336px; }
   #chart-equity { height: 96px; }
-  #cortex { height: 436px; }
+  #cortex { height: 640px; }
   .tab-page { max-height: 33vh; overflow-y: auto; }
   .col-c .pbody { max-height: 700px; overflow-y: auto; }
 }
@@ -372,14 +373,14 @@ input.field { width: 100%; font-family: var(--mono); }
   clip-path: polygon(0 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%); }
 .toast.good { border-left-color: var(--good); } .toast.bad { border-left-color: var(--bad); } .toast.warn { border-left-color: var(--warn); }
 @keyframes slidein { from { transform: translateX(30px); opacity: 0; } }
-.foot-note { color: var(--muted); font-size: 10.5px; margin-top: 12px; line-height: 1.5; }
+.foot-note { color: var(--muted); font-size: 10.5px; margin-top: 8px; margin-bottom: 0; line-height: 1.45; }
 
 /* neural cortex — the live brain animation (canvas draws everything; the CSS
    here only frames it and must stay cheap: no animated shadows or filters).
    contain:paint + its own compositor layer keep the 60fps canvas from ever
    invalidating the rest of the page. */
 .cortex-panel .phead { border-bottom: 1px solid var(--border); }
-.cortex-body { position: relative; padding: 0; contain: paint; }
-#cortex { display: block; width: 100%; height: 300px; background: transparent;
-  transform: translateZ(0); }
+.cortex-body { position: relative; padding: 0; contain: layout paint; }
+#cortex { display: block; width: 100%; height: 560px; background: transparent;
+  will-change: transform; transform: translateZ(0); }
 #cortex-cap { font-family: var(--mono); color: var(--muted); font-size: 10px; letter-spacing: .5px; }
