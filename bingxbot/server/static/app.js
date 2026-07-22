@@ -1022,14 +1022,14 @@ const cortex=(()=>{
     pulses.push({x0:h.x,y0:h.y,cx:(h.x+cx)/2,cy:(h.y+cy)/2,x1:cx,y1:cy,
                  p:0,spd:1.1+1.4*s,col:dirCol(h.sig),size:2.6+3.2*s,core:true});
   }
+  // ~30fps via setTimeout->rAF chaining: registering rAF every frame (even to
+  // skip) kept Firefox's refresh driver ticking at 60Hz forever. This way the
+  // browser genuinely idles between our frames.
+  function schedule(ms){ setTimeout(()=>requestAnimationFrame(frame),ms); }
   function frame(t){
-    requestAnimationFrame(frame);
-    if(document.hidden||!W){ lastT=t; return; }
-    // 30fps cap: half the raster work, visually identical for glow physics —
-    // the profiler showed this canvas competing with the page for one core
-    const dtRaw=(t-lastT)/1000;
-    if(dtRaw<0.030) return;
-    const dt=Math.min(0.08,Math.max(0.001,dtRaw)); lastT=t;
+    if(document.hidden||!W){ lastT=t; schedule(250); return; }
+    schedule(17);
+    const dt=Math.min(0.08,Math.max(0.001,(t-lastT)/1000)); lastT=t;
     const k=Math.min(1,dt*5);
     // trail fade, then blit the static layer 1:1 (a SCALED blit was being
     // bilinear-filtered on the CPU every frame)
@@ -1190,7 +1190,7 @@ const cortex=(()=>{
     }
   }
   new ResizeObserver(resize).observe(cv);
-  resize(); requestAnimationFrame(frame);
+  resize(); schedule(0);
   return {data};
 })();
 

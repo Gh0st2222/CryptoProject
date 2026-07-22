@@ -212,12 +212,12 @@ input.field { width: 100%; font-family: var(--mono); }
 .gauge-box .lab { display: flex; justify-content: space-between; color: var(--muted); font: 9px/1 var(--mono); text-transform: uppercase; letter-spacing: 1.4px; }
 .gauge-box .big { font: 800 22px/1.1 var(--mono); margin: 6px 0 5px; text-shadow: 0 0 14px rgba(0,210,255,.15); }
 .bar-track { position: relative; height: 8px; background: var(--surface-3); overflow: hidden; }
-.bar-fill { position: absolute; top: 0; bottom: 0; left: 0; transition: width .4s, background .4s; }
+.bar-fill { position: absolute; top: 0; bottom: 0; left: 0; }  /* no transition: updates arrive 2-4x/s; a .4s tween kept the refresh driver hot */
 .edge-track { background: linear-gradient(90deg, rgba(255,45,120,.28), rgba(24,30,46,.6) 46%, rgba(24,30,46,.6) 54%, rgba(0,210,255,.28)); }
 .edge-track .mid { position: absolute; left: 50%; top: -2px; bottom: -2px; width: 1px; background: var(--baseline); }
 .edge-track .thr { position: absolute; top: -2px; bottom: -2px; width: 1px; background: var(--muted); }
 .edge-track .needle { position: absolute; top: -3px; bottom: -3px; width: 4px; background: var(--ink);
-  left: 50%; transition: left .35s cubic-bezier(.3,.9,.3,1), background .35s; box-shadow: 0 0 10px rgba(0,210,255,.6); }
+  left: 50%; box-shadow: 0 0 10px rgba(0,210,255,.6); }
 
 .badges { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
 .badge { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--border-2);
@@ -246,7 +246,7 @@ input.field { width: 100%; font-family: var(--mono); }
 .desk .dn { display: flex; align-items: center; gap: 6px; font: 700 11px/1 var(--mono); text-transform: uppercase; letter-spacing: .8px; }
 .desk .sw { width: 9px; height: 9px; flex: none; box-shadow: 0 0 7px currentColor; }
 .desk .track { height: 16px; background: var(--surface-3); position: relative; overflow: hidden; }
-.desk .fill { position: absolute; left: 0; top: 0; bottom: 0; transition: width .5s; opacity: .85; }
+.desk .fill { position: absolute; left: 0; top: 0; bottom: 0; opacity: .85; }
 .desk .track .alloc { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); font: 700 10px/1 var(--mono); color: var(--ink); }
 .desk .meta { font: 10px/1.35 var(--mono); color: var(--muted); text-align: right; }
 .desk .meta b { color: var(--ink-2); font-weight: 700; }
@@ -275,7 +275,7 @@ input.field { width: 100%; font-family: var(--mono); }
 .kv { display: flex; justify-content: space-between; font: 10.5px/1.5 var(--mono); }
 .kv .k { color: var(--muted); } .kv .v { color: var(--ink-2); }
 .health-meter { height: 5px; background: var(--surface-3); overflow: hidden; margin-top: 2px; }
-.health-fill { height: 100%; transition: width .4s, background .4s; }
+.health-fill { height: 100%; }
 
 /* ---------------------------------------------------------------- tabs */
 .tabs { display: flex; gap: 1px; padding: 0 6px; border-bottom: 1px solid var(--border); overflow-x: auto; }
