@@ -662,7 +662,10 @@ class AutoTuner:
             "generation": self.de.generation, "population": len(self.de.pop),
             "diversity": round(self.de.diversity(), 3), "folds": len(fold_fits),
             "research_cores": self.orch.research_workers,
-            "champion_fitness": round(champ_fit, 3), "best_fitness": round(best_adj, 3),
+            # best=None means NO candidate passed the profit veto this cycle —
+            # surface null, not the -1e18 selection sentinel
+            "champion_fitness": round(champ_fit, 3),
+            "best_fitness": round(best_adj, 3) if best is not None else None,
             "promoted": promoted, "candidates": len(candidates),
             "vault_candidates": len(vault), "de_candidates": len(topk),
             "champion_source": (best["source"] if best else None),

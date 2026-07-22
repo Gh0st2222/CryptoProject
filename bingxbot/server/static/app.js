@@ -41,12 +41,17 @@ let btEquityChart,btEquitySeries,btAllocChart,btAllocSeries={};
 let pfEquityChart,pfEquitySeries;
 let wfEquityChart,wfEquitySeries;
 function initCharts(){
-  mainChart=LightweightCharts.createChart($("chart-main"),baseOpts(384));
+  const cm=$("chart-main"), ce=$("chart-equity");
+  mainChart=LightweightCharts.createChart(cm,baseOpts(cm.clientHeight||384));
   candleSeries=mainChart.addCandlestickSeries({upColor:C.up,downColor:C.dn,borderUpColor:C.up,borderDownColor:C.dn,wickUpColor:C.up,wickDownColor:C.dn});
-  equityChart=LightweightCharts.createChart($("chart-equity"),{...baseOpts(118),
+  equityChart=LightweightCharts.createChart(ce,{...baseOpts(ce.clientHeight||118),
     rightPriceScale:{borderColor:C.baseline,scaleMargins:{top:0.15,bottom:0.1}},timeScale:{visible:false},handleScroll:false,handleScale:false});
   equitySeries=equityChart.addAreaSeries({lineColor:C.accent,lineWidth:2,topColor:"rgba(0,210,255,0.22)",bottomColor:"rgba(0,210,255,0.02)",priceLineVisible:false});
-  new ResizeObserver(()=>{ mainChart.applyOptions({width:$("chart-main").clientWidth}); equityChart.applyOptions({width:$("chart-equity").clientWidth}); }).observe($("chart-main"));
+  // width AND height track the container — the responsive layout resizes both
+  new ResizeObserver(()=>{
+    mainChart.applyOptions({width:cm.clientWidth,height:cm.clientHeight||384});
+    equityChart.applyOptions({width:ce.clientWidth,height:ce.clientHeight||118});
+  }).observe(cm);
 }
 function tradeMarkers(markers){ return markers.slice().sort((a,b)=>a.ts-b.ts).map(m=>m.kind==="entry"?
   {time:Math.floor(m.ts/1000),position:m.side==="LONG"?"belowBar":"aboveBar",color:m.side==="LONG"?C.up:C.dn,shape:m.side==="LONG"?"arrowUp":"arrowDown",text:m.side==="LONG"?"L":"S"}:
@@ -387,7 +392,7 @@ function renderAutotuner(){
     ["Cycles run",at.cycles],
     ["Improvements",at.improvements],
     ["Champion fitness",at.champion_fitness??"—"],
-    ["Last challenger",lc?`${lc.best_fitness} (${lc.promoted?"adopted":"kept"})`:"—"],
+    ["Last challenger",lc?(lc.best_fitness==null?"none passed profit gate":`${lc.best_fitness} (${lc.promoted?"adopted":"kept"})`):"—"],
     ["Diversity",lc?.diversity??"—"],
     ["Next cycle",next],
   ].map(([k,v])=>`<div class="at-badge"><div class="k">${k}</div><div class="v">${esc(String(v))}</div></div>`).join("");
@@ -890,18 +895,27 @@ const ALPHA_DESK={momentum:"trend",macd:"trend",mtf_trend:"trend",breakout:"tren
   meanrev_bb:"meanrev",capitulation:"meanrev",rsi_fade:"meanrev",stoch_fade:"meanrev",vwap_revert:"meanrev",vwap_pullback:"meanrev",
   obi:"micro",flow:"micro",cvd_trend:"micro",spread_pressure:"micro",
   squeeze:"vol",vol_breakout:"vol",funding_skew:"carry",oi_divergence:"carry"};
+const ALPHA_SHORT={momentum:"MOM",macd:"MACD",mtf_trend:"MTF",breakout:"BRK",roc_accel:"ROC",
+  meanrev_bb:"BB",capitulation:"CAP",rsi_fade:"RSI",stoch_fade:"STO",vwap_revert:"VWR",vwap_pullback:"VWP",
+  obi:"OBI",flow:"FLOW",cvd_trend:"CVD",spread_pressure:"SPR",squeeze:"SQZ",vol_breakout:"VBK",
+  funding_skew:"FND",oi_divergence:"OI"};
+const REGIME_TINT={TREND_UP:"#00e0a0",TREND_DOWN:"#ff3d7f",RANGE:"#9d6bff",VOLATILE:"#ffc93d"};
 const cortex=(()=>{
   const cv=$("cortex"); if(!cv) return {data(){}};
   const g=cv.getContext("2d");
   const DPR=Math.min(window.devicePixelRatio||1,1.5);
   let W=0,H=0,cx=0,cy=0,R=0;
-  let nodes=[],hubs={},layoutSig="";
+  let nodes=[],hubs={},layoutSig="",bgDirty=true,bgRegime="";
   let tgt=null;                                  // latest viz payload
   const ex={edge:0,p_win:0.5,regime:"RANGE",sym:"",stage:"SCAN",block:"",held:false};
   const e={edge:0,p_win:0.5,charge:0};           // eased display values
-  const deskAcc={},pulses=[];
+  const deskAcc={},pulses=[],ripples=[],motes=[],ekg=[];
   let spin=0,lastT=0,capT=0;
+  const bg=document.createElement("canvas");     // static layer: mesh + labels + wash
   const SPR={};
+  const lerp=(a,b,k)=>a+(b-a)*k;
+  const dirCol=(v)=>v>=0?C.up:C.dn;
+  const TAU=Math.PI*2;
   function sprite(col){
     if(SPR[col]) return SPR[col];
     const s=document.createElement("canvas"); s.width=s.height=64;
@@ -916,56 +930,102 @@ const cortex=(()=>{
     if(!w||!h) return;
     cv.width=Math.round(w*DPR); cv.height=Math.round(h*DPR);
     g.setTransform(DPR,0,0,DPR,0,0);
-    W=w; H=h; cx=W*0.5; cy=H*0.53; R=Math.min(W*0.36,H*0.44);
-    layout();
+    W=w; H=h; cx=W*0.5; cy=H*0.52;
+    R=Math.min(W*0.335,(cy-16)/1.16);
+    if(!motes.length) for(let i=0;i<26;i++) motes.push({x:Math.random()*w,y:Math.random()*h,
+      vx:(Math.random()-0.5)*5,vy:-3-Math.random()*5,ph:Math.random()*TAU});
+    layout(); bgDirty=true;
   }
   function layout(){
     if(!tgt) return;
     const old={}; for(const nd of nodes) old[nd.nm]=nd;
     nodes=[]; hubs={};
     DESK_ORDER.forEach((d,i)=>{
-      const ang=-Math.PI/2+i*(2*Math.PI/DESK_ORDER.length);
-      hubs[d]={x:cx+Math.cos(ang)*R*0.48,y:cy+Math.sin(ang)*R*0.48,ang,col:DESK_COLORS[d],sig:0,alloc:0.2};
+      const ang=-Math.PI/2+i*(TAU/DESK_ORDER.length);
+      hubs[d]={x:cx+Math.cos(ang)*R*0.46,y:cy+Math.sin(ang)*R*0.46,ang,col:DESK_COLORS[d],sig:0,alloc:0.2};
       deskAcc[d]=deskAcc[d]||Math.random();
     });
     const byDesk={};
     for(const [nm] of tgt.a){ const d=ALPHA_DESK[nm]||"trend"; (byDesk[d]=byDesk[d]||[]).push(nm); }
+    let idx=0;
     for(const d of DESK_ORDER){
       const names=byDesk[d]||[],hub=hubs[d],n=names.length;
       names.forEach((nm,j)=>{
         const off=(n>1?(j/(n-1)-0.5):0)*Math.min(1.25,0.36*(n-1));
         const ang=hub.ang+off;
-        const p=old[nm]||{sc:0,tsc:0,wt:0.2,twt:0.2,acc:Math.random(),ph:Math.random()*6.283};
-        nodes.push({nm,d,col:hub.col,hub,
-          x:cx+Math.cos(ang)*R*0.98,y:cy+Math.sin(ang)*R*0.98,
-          sc:p.sc,tsc:p.tsc,wt:p.wt,twt:p.twt,acc:p.acc,ph:p.ph});
+        const x=cx+Math.cos(ang)*R*0.97, y=cy+Math.sin(ang)*R*0.97;
+        // curved axon: control point pushed sideways so the wiring weaves
+        const mx=(x+hub.x)/2, my=(y+hub.y)/2;
+        const dx=hub.x-x, dy=hub.y-y, dl=Math.hypot(dx,dy)||1;
+        const side=(idx++%2?1:-1)*0.22;
+        const cpx=mx-dy/dl*dl*side, cpy=my+dx/dl*dl*side;
+        const p=old[nm]||{sc:0,tsc:0,wt:0.2,twt:0.2,acc:Math.random(),ph:Math.random()*TAU};
+        nodes.push({nm,short:ALPHA_SHORT[nm]||nm.slice(0,4).toUpperCase(),d,col:hub.col,hub,
+          x,y,ang,cpx,cpy,sc:p.sc,tsc:p.tsc,wt:p.wt,twt:p.twt,acc:p.acc,ph:p.ph});
       });
     }
+    bgDirty=true;
+  }
+  function drawBg(){
+    bg.width=Math.round(W*DPR); bg.height=Math.round(H*DPR);
+    const b=bg.getContext("2d"); b.setTransform(DPR,0,0,DPR,0,0);
+    // regime wash — a deep tinted atmosphere behind everything
+    const tint=REGIME_TINT[bgRegime]||REGIME_TINT.RANGE;
+    const wash=b.createRadialGradient(cx,cy,R*0.1,cx,cy,Math.max(W,H)*0.75);
+    wash.addColorStop(0,tint+"14"); wash.addColorStop(0.55,tint+"07"); wash.addColorStop(1,"#00000000");
+    b.fillStyle=wash; b.fillRect(0,0,W,H);
+    // guide rings + desk sector spokes
+    b.strokeStyle="rgba(0,210,255,0.05)"; b.lineWidth=1;
+    for(const rr of [0.46,0.97]){ b.beginPath(); b.arc(cx,cy,R*rr,0,TAU); b.stroke(); }
+    b.setLineDash([2,7]);
+    b.strokeStyle="rgba(0,210,255,0.06)";
+    for(const d of DESK_ORDER){ const h=hubs[d]; if(!h) continue;
+      b.beginPath(); b.moveTo(cx+Math.cos(h.ang)*R*0.18,cy+Math.sin(h.ang)*R*0.18);
+      b.lineTo(cx+Math.cos(h.ang)*R*1.06,cy+Math.sin(h.ang)*R*1.06); b.stroke(); }
+    b.setLineDash([]);
+    // alpha name labels around the outer ring
+    b.font="7.5px ui-monospace,monospace"; b.textAlign="center"; b.fillStyle="rgba(89,99,122,0.75)";
+    for(const nd of nodes){
+      b.fillText(nd.short,cx+Math.cos(nd.ang)*R*1.10,cy+Math.sin(nd.ang)*R*1.10+2.5);
+    }
+    // desk labels sit inside their sector
+    b.font="8px ui-monospace,monospace";
+    for(const d of DESK_ORDER){ const h=hubs[d]; if(!h) continue;
+      b.fillStyle=h.col+"aa";
+      b.fillText(DESK_LABEL[d],cx+Math.cos(h.ang)*R*0.70,cy+Math.sin(h.ang)*R*0.70+3); }
+    bgDirty=false;
   }
   function data(viz,extra){
     tgt=viz; Object.assign(ex,extra||{});
     const sig=viz.a.map(x=>x[0]).join(",");
     if(sig!==layoutSig){ layoutSig=sig; layout(); }
+    if(ex.regime!==bgRegime){ bgRegime=ex.regime; bgDirty=true; }
     const m={}; for(const [nm,sc,wt] of viz.a) m[nm]=[sc,wt];
     for(const nd of nodes){ const v=m[nd.nm]; if(v){ nd.tsc=v[0]; nd.twt=v[1]; } }
     for(const d of DESK_ORDER){ const v=viz.d?.[d]; if(v&&hubs[d]){ hubs[d].sig=v[0]; hubs[d].alloc=v[1]; } }
+    ekg.push(clamp(ex.edge,-1,1)); if(ekg.length>170) ekg.shift();   // ~1 min memory
   }
-  const lerp=(a,b,k)=>a+(b-a)*k;
-  const dirCol=(v)=>v>=0?C.up:C.dn;
-  function spawn(x0,y0,x1,y1,col,spd,size){
-    if(pulses.length>140) pulses.shift();
-    pulses.push({x0,y0,x1,y1,p:0,spd,col,size});
+  function spawn(nd){   // pulse along the curved axon
+    if(pulses.length>150) pulses.shift();
+    pulses.push({x0:nd.x,y0:nd.y,cx:nd.cpx,cy:nd.cpy,x1:nd.hub.x,y1:nd.hub.y,
+                 p:0,spd:0.9+1.6*Math.abs(nd.sc),col:dirCol(nd.sc),size:2.0+2.5*Math.abs(nd.sc)});
+  }
+  function spawnCore(h){   // hub -> core, straight but glowing
+    if(pulses.length>150) pulses.shift();
+    const s=Math.abs(h.sig)*Math.min(1,h.alloc*4);
+    pulses.push({x0:h.x,y0:h.y,cx:(h.x+cx)/2,cy:(h.y+cy)/2,x1:cx,y1:cy,
+                 p:0,spd:1.1+1.4*s,col:dirCol(h.sig),size:2.6+3.2*s,core:true});
   }
   function frame(t){
     requestAnimationFrame(frame);
-    if(document.hidden){ lastT=t; return; }
-    if(!W||cv.clientWidth!==W) resize();
-    if(!W) return;
+    if(document.hidden||!W){ lastT=t; return; }
     const dt=Math.min(0.05,Math.max(0.001,(t-lastT)/1000)); lastT=t;
     const k=Math.min(1,dt*5);
-    // trail fade — the cheap way to get comet tails and glow persistence
+    // trail fade, then blit the static layer (rings/labels/wash stay crisp)
     g.globalCompositeOperation="source-over";
     g.fillStyle="rgba(5,7,12,0.30)"; g.fillRect(0,0,W,H);
+    if(bgDirty) drawBg();
+    g.globalAlpha=0.6; g.drawImage(bg,0,0,W,H); g.globalAlpha=1;
     if(!tgt||!nodes.length){
       g.fillStyle="#59637a"; g.font="10px ui-monospace,monospace"; g.textAlign="center";
       g.fillText("cortex warming up — waiting for the first evaluation…",cx,cy);
@@ -974,98 +1034,127 @@ const cortex=(()=>{
     const thr=tgt.thr||0.3;
     e.edge=lerp(e.edge,ex.edge,k); e.p_win=lerp(e.p_win,ex.p_win,k);
     e.charge=lerp(e.charge,clamp(Math.abs(e.edge)/Math.max(thr,0.01),0,1.35),k);
-    spin+=dt*(0.4+e.charge*2.2);
-    // axons (faint, brightness follows live strength)
-    g.lineWidth=1;
+    spin+=dt*(0.5+e.charge*2.4);
+    // ambient motes — depth without cost
+    g.globalCompositeOperation="lighter";
+    for(const m of motes){
+      m.x+=m.vx*dt; m.y+=m.vy*dt;
+      if(m.y<-4) { m.y=H+4; m.x=Math.random()*W; }
+      if(m.x<-4) m.x=W+4; else if(m.x>W+4) m.x=-4;
+      g.globalAlpha=0.05+0.05*Math.sin(t*0.0011+m.ph);
+      g.drawImage(sprite(C.accent),m.x-3,m.y-3,6,6);
+    }
+    g.globalAlpha=1; g.globalCompositeOperation="source-over";
+    // curved axons — brightness follows live strength
     for(const nd of nodes){
       nd.sc=lerp(nd.sc,nd.tsc,k); nd.wt=lerp(nd.wt,nd.twt,k);
-      const a=0.05+0.20*Math.min(1,Math.abs(nd.sc));
-      g.strokeStyle=nd.col+Math.round(a*255).toString(16).padStart(2,"0");
-      g.beginPath(); g.moveTo(nd.x,nd.y); g.lineTo(nd.hub.x,nd.hub.y); g.stroke();
+      const s=Math.min(1,Math.abs(nd.sc));
+      g.strokeStyle=nd.col+Math.round((0.05+0.22*s)*255).toString(16).padStart(2,"0");
+      g.lineWidth=0.8+1.4*s;
+      g.beginPath(); g.moveTo(nd.x,nd.y); g.quadraticCurveTo(nd.cpx,nd.cpy,nd.hub.x,nd.hub.y); g.stroke();
+      if(s>0.1){ nd.acc+=dt*(0.25+2.6*s); if(nd.acc>=1){ nd.acc=0; spawn(nd); } }
     }
     for(const d of DESK_ORDER){
       const h=hubs[d]; if(!h) continue;
-      const a=0.08+0.30*Math.min(1,Math.abs(h.sig));
-      g.strokeStyle=h.col+Math.round(a*255).toString(16).padStart(2,"0");
-      g.lineWidth=1+2.5*h.alloc;
+      const s=Math.min(1,Math.abs(h.sig));
+      g.strokeStyle=h.col+Math.round((0.10+0.30*s)*255).toString(16).padStart(2,"0");
+      g.lineWidth=1+2.6*h.alloc;
       g.beginPath(); g.moveTo(h.x,h.y); g.lineTo(cx,cy); g.stroke();
+      const ss=s*Math.min(1,h.alloc*4);
+      if(ss>0.05){ deskAcc[d]+=dt*(0.3+3.0*ss); if(deskAcc[d]>=1){ deskAcc[d]=0; spawnCore(h); } }
     }
-    // spawn pulses from live strengths (keeps firing between ws updates)
-    for(const nd of nodes){
-      const s=Math.abs(nd.sc);
-      if(s>0.1){
-        nd.acc+=dt*(0.25+2.6*s);
-        if(nd.acc>=1){ nd.acc=0; spawn(nd.x,nd.y,nd.hub.x,nd.hub.y,dirCol(nd.sc),0.9+1.6*s,2.0+2.5*s); }
-      }
-    }
-    for(const d of DESK_ORDER){
-      const h=hubs[d]; const s=Math.abs(h.sig)*Math.min(1,h.alloc*4);
-      if(s>0.05){
-        deskAcc[d]+=dt*(0.3+3.0*s);
-        if(deskAcc[d]>=1){ deskAcc[d]=0; spawn(h.x,h.y,cx,cy,dirCol(h.sig),1.1+1.4*s,2.5+3.0*s); }
-      }
-    }
-    // glows ride additive blending
+    // pulses ride the curves; arrivals ripple
     g.globalCompositeOperation="lighter";
     for(let i=pulses.length-1;i>=0;i--){
       const p=pulses[i]; p.p+=p.spd*dt;
-      if(p.p>=1){ pulses.splice(i,1); continue; }
-      const x=lerp(p.x0,p.x1,p.p),y=lerp(p.y0,p.y1,p.p);
-      const s=p.size*4*(1-p.p*0.4);
+      if(p.p>=1){
+        if(ripples.length<24) ripples.push({x:p.x1,y:p.y1,r:2,max:p.core?26:14,col:p.col});
+        pulses.splice(i,1); continue;
+      }
+      const u=1-p.p;
+      const x=u*u*p.x0+2*u*p.p*p.cx+p.p*p.p*p.x1;
+      const y=u*u*p.y0+2*u*p.p*p.cy+p.p*p.p*p.y1;
+      const s=p.size*4*(1-p.p*0.35);
       g.globalAlpha=0.85; g.drawImage(sprite(p.col),x-s/2,y-s/2,s,s);
     }
+    for(let i=ripples.length-1;i>=0;i--){
+      const r=ripples[i]; r.r+=dt*46;
+      if(r.r>=r.max){ ripples.splice(i,1); continue; }
+      g.globalAlpha=(1-r.r/r.max)*0.4; g.strokeStyle=r.col; g.lineWidth=1.2;
+      g.beginPath(); g.arc(r.x,r.y,r.r,0,TAU); g.stroke();
+    }
+    // neuron + hub glows
     for(const nd of nodes){
-      const s=Math.abs(nd.sc);
+      const s=Math.min(1,Math.abs(nd.sc));
       const breathe=0.5+0.5*Math.sin(t*0.001+nd.ph);
-      const sz=7+26*Math.min(1,s)+3*breathe*(0.3+s);
-      g.globalAlpha=0.28+0.62*Math.min(1,s);
+      const sz=7+26*s+3*breathe*(0.3+s);
+      g.globalAlpha=0.26+0.62*s;
       g.drawImage(sprite(s>0.05?dirCol(nd.sc):nd.col),nd.x-sz/2,nd.y-sz/2,sz,sz);
     }
     for(const d of DESK_ORDER){
-      const h=hubs[d]; const sz=16+34*h.alloc+16*Math.min(1,Math.abs(h.sig));
-      g.globalAlpha=0.55;
-      g.drawImage(sprite(h.col),h.x-sz/2,h.y-sz/2,sz,sz);
+      const h=hubs[d]; const sz=15+32*h.alloc+15*Math.min(1,Math.abs(h.sig));
+      g.globalAlpha=0.55; g.drawImage(sprite(h.col),h.x-sz/2,h.y-sz/2,sz,sz);
     }
-    // core glow scales with charge; goes hot when the edge crosses threshold
     const coreCol=dirCol(e.edge);
-    const coreSz=R*0.62*(0.75+0.45*e.charge);
-    g.globalAlpha=0.30+0.45*Math.min(1,e.charge);
+    const coreSz=R*0.60*(0.75+0.45*e.charge);
+    g.globalAlpha=0.28+0.45*Math.min(1,e.charge);
     g.drawImage(sprite(coreCol),cx-coreSz/2,cy-coreSz/2,coreSz,coreSz);
     g.globalAlpha=1; g.globalCompositeOperation="source-over";
-    // crisp marks: nodes, hubs, core ring + numbers
+    // crisp marks: neurons, hub cores + allocation arcs
     for(const nd of nodes){
-      g.fillStyle=Math.abs(nd.sc)>0.05?dirCol(nd.sc):"#2a3346";
-      g.beginPath(); g.arc(nd.x,nd.y,1.6+1.6*Math.min(1,Math.abs(nd.sc)),0,6.283); g.fill();
+      const s=Math.min(1,Math.abs(nd.sc));
+      g.fillStyle=s>0.05?dirCol(nd.sc):"#2a3346";
+      g.beginPath(); g.arc(nd.x,nd.y,1.6+1.7*s,0,TAU); g.fill();
     }
-    g.font="8.5px ui-monospace,monospace"; g.textAlign="center";
     for(const d of DESK_ORDER){
       const h=hubs[d];
-      g.fillStyle=h.col; g.beginPath(); g.arc(h.x,h.y,2.6+3.5*h.alloc,0,6.283); g.fill();
-      const lx=cx+(h.x-cx)*1.34, ly=cy+(h.y-cy)*1.34;
-      g.fillStyle="#59637a"; g.fillText(DESK_LABEL[d],lx,ly+3);
+      g.fillStyle=h.col; g.beginPath(); g.arc(h.x,h.y,2.4+3.2*h.alloc,0,TAU); g.fill();
+      g.strokeStyle=h.col+"88"; g.lineWidth=1.6;   // allocation arc around the hub
+      g.beginPath(); g.arc(h.x,h.y,8.5,-Math.PI/2,-Math.PI/2+clamp(h.alloc/0.4,0,1)*TAU); g.stroke();
     }
-    const cr=R*0.30;
+    // the core: threshold ring, |edge| arc, p(win) inner arc, ARMED reticle
+    const cr=R*0.285;
     g.lineWidth=3; g.strokeStyle="#141827";
-    g.beginPath(); g.arc(cx,cy,cr,0,6.283); g.stroke();
-    const frac=clamp(Math.abs(e.edge),0,1);
+    g.beginPath(); g.arc(cx,cy,cr,0,TAU); g.stroke();
     g.strokeStyle=coreCol;
-    g.beginPath(); g.arc(cx,cy,cr,-Math.PI/2,-Math.PI/2+frac*6.283*(e.edge>=0?1:-1),e.edge<0); g.stroke();
-    for(const s of [-1,1]){   // threshold ticks
-      const a=-Math.PI/2+s*clamp(thr,0,1)*6.283;
+    g.beginPath(); g.arc(cx,cy,cr,-Math.PI/2,-Math.PI/2+clamp(Math.abs(e.edge),0,1)*TAU*(e.edge>=0?1:-1),e.edge<0); g.stroke();
+    g.lineWidth=2; g.strokeStyle="#1d2436";
+    g.beginPath(); g.arc(cx,cy,cr-6,0,TAU); g.stroke();
+    g.strokeStyle=C.accent+"cc";
+    g.beginPath(); g.arc(cx,cy,cr-6,-Math.PI/2,-Math.PI/2+clamp(e.p_win,0,1)*TAU); g.stroke();
+    for(const s of [-1,1]){   // threshold ticks on the edge ring
+      const a=-Math.PI/2+s*clamp(thr,0,1)*TAU;
       g.strokeStyle="#59637a"; g.lineWidth=2;
-      g.beginPath(); g.moveTo(cx+Math.cos(a)*(cr-5),cy+Math.sin(a)*(cr-5));
-      g.lineTo(cx+Math.cos(a)*(cr+5),cy+Math.sin(a)*(cr+5)); g.stroke();
+      g.beginPath(); g.moveTo(cx+Math.cos(a)*(cr-3),cy+Math.sin(a)*(cr-3));
+      g.lineTo(cx+Math.cos(a)*(cr+4),cy+Math.sin(a)*(cr+4)); g.stroke();
     }
-    if(e.charge>=1){          // ARMED: rotating firing ring
-      g.strokeStyle=coreCol; g.lineWidth=1.5; g.setLineDash([4,9]); g.lineDashOffset=-spin*30;
-      g.beginPath(); g.arc(cx,cy,cr+7,0,6.283); g.stroke(); g.setLineDash([]);
+    if(e.charge>=1){          // ARMED: twin counter-rotating reticles
+      g.strokeStyle=coreCol; g.lineWidth=1.5;
+      g.setLineDash([5,10]); g.lineDashOffset=-spin*30;
+      g.beginPath(); g.arc(cx,cy,cr+7,0,TAU); g.stroke();
+      g.setLineDash([2,12]); g.lineDashOffset=spin*44;
+      g.beginPath(); g.arc(cx,cy,cr+12,0,TAU); g.stroke();
+      g.setLineDash([]);
     }
+    g.textAlign="center";
     g.fillStyle=coreCol; g.font="700 17px ui-monospace,monospace";
     g.fillText((e.edge>=0?"+":"−")+Math.abs(e.edge).toFixed(2),cx,cy-2);
     g.fillStyle="#a6b3c2"; g.font="8.5px ui-monospace,monospace";
     g.fillText(`P ${Math.round(e.p_win*100)}%${tgt.meta_p!=null?` · ML ${Math.round(tgt.meta_p*100)}%`:""}`,cx,cy+11);
     const rm=REGIME_META[ex.regime]||REGIME_META.RANGE;
-    g.fillStyle="#59637a"; g.fillText(`${rm.g} ${ex.regime}`,cx,cy+22);
+    g.fillStyle=REGIME_TINT[ex.regime]||"#59637a"; g.fillText(`${rm.g} ${ex.regime.replace("_"," ")}`,cx,cy+23);
+    // edge EKG — the last minute of conviction, breathing along the bottom
+    if(ekg.length>2){
+      const eh=13, ey=H-8, x0=8, x1=W-8;
+      g.strokeStyle="rgba(0,210,255,0.10)"; g.lineWidth=1;
+      g.beginPath(); g.moveTo(x0,ey); g.lineTo(x1,ey); g.stroke();
+      g.beginPath();
+      for(let i=0;i<ekg.length;i++){
+        const x=x0+(x1-x0)*(i/(ekg.length-1)), y=ey-ekg[i]*eh;
+        i?g.lineTo(x,y):g.moveTo(x,y);
+      }
+      g.strokeStyle=dirCol(ekg[ekg.length-1])+"99"; g.lineWidth=1.2; g.stroke();
+    }
     // caption (DOM text, 2 Hz is plenty)
     if(t-capT>500){ capT=t;
       const cap=$("cortex-cap");
