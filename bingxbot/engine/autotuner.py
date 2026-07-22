@@ -46,13 +46,20 @@ DEFLATE_K = 0.03            # margin inflation per decade of candidates tried on
                             # OOS window — multiple-testing honesty: after thousands
                             # of shots at the same gate, a marginal "win" is luck
 DEFLATE_CAP = 0.10          # never demand more than +10% extra margin
-MIN_ABS_FITNESS = 0.3       # ...and be clearly profitable (positive risk-adjusted score)
-OVERFIT_LAMBDA = 0.5        # penalty weight on the in-sample -> OOS drop
+MIN_ABS_FITNESS = 0.15      # ...and be clearly profitable (positive risk-adjusted
+                            # score). Recalibrated for the honest-fills scale
+                            # (v3): trade-through limits + double stop slippage
+                            # compressed every fitness number, and a floor tuned
+                            # to the old flattering scale would have quietly
+                            # made promotion stricter than anyone decided.
 TOP_K_VALIDATE = 5          # validate this many training-best members OOS, keep the best generalizer
 OOS_FOLDS = 3               # purged sequential portfolio folds a champion must earn across
 VAULT_CANDIDATES = 4        # also re-validate this many top vault champions each cycle (candidate pool, not graveyard)
 STALL_REINJECT = 20         # cycles without a promotion before a diversity restart
-DEMOTE_FLOOR = -1.0         # incumbent scoring below this on the TRADED basket is toxic...
+DEMOTE_FLOOR = -0.5         # incumbent scoring below this on the TRADED basket is
+                            # toxic... (recalibrated with MIN_ABS_FITNESS for the
+                            # compressed v3 scale — on the old bar the stand-down
+                            # would now trigger too late)
 DEMOTE_PATIENCE = 3         # ...for this many consecutive cycles -> stand down
 LIVE_MIN_SAMPLE = 8         # real trades before live evidence can demote: 1 win in
                             # 8 when the validation promised ~70% WR is a ~0.1%
@@ -471,9 +478,15 @@ class AutoTuner:
         best_folds: list[float] = []
         for i, c in enumerate(cands):
             oos, stats0, fold_fits_oos = cand_fit(i)
-            # DE members carry an overfit penalty (in-sample -> OOS drop); vault
-            # champions are scored raw — they've already proven out-of-sample.
-            adj = oos - (OVERFIT_LAMBDA * max(0.0, c["train_fit"] - oos) if c["train_fit"] is not None else 0.0)
+            # NO in-sample-vs-OOS value penalty anymore: training fitness is a
+            # SINGLE-SYMBOL score and OOS is a PORTFOLIO composite — different
+            # simulators, different units. Subtracting them charged every DE
+            # candidate (the only source of NEW champions) a handicap
+            # proportional to a unit mismatch, not to measured overfitting.
+            # Overfit protection lives where the units are consistent: the
+            # median+worst composite, the majority-fold beat, the PF >= 1
+            # veto and the deflated margin — all pure OOS.
+            adj = oos
             if c["source"] == "vault" and c["cid"]:
                 self.orch.set_champion_current(c["cid"], oos, stats0)  # keep its CURRENT eval fresh
             # absolute-profit veto: whatever the fitness composite says, a set

@@ -700,7 +700,8 @@ function renderChampions(){
   body.innerHTML=champStore.map((c,i)=>{
     const params=CHAMP_KEYS.filter(k=>c.params&&c.params[k]!=null).map(k=>`${k}=${c.params[k]}`).join("  ");
     const bf=c.birth_fitness??c.fitness??0, cf=c.fitness??0;
-    const oldScale=(c.fver??1)!==2;   // born under an older fitness scale — numbers not comparable
+    const oldScale=(c.fver??1)!==3;   // born under an older fitness scale — numbers not comparable
+                                      // (v3 = honest fills; v2 and earlier were the flattering fill model)
     const arrow=oldScale?"·":(cf>bf+1e-9?"▲":(cf<bf-1e-9?"▼":"·"));
     const bfCell=oldScale?`<span style="color:var(--muted);opacity:.5" title="recorded under an older fitness scale — not comparable to the current number">${bf.toFixed(2)}*</span>`
                          :`<span style="color:var(--muted)">${bf.toFixed(2)}</span>`;
