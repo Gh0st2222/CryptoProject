@@ -160,38 +160,57 @@ function renderPipeline(){
     return `<div class="pstage ${cls}"><div class="n">${String(i+1).padStart(2,"0")}</div><div class="l">${s}</div></div>`;
   }).join("");
 }
-let _gateSig=null;
+/* gates + MTF ladder: the structure is built ONCE per shape, then only text,
+   classes and bar widths are patched in place — the old innerHTML rebuilds
+   re-parsed and re-laid-out these widgets several times a second. */
+let _gateStruct=null,_gateRows=null;
 function renderGates(es){
-  // the entry-gate X-ray: every rung of the entry chain with live numbers —
-  // the failing rung is exactly why the machine is holding fire.
   const el=$("gate-list"); if(!el) return;
-  const held=S?.engine?.portfolio?.open_positions?.[curSymbol];
+  const held=!!S?.engine?.portfolio?.open_positions?.[curSymbol];
   const g=es?.gates||[];
-  const sig=curSymbol+"|"+(held?"H":"")+"|"+JSON.stringify(g);
-  if(sig===_gateSig) return; _gateSig=sig;
-  if(held){ el.innerHTML=`<span class="mtf-empty">in position — gates re-arm on exit</span>`; return; }
-  if(!g.length){ el.innerHTML=`<span class="mtf-empty">warming up…</span>`; return; }
-  el.innerHTML=g.map(x=>`<div class="gate ${x.ok?'pass':'fail'}" title="${esc(x.d)}">
-    <span class="gd">${x.ok?"▮":"▯"}</span><span class="gn">${esc(x.n)}</span><span class="gv">${esc(x.d)}</span></div>`).join("");
+  const struct=curSymbol+"|"+(held?"H":"")+"|"+g.map(x=>x.n).join(",");
+  if(struct!==_gateStruct){
+    _gateStruct=struct; _gateRows=null;
+    if(held){ el.innerHTML=`<span class="mtf-empty">in position — gates re-arm on exit</span>`; return; }
+    if(!g.length){ el.innerHTML=`<span class="mtf-empty">warming up…</span>`; return; }
+    el.innerHTML=g.map(x=>`<div class="gate"><span class="gd"></span><span class="gn">${esc(x.n)}</span><span class="gv"></span></div>`).join("");
+    _gateRows=[...el.querySelectorAll(".gate")];
+  }
+  if(!_gateRows) return;
+  for(let i=0;i<g.length&&i<_gateRows.length;i++){
+    const r=_gateRows[i], x=g[i];
+    const cls="gate "+(x.ok?"pass":"fail");
+    if(r.className!==cls) r.className=cls;
+    const glyph=x.ok?"▮":"▯";
+    if(r.firstChild.textContent!==glyph) r.firstChild.textContent=glyph;
+    if(r.lastChild.textContent!==x.d){ r.lastChild.textContent=x.d; r.title=x.d; }
+  }
 }
-let _mtfSig=null;
+let _mtfStruct=null,_mtfCells=null;
 function renderMTF(es){
   const strip=$("mtf-strip"); if(!strip) return;
   const mtf=es?.mtf||{};
-  const sig=curSymbol+"|"+JSON.stringify(mtf);
-  if(sig===_mtfSig) return; _mtfSig=sig;
   const order=["1m","5m","15m","1h"].filter(tf=>mtf[tf]);
-  if(!order.length){ strip.innerHTML=`<span class="mtf-empty">warming up…</span>`; return; }
-  strip.innerHTML=order.map(tf=>{
+  const struct=curSymbol+"|"+order.join(",");
+  if(struct!==_mtfStruct){
+    _mtfStruct=struct; _mtfCells=null;
+    if(!order.length){ strip.innerHTML=`<span class="mtf-empty">warming up…</span>`; return; }
+    strip.innerHTML=order.map(tf=>`<div class="mtf-cell"><div class="tf">${tf}</div>
+      <div class="dir"></div><div class="tfbar"><div class="tffill"></div></div><div class="tfrsi"></div></div>`).join("");
+    _mtfCells=[...strip.querySelectorAll(".mtf-cell")];
+  }
+  if(!_mtfCells) return;
+  order.forEach((tf,i)=>{
+    const c=_mtfCells[i]; if(!c) return;
     const m=mtf[tf], d=m.dir||0;
-    const cls=d>0.15?"up":d<-0.15?"dn":"flat";
+    const cls="mtf-cell "+(d>0.15?"up":d<-0.15?"dn":"flat");
+    if(c.className!==cls) c.className=cls;
     const arrow=d>0.15?"▲":d<-0.15?"▼":"▬";
-    const w=Math.round(Math.abs(clamp(d,-1,1))*100);
-    return `<div class="mtf-cell ${cls}"><div class="tf">${tf}</div>
-      <div class="dir">${arrow}</div>
-      <div class="tfbar"><div class="tffill" style="width:${w}%"></div></div>
-      <div class="tfrsi">RSI ${Math.round(m.rsi)}</div></div>`;
-  }).join("");
+    if(c.children[1].textContent!==arrow) c.children[1].textContent=arrow;
+    c.children[2].firstChild.style.width=Math.round(Math.abs(clamp(d,-1,1))*100)+"%";
+    const rsi="RSI "+Math.round(m.rsi);
+    if(c.children[3].textContent!==rsi) c.children[3].textContent=rsi;
+  });
 }
 function renderEdgeGauge(b, es){
   // price + edge/p(win) gauges + entry gate — the elements that must feel live,
@@ -944,11 +963,15 @@ const cortex=(()=>{
     c2.fillStyle=gr; c2.fillRect(0,0,64,64);
     return SPR[col]=s;
   }
+  let RS=1;   // render scale: DPR capped by a fixed PIXEL BUDGET, so the 30fps
+              // trail-fade + glow pass costs the same on any monitor. Soft glow
+              // art loses nothing visible at a slightly lower backing density.
   function resize(){
     const w=cv.clientWidth,h=cv.clientHeight;
     if(!w||!h) return;
-    cv.width=Math.round(w*DPR); cv.height=Math.round(h*DPR);
-    g.setTransform(DPR,0,0,DPR,0,0);
+    RS=Math.max(0.75,Math.min(DPR,Math.sqrt(560000/(w*h))));
+    cv.width=Math.round(w*RS); cv.height=Math.round(h*RS);
+    g.setTransform(RS,0,0,RS,0,0);
     // soft radial sprites don't need bilinear filtering — and the Firefox
     // profiler showed every filtered blit being rasterized on the CPU
     g.imageSmoothingEnabled=false;
@@ -990,8 +1013,8 @@ const cortex=(()=>{
   }
   const fscale=()=>Math.max(0.85,Math.min(2.0,R/165));
   function drawBg(){
-    bg.width=Math.round(W*DPR); bg.height=Math.round(H*DPR);
-    const b=bg.getContext("2d"); b.setTransform(DPR,0,0,DPR,0,0);
+    bg.width=Math.round(W*RS); bg.height=Math.round(H*RS);
+    const b=bg.getContext("2d"); b.setTransform(RS,0,0,RS,0,0);
     const F=fscale();
     // regime wash — a deep tinted atmosphere behind everything
     const tint=REGIME_TINT[bgRegime]||REGIME_TINT.RANGE;
