@@ -351,21 +351,23 @@ class TradingBrain:
         """Everything the online learning has earned — hedge weights, desk
         performance, calibrator, beta, threshold history. Restarts used to
         reset all of it to uniform, throwing away days of adaptation."""
+        # full precision throughout: persistence must restore EXACTLY what was
+        # learned — rounding "for tidy JSON" made restored calibrator weights
+        # drift by up to 5e-9, which is a different brain, not a saved one.
         return {
             "ver": 1, "alphas": list(ALPHAS),
-            "alpha_w": {nm: round(w, 8) for nm, w in self.alpha_w.items()},
-            "stats": {nm: [st.calls, st.hits, round(st.payoff_sum, 6)]
+            "alpha_w": dict(self.alpha_w),
+            "stats": {nm: [st.calls, st.hits, st.payoff_sum]
                       for nm, st in self.alpha_stats.items()},
-            "alloc_log_w": {d: round(w, 8) for d, w in self.allocator._log_w.items()},
-            "alloc_w": {d: round(p.weight, 8) for d, p in self.allocator.perf.items()},
-            "alloc_perf": {d: [round(p.ew_payoff, 8), round(p.ew_win, 8),
-                               round(p.ew_var, 8), p.graded, p.disabled]
+            "alloc_log_w": dict(self.allocator._log_w),
+            "alloc_w": {d: p.weight for d, p in self.allocator.perf.items()},
+            "alloc_perf": {d: [p.ew_payoff, p.ew_win, p.ew_var, p.graded, p.disabled]
                            for d, p in self.allocator.perf.items()},
-            "cal": {"w": [round(x, 8) for x in self.calibrator.w],
-                    "b": round(self.calibrator.b, 8), "n": self.calibrator.n},
-            "beta": round(self.beta, 6), "threshold": round(self.threshold, 6),
+            "cal": {"w": list(self.calibrator.w), "b": self.calibrator.b,
+                    "n": self.calibrator.n},
+            "beta": self.beta, "threshold": self.threshold,
             "graded": self.graded,
-            "score_hist": [round(x, 4) for x in list(self._score_hist)[-240:]],
+            "score_hist": list(self._score_hist)[-240:],
         }
 
     def load_state(self, d: dict) -> bool:

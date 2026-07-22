@@ -57,3 +57,13 @@ def test_score_fold_kernel_and_python_agree(monkeypatch):
     monkeypatch.setenv("BOT_NO_KERNEL", "1")
     slow = score_fold(candles, *args)
     assert fast == pytest.approx(slow, abs=1e-9), f"kernel {fast} vs python {slow}"
+
+
+def test_backtest_kernel_constants_mirror():
+    """The kernel re-declares backtest constants for nopython access — if they
+    ever drift apart, parity breaks silently. Pin them together here."""
+    from bingxbot.engine import backtest as B
+    from bingxbot.engine import kernel as K
+    for name in ("ASSUMED_SPREAD_BPS", "EV_MARGIN", "FILL_THROUGH_BPS",
+                 "STOP_SLIP_MULT", "FUNDING_MS", "ASSUMED_FUNDING_8H"):
+        assert getattr(B, name) == getattr(K, name), f"constant drift: {name}"
