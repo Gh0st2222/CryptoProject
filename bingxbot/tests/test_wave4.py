@@ -1,8 +1,8 @@
-"""Tests for wave 4: MAE/MFE excursions, per-symbol overlays, live-evidence
+"""Tests for wave 4: MAE/MFE excursions, per-symbol specialists, live-evidence
 stats, and the carry funding-timing window."""
 from bingxbot.config import CarryConfig, RiskConfig, StrategyConfig
 from bingxbot.data.history import synthetic_candles
-from bingxbot.engine.autotuner import BRAIN_PARAMS, select_overlays
+from bingxbot.engine.autotuner import BRAIN_PARAMS, select_specialists
 from bingxbot.engine.backtest import run_backtest
 from bingxbot.engine.carry import ENTRY_WINDOW_MS, pick_carry_entry
 
@@ -34,26 +34,49 @@ def _params(thr):
     return p
 
 
-def test_select_overlays_only_where_clearly_better():
-    syms = ["BTC-USDT", "HYPE-USDT"]
-    cand_params = [_params(0.2), _params(0.4)]
-    # candidate 1 is far better on HYPE only; on BTC the applied set wins
-    per_sym = [[1.0, 0.5], [0.8, 4.0]]
-    applied_fits = [2.0, 0.6]
-    ov = select_overlays(cand_params, per_sym, applied_fits, _params(0.3), syms)
+def test_select_specialists_only_where_clearly_better():
+    res = {
+        # on BTC nothing beats the applied set -> no overlay
+        "BTC-USDT": {"applied": (_params(0.3), 2.0, 1.4), "overlay": None,
+                     "cands": [(_params(0.2), 1.0, 1.5), (_params(0.4), 0.8, 1.2)]},
+        # on HYPE candidate 0.4 clearly wins with a profitable recent fold
+        "HYPE-USDT": {"applied": (_params(0.3), 0.6, 1.1), "overlay": None,
+                      "cands": [(_params(0.2), 0.5, 1.5), (_params(0.4), 4.0, 1.6)]},
+    }
+    ov = select_specialists(res)
     assert "BTC-USDT" not in ov, "nothing clearly beats the global set on BTC"
-    assert "HYPE-USDT" in ov and ov["HYPE-USDT"]["params"]["base_threshold"] == 0.4
+    assert ov["HYPE-USDT"]["params"]["base_threshold"] == 0.4
     assert set(ov["HYPE-USDT"]["params"]) <= set(BRAIN_PARAMS), "risk params never overlaid"
 
 
-def test_select_overlays_requires_clear_positive():
-    syms = ["ETH-USDT"]
-    # best candidate is negative -> no overlay even though it beats the applied set
-    ov = select_overlays([_params(0.2)], [[-0.5]], [-3.0], _params(0.3), syms)
+def test_select_specialists_gates_and_hysteresis():
+    # a challenger with a losing recent fold (PF < 1) can NEVER take the seat
+    ov = select_specialists({"ETH-USDT": {"applied": (_params(0.3), 0.5, 1.2), "overlay": None,
+                                          "cands": [(_params(0.2), 9.0, 0.8)]}})
     assert ov == {}
-    # identical params to the applied set -> pointless, skipped
-    ov = select_overlays([_params(0.3)], [[5.0]], [1.0], _params(0.3), syms)
+    # clearly-negative fitness never wins either
+    ov = select_specialists({"ETH-USDT": {"applied": (_params(0.3), -3.0, 0.5), "overlay": None,
+                                          "cands": [(_params(0.2), -0.5, 1.3)]}})
     assert ov == {}
+    # identical brain scalars to the applied set -> pointless, skipped
+    ov = select_specialists({"ETH-USDT": {"applied": (_params(0.3), 1.0, 1.2), "overlay": None,
+                                          "cands": [(_params(0.3), 5.0, 1.5)]}})
+    assert ov == {}
+    # hysteresis: a profitable incumbent that still beats the global keeps its
+    # seat against a challenger that is only MARGINALLY better...
+    res = {"SOL-USDT": {"applied": (_params(0.3), 1.0, 1.2),
+                        "overlay": (_params(0.2), 2.0, 1.4),
+                        "cands": [(_params(0.4), 2.05, 1.5)]}}
+    ov = select_specialists(res)
+    assert ov["SOL-USDT"]["params"]["base_threshold"] == 0.2, "incumbent keeps the seat"
+    # ...but loses it to a challenger that clears the margin
+    res["SOL-USDT"]["cands"] = [(_params(0.4), 3.0, 1.5)]
+    ov = select_specialists(res)
+    assert ov["SOL-USDT"]["params"]["base_threshold"] == 0.4
+    # an incumbent that stopped beating the global set is cleared
+    res["SOL-USDT"] = {"applied": (_params(0.3), 2.5, 1.4),
+                       "overlay": (_params(0.2), 1.0, 1.1), "cands": []}
+    assert select_specialists(res) == {}
 
 
 # --------------------------------------------------------------- live stats

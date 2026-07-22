@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -68,8 +69,26 @@ def _plan_cores() -> tuple[int, int]:
     if total <= 4:
         return 1, max(1, total - 2)              # 4 -> 1 interactive + 2 research (+1 loop)
     interactive = min(3, max(1, total // 5))      # ~20%, capped at 3
-    research = max(1, min(total - 1 - interactive, 16))
+    # reserve TWO logical cores (event loop + OS/browser headroom) and cap the
+    # research pool at 12 — beyond that the box feels pinned while the tuner's
+    # marginal search gain is tiny.
+    research = max(1, min(total - 2 - interactive, 12))
     return interactive, research
+
+
+def _research_worker_init():
+    """Runs inside every research-pool worker at spawn: drop OS priority so
+    the always-on tuner soaks up IDLE cpu only — the trading loop, the UI and
+    the user's browser always win the scheduler. Best-effort by design."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            h = ctypes.windll.kernel32.GetCurrentProcess()
+            ctypes.windll.kernel32.SetPriorityClass(h, 0x00004000)  # BELOW_NORMAL
+        else:
+            os.nice(10)
+    except Exception:  # noqa: BLE001 — priority is comfort, never correctness
+        pass
 
 
 class Alerter:
@@ -192,7 +211,8 @@ class Orchestrator:
             ctx = mp.get_context("spawn")
             ni, nr = self.cores
             self.pool = ProcessPoolExecutor(max_workers=ni, mp_context=ctx)
-            self.research_pool = ProcessPoolExecutor(max_workers=nr, mp_context=ctx)
+            self.research_pool = ProcessPoolExecutor(max_workers=nr, mp_context=ctx,
+                                                     initializer=_research_worker_init)
             log.info("cores: %d interactive + %d research (of %d logical detected)",
                      ni, nr, os.cpu_count() or 0)
         except Exception as e:  # noqa: BLE001
@@ -556,6 +576,7 @@ class Orchestrator:
             self.engine.set_overlay(sym, ov.get("params"))
         if mode == MODE_PAPER and snap:                # learning survives restarts too
             self.engine.load_brain_states(snap.get("brains"))
+            self.engine.load_entry_contexts(snap.get("entry_ctx"))
         await self.engine.start()
 
         from ..engine.autotuner import AutoTuner

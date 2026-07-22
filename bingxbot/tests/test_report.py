@@ -56,11 +56,40 @@ async def test_report_builds_with_running_engine(monkeypatch):
         if ctx.last_row:
             ctx.last_row = dict(ctx.last_row, hi_24h=float("nan"),
                                 lo_24h=float("nan"), range_pos_24h=float("nan"))
-        json_.dumps(engine.hot(), allow_nan=False, default=str)
+        hot = engine.hot()
+        json_.dumps(hot, allow_nan=False, default=str)
         json_.dumps(engine.snapshot(), allow_nan=False, default=str)
+        # the cortex animation payload rides the hot channel for every symbol
+        viz = hot["symbols"]["BTC-USDT"]["viz"]
+        assert len(viz["a"]) == 19 and all(len(x) == 3 for x in viz["a"])
+        assert set(viz["d"]) == {"trend", "meanrev", "micro", "vol", "carry"}
+
+        # a position's decision context survives a restart: save -> fresh
+        # engine -> restore, so the eventual close journals a full row.
+        engine.ctx["BTC-USDT"].entry_ctx = {"regime": "TREND_UP", "rpos24": 0.42}
+        engine.ctx["BTC-USDT"].bars_held = 7
+        saved = engine.entry_contexts()
+        assert saved["BTC-USDT"]["bars_held"] == 7
+        from bingxbot.exchange.models import Position
+        engine.portfolio.positions["BTC-USDT"] = Position(
+            symbol="BTC-USDT", side="LONG", qty=0.01, entry_price=100.0, opened_ts=1)
+        engine.ctx["BTC-USDT"].entry_ctx = {}
+        engine.ctx["BTC-USDT"].bars_held = 0
+        engine.load_entry_contexts(saved)
+        assert engine.ctx["BTC-USDT"].entry_ctx["rpos24"] == 0.42
+        assert engine.ctx["BTC-USDT"].bars_held == 7
+        engine.portfolio.positions.pop("BTC-USDT", None)
     finally:
         orch.engine = None
         await engine.stop()
+
+
+def test_heartbeat_rides_hot_channel():
+    """The idle 2s heartbeat must NOT trigger full-state pushes — that used to
+    serialize ~100KB and re-render the whole page every 2 seconds forever."""
+    from bingxbot.server.app import FULL_EVENTS
+    assert "heartbeat" not in FULL_EVENTS
+    assert "trade" in FULL_EVENTS and "bar" in FULL_EVENTS
 
 
 @pytest.mark.asyncio

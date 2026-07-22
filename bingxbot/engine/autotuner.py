@@ -54,18 +54,22 @@ VAULT_CANDIDATES = 4        # also re-validate this many top vault champions eac
 STALL_REINJECT = 20         # cycles without a promotion before a diversity restart
 DEMOTE_FLOOR = -1.0         # incumbent scoring below this on the TRADED basket is toxic...
 DEMOTE_PATIENCE = 3         # ...for this many consecutive cycles -> stand down
-LIVE_MIN_SAMPLE = 10        # real trades needed before live evidence can demote
+LIVE_MIN_SAMPLE = 8         # real trades before live evidence can demote: 1 win in
+                            # 8 when the validation promised ~70% WR is a ~0.1%
+                            # coincidence — waiting longer just pays more tuition
 LIVE_RECENT_N = 20          # judge a champion on its most recent real trades
 LIVE_PF_FLOOR = 0.7         # real profit factor below this (and < 1/2 expectation) -> demote
 LOOKBACK_DAYS = 60.0
 DATA_TTL_S = 1800
 GAP_FAST = 20               # cadence right after a promotion (keep hammering)
 GAP_SLOW = 60               # cadence when stable
-DUTY_CYCLE = 0.35           # research may use at most ~this fraction of wall time:
+DUTY_CYCLE = 0.28           # research may use at most ~this fraction of wall time:
                             # the sleep stretches with the measured cycle length so
                             # a slow host isn't pinned wall-to-wall by the tuner
 VAULT_REVAL_EVERY = 15      # re-validate the champion vault every N cycles
 META_TRAIN_EVERY = 12       # retrain the meta-labeling model every N cycles
+SPECIALIST_EVERY = 5        # per-symbol specialist (overlay) pass every N cycles —
+                            # it needs multi-fold statistics, not per-cycle churn
 MIN_BARS = 3000
 MIN_FOLD_BARS = 450         # a training fold below this can't produce a meaningful
                             # backtest (warmup + a real trading tail)
@@ -95,27 +99,57 @@ BRAIN_PARAMS = ("base_threshold", "target_trades_per_hour", "cost_multiple",
                 "hedge_eta", "horizon_bars", "min_p_win", "kelly_fraction")
 
 
-def select_overlays(cand_params: list[dict], per_sym_fits: list[list[float]],
-                    applied_fits: list[float], applied_params: dict, syms: list[str],
-                    margin: float = IMPROVE_MARGIN, floor: float = MIN_ABS_FITNESS) -> dict:
-    """Pick a per-symbol brain overlay wherever some candidate CLEARLY beats the
-    globally applied set on that specific symbol (clearly positive too). Pure —
-    the per-symbol validation numbers already exist; this stops averaging them
-    away. Returns {symbol: {params, fitness, vs}}."""
+def overlay_of(params: dict) -> dict:
+    """The brain-scalar slice of a full parameter set — what an overlay stores."""
+    return {k: params[k] for k in BRAIN_PARAMS if k in params}
+
+
+def select_specialists(sym_results: dict, margin: float = IMPROVE_MARGIN,
+                       floor: float = MIN_ABS_FITNESS) -> dict:
+    """Pick each symbol's specialist overlay from FOLD-VALIDATED evidence.
+
+    sym_results: {sym: {"applied": (params, fit, pf), "overlay": (params, fit, pf) | None,
+                        "cands": [(params, fit, pf), ...]}}
+    where every fit is the median+worst composite across the SAME purged OOS
+    folds the global promotion uses, and pf is the most recent fold's profit
+    factor.
+
+    Rules (the old single-window picker flapped SET/CLEARED every cycle and
+    converged to zero overlays — a specialist bench needs statistics and
+    hysteresis):
+      - a challenger must be profitable where it matters (pf >= 1), clearly
+        positive (>= floor) and clearly better than the applied global set;
+      - an INCUMBENT overlay keeps its seat while it still beats the global
+        set — a challenger must beat the incumbent by the margin, not just
+        the global;
+      - an overlay that stops beating the global set (or turns unprofitable)
+        is cleared — the global set is the best known there.
+    Returns {sym: {"params", "fitness", "vs", "pf"}} (missing sym = no overlay)."""
     out: dict[str, dict] = {}
-    for j, sym in enumerate(syms):
-        base = applied_fits[j] if j < len(applied_fits) else 0.0
-        best_i, best_f = -1, -1e18
-        for i in range(len(cand_params)):
-            f = per_sym_fits[i][j]
-            if f > best_f:
-                best_i, best_f = i, f
-        if best_i < 0 or best_f <= max(base * margin, floor):
-            continue
-        ov = {k: cand_params[best_i][k] for k in BRAIN_PARAMS if k in cand_params[best_i]}
-        same = all(abs(float(ov.get(k, 0)) - float(applied_params.get(k, 0))) < 1e-9 for k in ov)
-        if ov and not same:
-            out[sym] = {"params": ov, "fitness": round(best_f, 3), "vs": round(base, 3)}
+    for sym, r in sym_results.items():
+        applied_params, base_fit, _base_pf = r["applied"]
+        base_ov = overlay_of(applied_params)
+        bar = max(float(base_fit) * margin, floor)
+        best = None
+        for params, fit, pf in r.get("cands", []):
+            if pf < 1.0 or fit <= bar:
+                continue
+            if overlay_of(params) == base_ov:
+                continue    # identical brain scalars to the global set — pointless overlay
+            if best is None or fit > best[1]:
+                best = (params, fit, pf)
+        base_fit = float(base_fit)
+        inc = r.get("overlay")
+        if inc is not None:
+            inc_params, inc_fit, inc_pf = inc
+            keeps_seat = inc_pf >= 1.0 and inc_fit > max(base_fit, floor)
+            if keeps_seat and (best is None or best[1] <= inc_fit * margin):
+                out[sym] = {"params": overlay_of(inc_params), "fitness": round(inc_fit, 3),
+                            "vs": round(base_fit, 3), "pf": round(inc_pf, 3)}
+                continue
+        if best is not None:
+            out[sym] = {"params": overlay_of(best[0]), "fitness": round(best[1], 3),
+                        "vs": round(base_fit, 3), "pf": round(best[2], 3)}
     return out
 
 
@@ -241,6 +275,61 @@ class AutoTuner:
         of TRAINING data silently counted toward every 'out-of-sample' score."""
         val_cut = int(len(candles) * 0.75)
         return candles[max(0, val_cut - 300):]
+
+    async def _specialist_pass(self, cands: list[dict], applied_params: dict,
+                               folds_cbs: list[dict], interval: str, slip: float,
+                               strat, risk) -> dict:
+        """Score (applied set, incumbent overlay, every candidate's brain
+        scalars merged onto the applied risk geometry) PER SYMBOL across the
+        same purged OOS folds, in one parallel batch. Near-clone candidates
+        collapse after the brain-scalar merge, so the batch stays small.
+        Returns the sym_results shape select_specialists() consumes."""
+        syms = sorted({s for fc in folds_cbs for s in fc})
+        args: list[tuple] = []
+        index: list[tuple] = []          # (sym, tag, params, n_folds)
+        for sym in syms:
+            folds = [{sym: fc[sym]} for fc in folds_cbs if fc.get(sym)]
+            if not folds:
+                continue
+            variants: list[tuple[str, dict]] = [("applied", dict(applied_params))]
+            seen = {tuple(sorted(overlay_of(applied_params).items()))}
+            cur = self.orch.symbol_overlays.get(sym)
+            if cur and cur.get("params"):
+                merged = {**applied_params, **cur["params"]}
+                key = tuple(sorted(overlay_of(merged).items()))
+                if key not in seen:
+                    seen.add(key)
+                    variants.append(("overlay", merged))
+            for c in cands:
+                merged = {**applied_params, **overlay_of(c["params"])}
+                key = tuple(sorted(overlay_of(merged).items()))
+                if key in seen:
+                    continue
+                seen.add(key)
+                variants.append(("cand", merged))
+            spec = self.orch.specs.get(sym, ContractSpec(sym))
+            for tag, params in variants:
+                for fc in folds:
+                    args.append((params, fc, interval, {sym: spec}, spec.taker_fee,
+                                 slip, strat, risk))
+                index.append((sym, tag, params, len(folds)))
+        res = await self.orch.map_cpu(validate_params_portfolio, args, research=True)
+        out: dict[str, dict] = {}
+        i = 0
+        for sym, tag, params, nf in index:
+            rs = res[i:i + nf]
+            i += nf
+            fits = [r["fitness"] for r in rs]
+            fit = _oos_composite(fits)
+            pf = float(rs[-1]["stats"].get("profit_factor", 0.0) or 0.0)
+            slot = out.setdefault(sym, {"applied": None, "overlay": None, "cands": []})
+            if tag == "applied":
+                slot["applied"] = (params, fit, pf)
+            elif tag == "overlay":
+                slot["overlay"] = (params, fit, pf)
+            else:
+                slot["cands"].append((params, fit, pf))
+        return {s: r for s, r in out.items() if r["applied"] is not None}
 
     def _traded_symbols(self) -> list[str]:
         """What the engine is actually running right now — the set promotions
@@ -472,30 +561,25 @@ class AutoTuner:
                     log.warning("auto-tune STAND-DOWN: incumbent %.2f on traded basket -> %s",
                                 champ_fit, fb_name)
 
-        # PER-SYMBOL OVERLAYS: the per-symbol validation numbers already exist —
-        # stop averaging them away. Wherever a candidate clearly beats the
-        # globally applied set on one specific traded symbol, that symbol's brain
-        # gets the winner's scalars as an overlay (risk geometry stays global).
-        try:
-            # overlays still need per-symbol evidence: one single-symbol batch
-            # (cands + the applied set) on the most recent held-out window.
-            nb = len(basket)
-            ov_args = []
-            applied_params = best_params if promoted else champ
-            for c in cands + [{"params": applied_params}]:
-                for bsym, bvalid in basket:
-                    bspec = self.orch.specs.get(bsym, ContractSpec(bsym))
-                    ov_args.append((c["params"], bvalid, bsym, interval, bspec,
-                                    bspec.taker_fee, slip, strat, risk))
-            ov_res = await self.orch.map_cpu(validate_params, ov_args, research=True)
-            per_sym = [[ov_res[i * nb + j]["fitness"] for j in range(nb)]
-                       for i in range(len(cands))]
-            applied_fits = [ov_res[len(cands) * nb + j]["fitness"] for j in range(nb)]
-            overlays = select_overlays([c["params"] for c in cands], per_sym,
-                                       applied_fits, applied_params, [s for s, _ in basket])
-            self.orch.update_symbol_overlays(overlays, traded=[s for s, _ in basket])
-        except Exception as e:  # noqa: BLE001 — overlays are an optimization, never fatal
-            log.warning("overlay pass failed: %s", e)
+        # PER-SYMBOL SPECIALIST BENCH (every SPECIALIST_EVERY cycles): the
+        # global promotion judges the whole basket, so a set that is brilliant
+        # on ONE symbol but average elsewhere can never win the global seat —
+        # the "a good BTC champion blocks a better SOL specialist" failure.
+        # Here each traded symbol runs its own contest: every candidate's
+        # brain scalars merged onto the applied risk geometry, validated on
+        # that symbol alone across the SAME purged OOS folds, PF-gated, with
+        # incumbent hysteresis. (The old picker judged one window every cycle
+        # with no gates — it flapped SET/CLEARED endlessly, burned a ~30-
+        # backtest batch per cycle, and still converged to zero overlays.)
+        if self.cycles % SPECIALIST_EVERY == 0:
+            try:
+                applied_params = best_params if promoted else champ
+                sym_results = await self._specialist_pass(cands, applied_params, folds_cbs,
+                                                          interval, slip, strat, risk)
+                overlays = select_specialists(sym_results)
+                self.orch.update_symbol_overlays(overlays, traded=list(sym_results))
+            except Exception as e:  # noqa: BLE001 — specialists are an optimization, never fatal
+                log.warning("specialist pass failed: %s", e)
 
         # LIVE-EVIDENCE DEMOTION: backtests propose, live results dispose. A
         # champion with a real sample whose actual profit factor collapsed vs

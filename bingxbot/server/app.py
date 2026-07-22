@@ -213,7 +213,11 @@ async def apply_params(req: ApplyParamsReq):
 
 # event -> which channel it drives. "hot" is the small high-cadence payload
 # (prices, uPnL, stage); everything structural rides the heavier full state.
-FULL_EVENTS = {"state", "bar", "trade", "mode", "job", "autotune", "config", "heartbeat", "radar"}
+# NOTE: "heartbeat" (the idle 2s timeout) deliberately rides the HOT channel —
+# it used to trigger a full ~100KB status serialize + whole-page re-render
+# every 2 seconds around the clock, which cooked both the server CPU and the
+# browser's frame rate for zero new information.
+FULL_EVENTS = {"state", "bar", "trade", "mode", "job", "autotune", "config", "radar"}
 FULL_MIN_GAP = 0.9    # seconds between heavy full-state pushes
 HOT_MIN_GAP = 0.25    # seconds between light hot pushes (≈ up to 4/s)
 

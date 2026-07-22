@@ -57,6 +57,17 @@ let S=null, curSymbol=null, lastTradeCount=-1;
 const symbols=()=>S?.config?.symbols??[];
 const engSym=()=>S?.engine?.symbols?.[curSymbol];
 
+/* one rAF paints per frame no matter how many ws messages arrived — the page
+   stops re-laying-out several times a second for identical pixels. */
+let _dirtyFull=false,_dirtyHot=false,_rafQueued=false;
+function scheduleRender(kind){
+  if(kind==="full") _dirtyFull=true; else _dirtyHot=true;
+  if(_rafQueued) return; _rafQueued=true;
+  requestAnimationFrame(()=>{ _rafQueued=false;
+    const full=_dirtyFull; _dirtyFull=_dirtyHot=false;
+    if(full) renderAll(); else renderHot(); });
+}
+
 async function refreshCandles(full=false){
   if(!curSymbol||!S?.engine) return;
   try{
@@ -117,8 +128,13 @@ function renderSymTabs(){
   }
   followFocus();
 }
+let _tapeSig=null;
 function renderTape(){
   const tape=S.engine?.tape??[]; const track=$("tape-track");
+  // rebuild ONLY when a fill actually arrived — re-setting innerHTML restarts
+  // the marquee animation, which made the ticker stutter 4x a second.
+  const sig=tape.length+"|"+JSON.stringify(tape[tape.length-1]??0);
+  if(sig===_tapeSig) return; _tapeSig=sig;
   if(!tape.length){ track.innerHTML=`<span class="tape-item" style="color:var(--muted)">awaiting fills…</span>`; return; }
   const items=tape.slice().reverse().map(t=>{
     const tag=t.kind==="OPEN"?`<span class="tag open">OPEN</span>`:`<span class="tag close">CLOSE</span>`;
@@ -128,28 +144,37 @@ function renderTape(){
   }).join("");
   track.innerHTML=items+items;   // duplicate for seamless marquee
 }
+let _pipeSig=null;
 function renderPipeline(){
   const es=engSym(); const stages=S.engine?.stages??["SCAN","DETECT","VALIDATE","SIZE","FILL","MANAGE","SETTLE"];
   const cur=es?.stage||"SCAN"; const ci=stages.indexOf(cur);
+  const sig=curSymbol+"|"+cur;
+  if(sig===_pipeSig) return; _pipeSig=sig;
   $("pipe").innerHTML=stages.map((s,i)=>{
     const cls=i===ci?"on":(ci>=0&&i<ci?"done":"");
     return `<div class="pstage ${cls}"><div class="n">${String(i+1).padStart(2,"0")}</div><div class="l">${s}</div></div>`;
   }).join("");
 }
+let _gateSig=null;
 function renderGates(es){
   // the entry-gate X-ray: every rung of the entry chain with live numbers —
   // the failing rung is exactly why the machine is holding fire.
   const el=$("gate-list"); if(!el) return;
   const held=S?.engine?.portfolio?.open_positions?.[curSymbol];
-  if(held){ el.innerHTML=`<span class="mtf-empty">in position — gates re-arm on exit</span>`; return; }
   const g=es?.gates||[];
+  const sig=curSymbol+"|"+(held?"H":"")+"|"+JSON.stringify(g);
+  if(sig===_gateSig) return; _gateSig=sig;
+  if(held){ el.innerHTML=`<span class="mtf-empty">in position — gates re-arm on exit</span>`; return; }
   if(!g.length){ el.innerHTML=`<span class="mtf-empty">warming up…</span>`; return; }
   el.innerHTML=g.map(x=>`<div class="gate ${x.ok?'pass':'fail'}" title="${esc(x.d)}">
     <span class="gd">${x.ok?"▮":"▯"}</span><span class="gn">${esc(x.n)}</span><span class="gv">${esc(x.d)}</span></div>`).join("");
 }
+let _mtfSig=null;
 function renderMTF(es){
   const strip=$("mtf-strip"); if(!strip) return;
   const mtf=es?.mtf||{};
+  const sig=curSymbol+"|"+JSON.stringify(mtf);
+  if(sig===_mtfSig) return; _mtfSig=sig;
   const order=["1m","5m","15m","1h"].filter(tf=>mtf[tf]);
   if(!order.length){ strip.innerHTML=`<span class="mtf-empty">warming up…</span>`; return; }
   strip.innerHTML=order.map(tf=>{
@@ -249,25 +274,46 @@ function renderAlphaFloor(alphas){
       <div class="alpha-grid">${rows}</div></div>`;
   }).join("");
 }
+let _eqCurveLen=-1;
 function renderEquity(){
   const curve=S.engine?.equity_curve??[];
   if(curve.length>1){
-    equitySeries.setData(curve.map(([ts,eq])=>({time:Math.floor(ts/1000),value:eq})));
+    // setData of a multi-thousand-point series every full push was a major
+    // frame killer; the live tip already rides equitySeries.update() on the
+    // hot channel, so a full reload only matters when history itself changed.
+    if(curve.length!==_eqCurveLen){
+      _eqCurveLen=curve.length;
+      equitySeries.setData(curve.map(([ts,eq])=>({time:Math.floor(ts/1000),value:eq})));
+    }
     const eq=curve[curve.length-1][1], start=S.engine.portfolio.starting_balance, dlt=eq-start;
     $("eq-cap").textContent=`${fmt.usd(eq)}  (${fmt.signed(dlt,2)} / ${fmt.signed(dlt/start*100,2)}%)`;
     $("eq-cap").className="val "+pnlCls(dlt);
   }
 }
+let _posSig=null;
 function renderPositions(){
   const pf=S.engine?.portfolio, body=$("pos-body");
   const entries=pf?Object.entries(pf.open_positions):[];
-  if(!entries.length){ body.innerHTML=`<tr><td colspan="11" class="empty">No open positions</td></tr>`; return; }
-  body.innerHTML=entries.map(([sym,p])=>{ const mark=S.engine.symbols[sym]?.price??0;
-    return `<tr><td>${esc(sym)}</td><td class="${sideCls(p.side)}">${p.side}</td><td class="r">${p.qty}</td>
-      <td class="r">${fmt.px(p.entry)}</td><td class="r">${fmt.px(mark)}</td><td class="r">${fmt.px(p.stop)}</td>
-      <td class="r">${fmt.px(p.tp)}</td><td class="r ${pnlCls(p.upnl)}">${fmt.signed(p.upnl,2)}</td>
-      <td class="r">${p.leverage}x</td><td>${fmt.time(p.opened_ts)}</td>
-      <td><button class="btn sm" onclick="closePos('${esc(sym)}')">Close</button></td></tr>`; }).join("");
+  // structure (which positions, side, qty, stop) rebuilds rows; the fast-moving
+  // mark/uPnL cells are PATCHED in place — no 4 Hz innerHTML churn.
+  const sig=entries.map(([s,p])=>`${s}${p.side}${p.qty}${p.stop}`).join("~");
+  if(sig!==_posSig){
+    _posSig=sig;
+    if(!entries.length){ body.innerHTML=`<tr><td colspan="11" class="empty">No open positions</td></tr>`; return; }
+    body.innerHTML=entries.map(([sym,p])=>{ const mark=S.engine.symbols[sym]?.price??0;
+      return `<tr><td>${esc(sym)}</td><td class="${sideCls(p.side)}">${p.side}</td><td class="r">${p.qty}</td>
+        <td class="r">${fmt.px(p.entry)}</td><td class="r" data-mark="${esc(sym)}">${fmt.px(mark)}</td><td class="r">${fmt.px(p.stop)}</td>
+        <td class="r">${fmt.px(p.tp)}</td><td class="r ${pnlCls(p.upnl)}" data-upnl="${esc(sym)}">${fmt.signed(p.upnl,2)}</td>
+        <td class="r">${p.leverage}x</td><td>${fmt.time(p.opened_ts)}</td>
+        <td><button class="btn sm" onclick="closePos('${esc(sym)}')">Close</button></td></tr>`; }).join("");
+    return;
+  }
+  for(const [sym,p] of entries){
+    const mc=body.querySelector(`[data-mark="${CSS.escape(sym)}"]`);
+    if(mc) mc.textContent=fmt.px(S.engine.symbols[sym]?.price??0);
+    const uc=body.querySelector(`[data-upnl="${CSS.escape(sym)}"]`);
+    if(uc){ uc.textContent=fmt.signed(p.upnl,2); uc.className="r "+pnlCls(p.upnl); }
+  }
 }
 function renderTrades(){
   const trades=(S.engine?.trades??[]).slice().reverse(), st=S.engine?.portfolio?.stats;
@@ -384,6 +430,7 @@ function renderAll(){
   if(!S) return;
   renderTop(); renderSymTabs(); renderTape();
   if(S.engine){ renderPipeline(); renderBrain(); renderEquity(); renderPositions(); renderTrades();
+    cortexFeed();
     const tc=S.engine.portfolio.stats.trades; refreshCandles(false).then(()=>{lastTradeCount=tc;}); }
   renderAutotuner(); renderChampions(); renderRadar(); renderSettings();
 }
@@ -404,13 +451,23 @@ function applyHot(h){
     if(hs.mtf) s.mtf=hs.mtf;
     if(hs.gates) s.gates=hs.gates;
     if(hs.candle) s.candle=hs.candle;
+    if(hs.viz) s.viz=hs.viz;
     if(s.brain){ s.brain.edge=hs.edge; s.brain.p_win=hs.p_win; s.brain.regime=hs.regime; }
   }
   for(const [sym,hp] of Object.entries(he.positions||{})){
     const p=pf?.open_positions?.[sym]; if(p) p.upnl=hp.upnl;
   }
   if(he.tape) S.engine.tape=he.tape;
-  renderHot();
+  cortexFeed();               // animation targets update immediately, off-paint
+  scheduleRender("hot");
+}
+function cortexFeed(){
+  const es=engSym(); if(!es?.viz) return;
+  cortex.data(es.viz,{edge:es.brain?.edge??0, p_win:es.brain?.p_win??0.5,
+    regime:es.brain?.regime||"RANGE", sym:curSymbol, price:es.price,
+    stage:es.stage, block:es.entry_block,
+    held:!!S?.engine?.portfolio?.open_positions?.[curSymbol],
+    ticks:es.eval_ms??0});
 }
 let lastEqT=0;
 function renderHot(){
@@ -436,7 +493,7 @@ function connectWS(){
   const proto=location.protocol==="https:"?"wss":"ws";
   ws=new WebSocket(`${proto}://${location.host}/ws`);
   ws.onmessage=(ev)=>{ const m=JSON.parse(ev.data);
-    if(m.type==="state"){ S=m.data; renderAll(); }
+    if(m.type==="state"){ S=m.data; scheduleRender("full"); }
     else if(m.type==="hot"){ applyHot(m.data); } };
   ws.onopen=()=>{wsRetry=1;}; ws.onclose=()=>setTimeout(connectWS,Math.min(wsRetry*=1.6,8)*1000); ws.onerror=()=>ws.close();
 }
@@ -821,6 +878,204 @@ function renderAnalytics(d){
   $("an-desk").innerHTML=anRows(s.by_desk); $("an-exit").innerHTML=anRows(s.by_exit);
   $("an-hour").innerHTML=anRows(s.by_hour); $("an-side").innerHTML=anRows(s.by_side);
 }
+
+/* ================= NEURAL CORTEX — the brain, visibly firing =================
+   A 60fps canvas of the focused symbol's actual wiring: 19 alpha neurons on an
+   outer ring, clustered around their 5 desk hubs, all feeding the fused-edge
+   core. Pulses travel the axons at the real signal strengths riding the 0.4s
+   hot channel; between updates everything eases and breathes so the machine
+   reads as alive, not as a chart. Perf rules: pre-rendered glow sprites (no
+   shadowBlur), one trail-fade fillRect, DPR capped, hidden-tab pause. */
+const ALPHA_DESK={momentum:"trend",macd:"trend",mtf_trend:"trend",breakout:"trend",roc_accel:"trend",
+  meanrev_bb:"meanrev",capitulation:"meanrev",rsi_fade:"meanrev",stoch_fade:"meanrev",vwap_revert:"meanrev",vwap_pullback:"meanrev",
+  obi:"micro",flow:"micro",cvd_trend:"micro",spread_pressure:"micro",
+  squeeze:"vol",vol_breakout:"vol",funding_skew:"carry",oi_divergence:"carry"};
+const cortex=(()=>{
+  const cv=$("cortex"); if(!cv) return {data(){}};
+  const g=cv.getContext("2d");
+  const DPR=Math.min(window.devicePixelRatio||1,1.5);
+  let W=0,H=0,cx=0,cy=0,R=0;
+  let nodes=[],hubs={},layoutSig="";
+  let tgt=null;                                  // latest viz payload
+  const ex={edge:0,p_win:0.5,regime:"RANGE",sym:"",stage:"SCAN",block:"",held:false};
+  const e={edge:0,p_win:0.5,charge:0};           // eased display values
+  const deskAcc={},pulses=[];
+  let spin=0,lastT=0,capT=0;
+  const SPR={};
+  function sprite(col){
+    if(SPR[col]) return SPR[col];
+    const s=document.createElement("canvas"); s.width=s.height=64;
+    const c2=s.getContext("2d");
+    const gr=c2.createRadialGradient(32,32,2,32,32,30);
+    gr.addColorStop(0,col); gr.addColorStop(0.4,col+"66"); gr.addColorStop(1,col+"00");
+    c2.fillStyle=gr; c2.fillRect(0,0,64,64);
+    return SPR[col]=s;
+  }
+  function resize(){
+    const w=cv.clientWidth,h=cv.clientHeight;
+    if(!w||!h) return;
+    cv.width=Math.round(w*DPR); cv.height=Math.round(h*DPR);
+    g.setTransform(DPR,0,0,DPR,0,0);
+    W=w; H=h; cx=W*0.5; cy=H*0.53; R=Math.min(W*0.36,H*0.44);
+    layout();
+  }
+  function layout(){
+    if(!tgt) return;
+    const old={}; for(const nd of nodes) old[nd.nm]=nd;
+    nodes=[]; hubs={};
+    DESK_ORDER.forEach((d,i)=>{
+      const ang=-Math.PI/2+i*(2*Math.PI/DESK_ORDER.length);
+      hubs[d]={x:cx+Math.cos(ang)*R*0.48,y:cy+Math.sin(ang)*R*0.48,ang,col:DESK_COLORS[d],sig:0,alloc:0.2};
+      deskAcc[d]=deskAcc[d]||Math.random();
+    });
+    const byDesk={};
+    for(const [nm] of tgt.a){ const d=ALPHA_DESK[nm]||"trend"; (byDesk[d]=byDesk[d]||[]).push(nm); }
+    for(const d of DESK_ORDER){
+      const names=byDesk[d]||[],hub=hubs[d],n=names.length;
+      names.forEach((nm,j)=>{
+        const off=(n>1?(j/(n-1)-0.5):0)*Math.min(1.25,0.36*(n-1));
+        const ang=hub.ang+off;
+        const p=old[nm]||{sc:0,tsc:0,wt:0.2,twt:0.2,acc:Math.random(),ph:Math.random()*6.283};
+        nodes.push({nm,d,col:hub.col,hub,
+          x:cx+Math.cos(ang)*R*0.98,y:cy+Math.sin(ang)*R*0.98,
+          sc:p.sc,tsc:p.tsc,wt:p.wt,twt:p.twt,acc:p.acc,ph:p.ph});
+      });
+    }
+  }
+  function data(viz,extra){
+    tgt=viz; Object.assign(ex,extra||{});
+    const sig=viz.a.map(x=>x[0]).join(",");
+    if(sig!==layoutSig){ layoutSig=sig; layout(); }
+    const m={}; for(const [nm,sc,wt] of viz.a) m[nm]=[sc,wt];
+    for(const nd of nodes){ const v=m[nd.nm]; if(v){ nd.tsc=v[0]; nd.twt=v[1]; } }
+    for(const d of DESK_ORDER){ const v=viz.d?.[d]; if(v&&hubs[d]){ hubs[d].sig=v[0]; hubs[d].alloc=v[1]; } }
+  }
+  const lerp=(a,b,k)=>a+(b-a)*k;
+  const dirCol=(v)=>v>=0?C.up:C.dn;
+  function spawn(x0,y0,x1,y1,col,spd,size){
+    if(pulses.length>140) pulses.shift();
+    pulses.push({x0,y0,x1,y1,p:0,spd,col,size});
+  }
+  function frame(t){
+    requestAnimationFrame(frame);
+    if(document.hidden){ lastT=t; return; }
+    if(!W||cv.clientWidth!==W) resize();
+    if(!W) return;
+    const dt=Math.min(0.05,Math.max(0.001,(t-lastT)/1000)); lastT=t;
+    const k=Math.min(1,dt*5);
+    // trail fade — the cheap way to get comet tails and glow persistence
+    g.globalCompositeOperation="source-over";
+    g.fillStyle="rgba(5,7,12,0.30)"; g.fillRect(0,0,W,H);
+    if(!tgt||!nodes.length){
+      g.fillStyle="#59637a"; g.font="10px ui-monospace,monospace"; g.textAlign="center";
+      g.fillText("cortex warming up — waiting for the first evaluation…",cx,cy);
+      return;
+    }
+    const thr=tgt.thr||0.3;
+    e.edge=lerp(e.edge,ex.edge,k); e.p_win=lerp(e.p_win,ex.p_win,k);
+    e.charge=lerp(e.charge,clamp(Math.abs(e.edge)/Math.max(thr,0.01),0,1.35),k);
+    spin+=dt*(0.4+e.charge*2.2);
+    // axons (faint, brightness follows live strength)
+    g.lineWidth=1;
+    for(const nd of nodes){
+      nd.sc=lerp(nd.sc,nd.tsc,k); nd.wt=lerp(nd.wt,nd.twt,k);
+      const a=0.05+0.20*Math.min(1,Math.abs(nd.sc));
+      g.strokeStyle=nd.col+Math.round(a*255).toString(16).padStart(2,"0");
+      g.beginPath(); g.moveTo(nd.x,nd.y); g.lineTo(nd.hub.x,nd.hub.y); g.stroke();
+    }
+    for(const d of DESK_ORDER){
+      const h=hubs[d]; if(!h) continue;
+      const a=0.08+0.30*Math.min(1,Math.abs(h.sig));
+      g.strokeStyle=h.col+Math.round(a*255).toString(16).padStart(2,"0");
+      g.lineWidth=1+2.5*h.alloc;
+      g.beginPath(); g.moveTo(h.x,h.y); g.lineTo(cx,cy); g.stroke();
+    }
+    // spawn pulses from live strengths (keeps firing between ws updates)
+    for(const nd of nodes){
+      const s=Math.abs(nd.sc);
+      if(s>0.1){
+        nd.acc+=dt*(0.25+2.6*s);
+        if(nd.acc>=1){ nd.acc=0; spawn(nd.x,nd.y,nd.hub.x,nd.hub.y,dirCol(nd.sc),0.9+1.6*s,2.0+2.5*s); }
+      }
+    }
+    for(const d of DESK_ORDER){
+      const h=hubs[d]; const s=Math.abs(h.sig)*Math.min(1,h.alloc*4);
+      if(s>0.05){
+        deskAcc[d]+=dt*(0.3+3.0*s);
+        if(deskAcc[d]>=1){ deskAcc[d]=0; spawn(h.x,h.y,cx,cy,dirCol(h.sig),1.1+1.4*s,2.5+3.0*s); }
+      }
+    }
+    // glows ride additive blending
+    g.globalCompositeOperation="lighter";
+    for(let i=pulses.length-1;i>=0;i--){
+      const p=pulses[i]; p.p+=p.spd*dt;
+      if(p.p>=1){ pulses.splice(i,1); continue; }
+      const x=lerp(p.x0,p.x1,p.p),y=lerp(p.y0,p.y1,p.p);
+      const s=p.size*4*(1-p.p*0.4);
+      g.globalAlpha=0.85; g.drawImage(sprite(p.col),x-s/2,y-s/2,s,s);
+    }
+    for(const nd of nodes){
+      const s=Math.abs(nd.sc);
+      const breathe=0.5+0.5*Math.sin(t*0.001+nd.ph);
+      const sz=7+26*Math.min(1,s)+3*breathe*(0.3+s);
+      g.globalAlpha=0.28+0.62*Math.min(1,s);
+      g.drawImage(sprite(s>0.05?dirCol(nd.sc):nd.col),nd.x-sz/2,nd.y-sz/2,sz,sz);
+    }
+    for(const d of DESK_ORDER){
+      const h=hubs[d]; const sz=16+34*h.alloc+16*Math.min(1,Math.abs(h.sig));
+      g.globalAlpha=0.55;
+      g.drawImage(sprite(h.col),h.x-sz/2,h.y-sz/2,sz,sz);
+    }
+    // core glow scales with charge; goes hot when the edge crosses threshold
+    const coreCol=dirCol(e.edge);
+    const coreSz=R*0.62*(0.75+0.45*e.charge);
+    g.globalAlpha=0.30+0.45*Math.min(1,e.charge);
+    g.drawImage(sprite(coreCol),cx-coreSz/2,cy-coreSz/2,coreSz,coreSz);
+    g.globalAlpha=1; g.globalCompositeOperation="source-over";
+    // crisp marks: nodes, hubs, core ring + numbers
+    for(const nd of nodes){
+      g.fillStyle=Math.abs(nd.sc)>0.05?dirCol(nd.sc):"#2a3346";
+      g.beginPath(); g.arc(nd.x,nd.y,1.6+1.6*Math.min(1,Math.abs(nd.sc)),0,6.283); g.fill();
+    }
+    g.font="8.5px ui-monospace,monospace"; g.textAlign="center";
+    for(const d of DESK_ORDER){
+      const h=hubs[d];
+      g.fillStyle=h.col; g.beginPath(); g.arc(h.x,h.y,2.6+3.5*h.alloc,0,6.283); g.fill();
+      const lx=cx+(h.x-cx)*1.34, ly=cy+(h.y-cy)*1.34;
+      g.fillStyle="#59637a"; g.fillText(DESK_LABEL[d],lx,ly+3);
+    }
+    const cr=R*0.30;
+    g.lineWidth=3; g.strokeStyle="#141827";
+    g.beginPath(); g.arc(cx,cy,cr,0,6.283); g.stroke();
+    const frac=clamp(Math.abs(e.edge),0,1);
+    g.strokeStyle=coreCol;
+    g.beginPath(); g.arc(cx,cy,cr,-Math.PI/2,-Math.PI/2+frac*6.283*(e.edge>=0?1:-1),e.edge<0); g.stroke();
+    for(const s of [-1,1]){   // threshold ticks
+      const a=-Math.PI/2+s*clamp(thr,0,1)*6.283;
+      g.strokeStyle="#59637a"; g.lineWidth=2;
+      g.beginPath(); g.moveTo(cx+Math.cos(a)*(cr-5),cy+Math.sin(a)*(cr-5));
+      g.lineTo(cx+Math.cos(a)*(cr+5),cy+Math.sin(a)*(cr+5)); g.stroke();
+    }
+    if(e.charge>=1){          // ARMED: rotating firing ring
+      g.strokeStyle=coreCol; g.lineWidth=1.5; g.setLineDash([4,9]); g.lineDashOffset=-spin*30;
+      g.beginPath(); g.arc(cx,cy,cr+7,0,6.283); g.stroke(); g.setLineDash([]);
+    }
+    g.fillStyle=coreCol; g.font="700 17px ui-monospace,monospace";
+    g.fillText((e.edge>=0?"+":"−")+Math.abs(e.edge).toFixed(2),cx,cy-2);
+    g.fillStyle="#a6b3c2"; g.font="8.5px ui-monospace,monospace";
+    g.fillText(`P ${Math.round(e.p_win*100)}%${tgt.meta_p!=null?` · ML ${Math.round(tgt.meta_p*100)}%`:""}`,cx,cy+11);
+    const rm=REGIME_META[ex.regime]||REGIME_META.RANGE;
+    g.fillStyle="#59637a"; g.fillText(`${rm.g} ${ex.regime}`,cx,cy+22);
+    // caption (DOM text, 2 Hz is plenty)
+    if(t-capT>500){ capT=t;
+      const cap=$("cortex-cap");
+      if(cap) cap.textContent=`${ex.sym||"—"} · ${ex.held?"IN POSITION":(e.charge>=1?"⚡ ARMED":ex.stage||"SCAN")}${ex.block&&!ex.held?` · ${ex.block}`:""}`;
+    }
+  }
+  new ResizeObserver(resize).observe(cv);
+  resize(); requestAnimationFrame(frame);
+  return {data};
+})();
 
 initCharts(); connectWS();
 // slow reconciliation only (closed bars + markers) — the live candle rides the

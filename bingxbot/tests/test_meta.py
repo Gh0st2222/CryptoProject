@@ -123,3 +123,35 @@ def test_brain_blends_meta_when_ready(monkeypatch, tmp_path):
     b2.use_meta = False
     ev2 = b2.score(row, micro, {})
     assert ev2["p_win"] < ev["p_win"], "use_meta=False must bypass the model"
+
+
+def test_meta_predict_cached_per_bar(monkeypatch):
+    """Live reactive scans re-score the SAME bar several times a second; the
+    GBM predict must run once per (bar, direction) — a new bar re-predicts.
+    (This is what cut eval_ms back down after the model went live.)"""
+    from bingxbot.strategy.brain import TradingBrain
+    calls = {"n": 0}
+
+    class _Fake:
+        ready = True
+        blend_weight = 0.5
+
+        def predict_one(self, x):
+            calls["n"] += 1
+            return 0.9
+
+    import bingxbot.strategy.brain as brain_mod
+    monkeypatch.setattr(brain_mod, "_get_meta", lambda path=None: _Fake())
+    from bingxbot.strategy import alphas as alpha_mod
+    from bingxbot.strategy.alphas import DESKS
+    for nm in DESKS["trend"]:
+        monkeypatch.setitem(alpha_mod.ALPHAS, nm, lambda r, m, c: 1.0)
+    micro = {"obi": 0.0, "flow": 0.0, "cvd_slope": 0.0, "spread_bps": 1.0, "ticks_per_s": 0.0}
+    row = {"atr_pct": 0.01, "close": 100.0, "atr_pctile": 0.5, "ts": 1_700_000_000_000}
+    b = TradingBrain(base_threshold=0.2, threshold_adapt=False)
+    b.score(row, micro, {})
+    b.score(row, micro, {})
+    b.score(dict(row), micro, {})            # same ts, fresh dict — still cached
+    assert calls["n"] == 1, f"same bar+direction must reuse, got {calls['n']} predicts"
+    b.score(dict(row, ts=row["ts"] + 60_000), micro, {})
+    assert calls["n"] == 2, "a new bar must re-predict"

@@ -86,6 +86,8 @@ class TradingBrain:
         self._idx = 0
         self.use_meta = True       # the ML dataset builder disables this on its
         self.meta_p = None         # own brain so the model never labels itself
+        self._meta_key = None      # (bar_ts, direction) of the cached prediction
+        self._meta_cached = None
         self.beta = 1.0
         self.threshold = base_threshold
         self.graded = 0
@@ -161,7 +163,17 @@ class TradingBrain:
             try:
                 m = _get_meta()
                 if m is not None and m.ready:
-                    self.meta_p = m.predict_one(_meta_features(row, micro, ctx, edge, regime))
+                    # one GBM predict per (bar, direction): live reactive scans
+                    # re-score the SAME bar several times a second, and the
+                    # single-row predict is the expensive part of the whole
+                    # eval. Backtests step ts every call, so they never reuse —
+                    # parity between modes is untouched.
+                    key = (row.get("ts"), 1 if edge > 0 else -1)
+                    if key == self._meta_key and self._meta_cached is not None:
+                        self.meta_p = self._meta_cached
+                    else:
+                        self.meta_p = m.predict_one(_meta_features(row, micro, ctx, edge, regime))
+                        self._meta_key, self._meta_cached = key, self.meta_p
                     w = m.blend_weight
                     p_win = clamp(w * self.meta_p + (1 - w) * p_win, 0.05, 0.95)
             except Exception:  # noqa: BLE001 — a broken model must never block trading
@@ -407,6 +419,27 @@ class TradingBrain:
         if abs(score) > 0.05:
             return "firing"
         return "dormant" if ALPHA_META[name][1] == EVENT else "quiet"
+
+    def viz(self) -> dict:
+        """Tiny live wiring snapshot for the dashboard's cortex animation:
+        every alpha's last score + hedge weight and every desk's signal +
+        allocation — just enough to draw the brain firing, cheap enough to
+        ride the 4 Hz hot channel. Non-finite scores become 0 (JSON-safe)."""
+        sc = self._sc or {}
+        scores = sc.get("alpha_scores") or {}
+        desk_sig = sc.get("desk_sig") or {}
+        alloc = self.allocator.weights()
+
+        def f(x):
+            v = float(x)
+            return round(v, 3) if math.isfinite(v) else 0.0
+
+        return {
+            "a": [[nm, f(scores.get(nm, 0.0)), f(self.alpha_w.get(nm, 0.0))] for nm in ALPHAS],
+            "d": {d: [f(desk_sig.get(d, 0.0)), f(alloc.get(d, 0.0))] for d in DESK_ORDER},
+            "meta_p": self.meta_p,
+            "thr": round(self.threshold, 4),
+        }
 
     def snapshot(self) -> dict:
         last = self.last or {}

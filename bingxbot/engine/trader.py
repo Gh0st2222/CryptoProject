@@ -143,7 +143,8 @@ class TraderEngine:
         if self.portfolio.mode == "paper":
             from .persist import save_paper_state
             save_paper_state(self.portfolio, self.risk.state,
-                             brains=self.brain_states())   # the session AND the learning survive
+                             brains=self.brain_states(),   # the session AND the learning survive
+                             entry_ctx=self.entry_contexts())
         await self.feed.stop()
         log.info("trader stopped")
 
@@ -202,8 +203,13 @@ class TraderEngine:
                     log.warning("track record roll failed: %s", e)
             if self.portfolio.mode == "paper" and beat % 6 == 0:   # every 30s
                 from .persist import save_paper_state
-                save_paper_state(self.portfolio, self.risk.state, brains=self.brain_states())
-            if self.on_update:
+                save_paper_state(self.portfolio, self.risk.state,
+                                 brains=self.brain_states(),
+                                 entry_ctx=self.entry_contexts())
+            # full-state refresh every 30s only — prices/uPnL/stage already ride
+            # the 0.4s hot channel, and this used to force a heavy full push
+            # (serialize + whole-page re-render) every 5 seconds around the clock.
+            if self.on_update and beat % 6 == 0:
                 await self.on_update("state")
 
     async def _fast_push_loop(self) -> None:
@@ -309,6 +315,22 @@ class TraderEngine:
         if n:
             log.info("restored learning state for %d brains", n)
         return n
+
+    def entry_contexts(self) -> dict:
+        """Decision context of currently OPEN positions, for paper persistence —
+        without it a position that straddles a restart journals with an empty
+        context (no regime/edge/24h location), a blind row in the analytics."""
+        return {sym: {"entry_ctx": c.entry_ctx, "bars_held": c.bars_held}
+                for sym, c in self.ctx.items() if c.entry_ctx}
+
+    def load_entry_contexts(self, d: dict | None) -> None:
+        if not d:
+            return
+        for sym, v in d.items():
+            c = self.ctx.get(sym)
+            if c is not None and sym in self.portfolio.positions:
+                c.entry_ctx = dict(v.get("entry_ctx") or {})
+                c.bars_held = int(v.get("bars_held") or 0)
 
     def pending_entries(self) -> int:
         """Resting limit entries currently waiting for a fill. Each one is a
@@ -845,6 +867,7 @@ class TraderEngine:
                     "rpos24": _fin(c.last_row.get("range_pos_24h"), 4),
                     "candle": self._live_candle(sym),
                     "gates": c.gates,
+                    "viz": c.brain.viz(),   # cortex animation: alpha/desk wiring
                 }
                 for sym, c in self.ctx.items()
             },
