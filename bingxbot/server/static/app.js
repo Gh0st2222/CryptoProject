@@ -431,13 +431,26 @@ function renderSettings(){
     return `<div style="display:flex;justify-content:space-between"><span style="color:var(--muted)">${lab}</span><span style="color:var(--ink)">${val}</span></div>`;
   }).join("");
 }
+/* only the VISIBLE bottom tab gets rendered — rebuilding five hidden tables
+   (trades, vault, tuner history, radar, settings) on every full push was a
+   layout+GC burst the user could FEEL as a periodic stutter. Hidden tabs
+   render from state the moment they're opened. */
+const activePage=()=>document.querySelector(".tab-page.active")?.dataset.page;
+function renderBottomTab(page){
+  if(!S) return;
+  if(page==="positions"){ if(S.engine) renderPositions(); }
+  else if(page==="trades"){ if(S.engine) renderTrades(); }
+  else if(page==="autotuner"){ renderAutotuner(); renderChampions(); }
+  else if(page==="radar"){ renderRadar(); }
+  else if(page==="settings"){ renderSettings(); }
+}
 function renderAll(){
   if(!S) return;
   renderTop(); renderSymTabs(); renderTape();
-  if(S.engine){ renderPipeline(); renderBrain(); renderEquity(); renderPositions(); renderTrades();
+  if(S.engine){ renderPipeline(); renderBrain(); renderEquity();
     cortexFeed();
     const tc=S.engine.portfolio.stats.trades; refreshCandles(false).then(()=>{lastTradeCount=tc;}); }
-  renderAutotuner(); renderChampions(); renderRadar(); renderSettings();
+  renderBottomTab(activePage());
 }
 
 /* ------- fast 'hot' channel: patch the live numbers between full pushes ----- */
@@ -477,7 +490,8 @@ function cortexFeed(){
 let lastEqT=0;
 function renderHot(){
   if(!S?.engine) return;
-  renderTop(); renderPipeline(); renderPositions(); renderTape();
+  renderTop(); renderPipeline(); renderTape();
+  if(activePage()==="positions") renderPositions();
   renderSymTabs();   // adopted set + auto-follow react at hot cadence
   const es=engSym(); if(es&&es.brain){ renderEdgeGauge(es.brain, es); renderMTF(es); renderGates(es); }
   // live-forming candle straight off the hot channel — the chart moves at tick
@@ -533,6 +547,7 @@ $("live-go").onclick=async()=>{ try{ const r=await api("/api/mode",{mode:"live",
 document.querySelectorAll(".tab").forEach(b=>{ b.onclick=()=>{
   document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("active",x===b));
   document.querySelectorAll(".tab-page").forEach(p=>p.classList.toggle("active",p.dataset.page===b.dataset.tab));
+  renderBottomTab(b.dataset.tab);   // hidden tabs render on open, not on every push
   if(b.dataset.tab==="backtest") ensureBtCharts();
   if(b.dataset.tab==="portfolio") ensurePfChart();
   if(b.dataset.tab==="walkforward") ensureWfChart();
@@ -917,6 +932,9 @@ const cortex=(()=>{
   const lerp=(a,b,k)=>a+(b-a)*k;
   const dirCol=(v)=>v>=0?C.up:C.dn;
   const TAU=Math.PI*2;
+  const _colA={};
+  function colA(col,a){ const q=Math.min(31,Math.max(0,(a*31)|0)); const k2=col+q;
+    return _colA[k2]||(_colA[k2]=col+Math.round(q/31*255).toString(16).padStart(2,"0")); }
   function sprite(col){
     if(SPR[col]) return SPR[col];
     const s=document.createElement("canvas"); s.width=s.height=64;
@@ -1058,11 +1076,13 @@ const cortex=(()=>{
       g.drawImage(sprite(C.accent),m.x-3|0,m.y-3|0,6,6);
     }
     g.globalAlpha=1; g.globalCompositeOperation="source-over";
-    // curved axons — brightness follows live strength
+    // curved axons — brightness follows live strength. Color strings are
+    // CACHED per (color, quantized alpha): building ~750 fresh strings a
+    // second fed Firefox's GC a periodic cleanup burst.
     for(const nd of nodes){
       nd.sc=lerp(nd.sc,nd.tsc,k); nd.wt=lerp(nd.wt,nd.twt,k);
       const s=Math.min(1,Math.abs(nd.sc));
-      g.strokeStyle=nd.col+Math.round((0.05+0.22*s)*255).toString(16).padStart(2,"0");
+      g.strokeStyle=colA(nd.col,0.05+0.22*s);
       g.lineWidth=0.8+1.4*s;
       g.beginPath(); g.moveTo(nd.x,nd.y); g.quadraticCurveTo(nd.cpx,nd.cpy,nd.hub.x,nd.hub.y); g.stroke();
       if(s>0.1){ nd.acc+=dt*(0.25+2.6*s); if(nd.acc>=1){ nd.acc=0; spawn(nd); } }
@@ -1070,7 +1090,7 @@ const cortex=(()=>{
     for(const d of DESK_ORDER){
       const h=hubs[d]; if(!h) continue;
       const s=Math.min(1,Math.abs(h.sig));
-      g.strokeStyle=h.col+Math.round((0.10+0.30*s)*255).toString(16).padStart(2,"0");
+      g.strokeStyle=colA(h.col,0.10+0.30*s);
       g.lineWidth=1+2.6*h.alloc;
       g.beginPath(); g.moveTo(h.x,h.y); g.lineTo(cx,cy); g.stroke();
       const ss=s*Math.min(1,h.alloc*4);
