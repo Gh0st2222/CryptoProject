@@ -26,7 +26,7 @@ CURVE_TAIL = 4000
 
 
 def save_paper_state(portfolio, risk_state, path: Path = STATE_PATH,
-                     brains: dict | None = None) -> None:
+                     brains: dict | None = None, entry_ctx: dict | None = None) -> None:
     try:
         data = {
             "ts": now_ms(),
@@ -38,7 +38,8 @@ def save_paper_state(portfolio, risk_state, path: Path = STATE_PATH,
             "trades": [dataclasses.asdict(t) for t in portfolio.trades[-TRADE_TAIL:]],
             "equity_curve": list(portfolio.equity_curve)[-CURVE_TAIL:],
             "risk": dataclasses.asdict(risk_state),
-            "brains": brains or {},   # per-symbol online learning survives too
+            "brains": brains or {},        # per-symbol online learning survives too
+            "entry_ctx": entry_ctx or {},  # open positions keep their decision context
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")

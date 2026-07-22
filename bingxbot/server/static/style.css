@@ -356,3 +356,10 @@ input.field { width: 100%; font-family: var(--mono); }
 .toast.good { border-left-color: var(--good); } .toast.bad { border-left-color: var(--bad); } .toast.warn { border-left-color: var(--warn); }
 @keyframes slidein { from { transform: translateX(30px); opacity: 0; } }
 .foot-note { color: var(--muted); font-size: 10.5px; margin-top: 12px; line-height: 1.5; }
+
+/* neural cortex — the live brain animation (canvas draws everything; the CSS
+   here only frames it and must stay cheap: no animated shadows or filters) */
+.cortex-panel .phead { border-bottom: 1px solid var(--border); }
+.cortex-body { position: relative; padding: 0; }
+#cortex { display: block; width: 100%; height: 252px; background: transparent; }
+#cortex-cap { font-family: var(--mono); color: var(--muted); font-size: 10px; letter-spacing: .5px; }
