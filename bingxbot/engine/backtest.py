@@ -778,8 +778,10 @@ def _apply_params(strat: StrategyConfig, risk: RiskConfig, p: dict) -> tuple[Str
     return s, r
 
 
-FITNESS_VER = 2   # bump when the fitness scale changes — birth scores recorded
+FITNESS_VER = 3   # bump when the fitness scale changes — birth scores recorded
                   # under a different version are not comparable to current ones
+                  # (v3: honest fills — trade-through limits, double stop slip —
+                  # compressed the whole scale vs v2)
 
 
 def _fitness(stats: dict) -> float:
