@@ -247,7 +247,7 @@ class AutoTuner:
         candles = await self.orch._get_backtest_candles(
             symbol, cfg.strategy.interval, LOOKBACK_DAYS, cfg.feed == "synthetic", _NullJob())
         self._cache[symbol] = (candles, time.time())
-        if len(self._cache) > 6:   # bound the cache to the working set
+        if len(self._cache) > 10:  # bound the cache to the working set
             oldest = min(self._cache, key=lambda s: self._cache[s][1])
             if oldest != symbol:
                 self._cache.pop(oldest, None)
@@ -632,11 +632,25 @@ class AutoTuner:
         if self.cycles % META_TRAIN_EVERY == 0:
             try:
                 from ..ml.meta import train_from_candles
+                # train on a WIDER basket than we trade: the traded symbols
+                # plus top-volume universe perps, up to 8 — the meta model's
+                # features are all symbol-relative (ATR units, percentiles),
+                # so pooled history means ~2x the samples and a sturdier AUC
+                # without diluting what it learns.
                 cbs = {}
-                for tsym in self._traded_symbols()[:4]:
-                    tc = self._cache.get(tsym)
-                    if tc and len(tc[0]) >= MIN_BARS:
-                        cbs[tsym] = tc[0]
+                meta_syms = list(self._traded_symbols()[:4])
+                for extra in self._universe():
+                    if len(meta_syms) >= 8:
+                        break
+                    if extra not in meta_syms:
+                        meta_syms.append(extra)
+                for tsym in meta_syms:
+                    try:
+                        tc0 = await self._get_candles(tsym)
+                    except Exception:  # noqa: BLE001 — basket breadth is best-effort
+                        tc0 = None
+                    if tc0 and len(tc0) >= MIN_BARS:
+                        cbs[tsym] = tc0
                 if not cbs:
                     self.last_meta = {"trained": False, "reason": "no cached history >= MIN_BARS",
                                       "ts": int(time.time() * 1000)}

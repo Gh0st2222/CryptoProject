@@ -418,6 +418,30 @@ def test_feed_seed_covers_24h_window():
     assert len(feed.states["BTC-USDT"].candles) >= 1441
 
 
+def test_ev_floor_refuses_coin_flips():
+    """The expected-value gate: with a healthy payoff prior the floor stays
+    out of the way; as the MEASURED payoff decays toward 1:1 the required
+    P(win) rises above the coin-flip entries that produced every live loss."""
+    from bingxbot.config import RiskConfig
+    from bingxbot.engine.backtest import gate_ev
+    rc = RiskConfig()
+    rc.sl_atr_min = 1.5
+    row = {"atr_pct": 0.004}          # 0.6% stop distance
+    fees, spread, slip = 0.0007, 1.0, 1.0
+    # prior payoff 2.65: breakeven ~ (1+0.15)/(3.65) ~ 31% -> a 49% signal passes
+    assert gate_ev(rc, 2.65, 0.49, row, fees, spread, slip)[0]
+    # measured payoff collapsed to 1.0: floor ~ (1+0.15)/2 + margin ~ 59% ->
+    # the exact 48-51% trades that bled the live account are refused
+    assert not gate_ev(rc, 1.0, 0.51, row, fees, spread, slip)[0]
+    assert gate_ev(rc, 1.0, 0.62, row, fees, spread, slip)[0]
+    # costs several times the stop distance -> the floor caps at 92%: untradeable
+    tiny = {"atr_pct": 0.0002}        # stop 0.03%, costs 0.10% -> cost_r > 3
+    ok, why = gate_ev(rc, 2.65, 0.85, tiny, fees, spread, slip)
+    assert not ok and "EV floor" in why
+    # no volatility estimate -> refuse
+    assert not gate_ev(rc, 2.65, 0.9, {"atr_pct": 0.0}, fees, spread, slip)[0]
+
+
 def test_oos_composite_resists_one_lucky_fold():
     """Promotion fitness: one parabolic OOS fold must not buy the seat. The
     exact fold fits from a live mispromotion — [+21.06, +0.94, -1.53] scored
@@ -428,6 +452,37 @@ def test_oos_composite_resists_one_lucky_fold():
     steady = [1.4, 1.1, 0.9]
     assert _oos_composite(steady) > _oos_composite(lucky)
     assert _oos_composite(lucky) < 1.0
+
+
+def test_champion_probation_sizing(tmp_path):
+    """Prove-it sizing: the active parameter set trades at reduced risk until
+    it shows a real sample with an acceptable profit factor; a proven-good set
+    gets full size, a proven-bad one drops back to probation size."""
+    from bingxbot.config import BotConfig
+    from bingxbot.data.feed import SyntheticFeed
+    from bingxbot.engine.brokers import PaperBroker
+    from bingxbot.engine.journal import TradeJournal
+    from bingxbot.engine.portfolio import Portfolio
+    from bingxbot.engine.trader import PROBATION_MULT, TraderEngine
+    from bingxbot.risk.manager import RiskManager
+    cfg = BotConfig()
+    cfg.symbols = ["BTC-USDT"]
+    feed = SyntheticFeed(cfg.symbols, "15m", warmup_bars=10, seed=1)
+    pf = Portfolio(1000.0, mode="paper")
+    j = TradeJournal(tmp_path / "j.jsonl")
+    eng = TraderEngine(cfg, feed, PaperBroker(pf, feed.states, {}, 5e-4, 0.0),
+                       pf, RiskManager(cfg.risk), {}, journal=j)
+    eng.active_champion_id = "abc"
+    assert eng._champion_probation() == PROBATION_MULT, "unproven -> probation size"
+    for _ in range(8):
+        j.rows.append({"mode": "paper", "champion_id": "abc", "pnl": 1.0})
+    assert eng._champion_probation() == 1.0, "8 winning live trades -> full size"
+    for _ in range(8):
+        j.rows.append({"mode": "paper", "champion_id": "abc", "pnl": -9.0})
+    assert eng._champion_probation() == PROBATION_MULT, "proven bad -> back to probation"
+    # trades under a DIFFERENT champion never count toward this one's record
+    eng.active_champion_id = "zzz"
+    assert eng._champion_probation() == PROBATION_MULT
 
 
 def test_entry_context_captures_24h_location():

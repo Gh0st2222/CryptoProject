@@ -44,6 +44,11 @@ def _alpha_cache(ff) -> list[dict]:
                      for i in range(ff.n)]
     return ff._alpha
 ASSUMED_SPREAD_BPS = 1.0
+EV_MARGIN = 0.02            # P(win) must clear the cost-adjusted breakeven prob by this
+FILL_THROUGH_BPS = 1.0      # a resting limit fills only when price trades THROUGH it
+                            # by this much — a wick that kisses the level never
+                            # guarantees a maker fill (queue position is real)
+STOP_SLIP_MULT = 2.0        # stops fire into momentum: pay double slippage there
 TREND_REGIMES = {"TREND_UP", "TREND_DOWN"}
 FUNDING_MS = 8 * 3600 * 1000        # perp funding settles every 8h
 ASSUMED_FUNDING_8H = 0.0001         # 0.01%/8h baseline, charged as a COST while
@@ -101,11 +106,34 @@ def gate_regime(strat, edge: float, row: dict, regime: str) -> tuple[bool, str]:
     return False, "volatile chop (sitting out)"
 
 
-def _entry_signal_ok(brain, strat, edge: float, p_win: float, row: dict, ev: dict,
-                     fees_rt: float, slippage_bps: float) -> bool:
+def gate_ev(risk_cfg, payoff_b: float, p_win: float, row: dict, fees_rt: float,
+            spread_bps: float, slippage_bps: float) -> tuple[bool, str]:
+    """Expected-value floor — the gate that refuses coin-flip entries.
+
+    P(win) must clear the breakeven probability at the MEASURED payoff ratio
+    with the real round-trip cost expressed in stop-distance units:
+    p_be = (1 + cost_R) / (1 + b). Every live loss so far entered at p_win
+    48-51% with a measured payoff near 1:1 — mathematically dead before fees.
+    As the exits' realized payoff decays, this bar rises automatically at
+    exactly the rate the edge is decaying; when payoff is healthy the gate
+    stays out of the way (prior b≈2.6 puts the floor near 30%)."""
+    atr_pct = row.get("atr_pct", 0.0)
+    if not (isinstance(atr_pct, float) and math.isfinite(atr_pct)) or atr_pct <= 0:
+        return False, "no volatility estimate"
+    stop_pct = max(risk_cfg.sl_atr_min * atr_pct, 1e-9)
+    cost_r = (fees_rt + (spread_bps + 2.0 * slippage_bps) / 10_000.0) / stop_pct
+    b = max(payoff_b, 0.1)
+    need = min((1.0 + cost_r) / (1.0 + b) + EV_MARGIN, 0.92)
+    if p_win < need:
+        return False, f"P {p_win:.0%} < EV floor {need:.0%} (b {b:.2f})"
+    return True, f"P {p_win:.0%} ≥ EV floor {need:.0%} (b {b:.2f})"
+
+
+def _entry_signal_ok(brain, strat, risk_cfg, edge: float, p_win: float, row: dict, ev: dict,
+                     fees_rt: float, slippage_bps: float, payoff_b: float) -> bool:
     """The full entry filter chain — brain quality gates, the hard MTF veto,
-    funding awareness, then the regime branch. The single biggest fix for
-    fee-drag: only trade where an edge actually exists."""
+    funding awareness, the regime branch, then the expected-value floor. The
+    single biggest fix for fee-drag: only trade where an edge actually exists."""
     ok, _ = brain.entry_ok(edge, p_win, row, fees_rt, ASSUMED_SPREAD_BPS, slippage_bps)
     if not ok:
         return False
@@ -113,7 +141,9 @@ def _entry_signal_ok(brain, strat, edge: float, p_win: float, row: dict, ev: dic
         return False
     if not gate_funding(strat, edge, row)[0]:
         return False
-    return gate_regime(strat, edge, row, ev["regime"])[0]
+    if not gate_regime(strat, edge, row, ev["regime"])[0]:
+        return False
+    return gate_ev(risk_cfg, payoff_b, p_win, row, fees_rt, ASSUMED_SPREAD_BPS, slippage_bps)[0]
 
 
 def candles_to_arrays(candles: list[Candle]) -> dict[str, np.ndarray]:
@@ -239,14 +269,15 @@ class _SymSim:
                                      "price": round(eff, 8), "pnl": round(tr.pnl, 6),
                                      "reason": "scale out"})
 
-    def close_at(self, i, pf, risk, px, reason, marks, maker=False):
+    def close_at(self, i, pf, risk, px, reason, marks, maker=False, slip_mult=1.0):
         pos = pf.positions.get(self.symbol)
         if pos is None:
             return
         if maker:
             fee = pos.qty * px * self.maker_fee
         else:
-            px = px * (1 - self.slip) if pos.side == LONG else px * (1 + self.slip)
+            s = self.slip * slip_mult
+            px = px * (1 - s) if pos.side == LONG else px * (1 + s)
             fee = pos.qty * px * self.taker
         tr = pf.close_position(self.symbol, px, int(self.ts[i]), fee, reason, self.planned_risk)
         if tr:
@@ -273,7 +304,11 @@ class _SymSim:
                 self._slots["n"] -= 1
             else:
                 lim = p["limit"]
-                hit = (l[i] <= lim) if side == LONG else (h[i] >= lim)
+                # maker fills require price to trade THROUGH the level, not
+                # merely touch it — the exact wick-kiss "fill" the live engine
+                # can never collect was flattering every pullback entry.
+                thru = FILL_THROUGH_BPS / 10_000.0
+                hit = (l[i] <= lim * (1 - thru)) if side == LONG else (h[i] >= lim * (1 + thru))
                 if hit:
                     self.open_at(i, pf, risk, side, lim, p["atr"], p["regime"], p["style"],
                                  p["size_mult"], p["reason"], True, marks)
@@ -295,8 +330,10 @@ class _SymSim:
             stop, tp = pos.stop_price, pos.take_profit
             if stop > 0 and ((l[i] <= stop) if d > 0 else (h[i] >= stop)):
                 gap = (o[i] < stop) if d > 0 else (o[i] > stop)
+                # stops fire INTO momentum — they pay extra slippage, always
                 self.close_at(i, pf, risk, o[i] if gap else stop,
-                              "stop" if not pos.breakeven_moved else "trail stop", marks)
+                              "stop" if not pos.breakeven_moved else "trail stop", marks,
+                              slip_mult=STOP_SLIP_MULT)
             elif tp > 0 and ((h[i] >= tp) if d > 0 else (l[i] <= tp)):
                 self.close_at(i, pf, risk, tp, "target", marks, maker=True)
             pos = pf.positions.get(sym)
@@ -321,10 +358,11 @@ class _SymSim:
             # 5) entry decision for the next bar (pendings reserve slots)
             equity = pf.equity(marks)
             ok, _ = risk.can_enter(equity, len(pf.positions) + self._slots["n"], ASSUMED_SPREAD_BPS)
-            if ok and _entry_signal_ok(self.brain, self.strat, edge, p_win, row, ev,
-                                       self.fees_rt, self.slippage_bps):
-                style = "scalp" if regime == "RANGE" else "trend"
-                kelly = self.brain.kelly_size_mult(p_win, risk.payoff_ratio(style)) if self.strat.use_kelly else 1.0
+            style = "scalp" if regime == "RANGE" else "trend"
+            payoff_b = risk.payoff_ratio(style)
+            if ok and _entry_signal_ok(self.brain, self.strat, self.risk_cfg, edge, p_win, row, ev,
+                                       self.fees_rt, self.slippage_bps, payoff_b):
+                kelly = self.brain.kelly_size_mult(p_win, payoff_b) if self.strat.use_kelly else 1.0
                 size_mult = kelly * risk.health.scalar
                 side = LONG if edge > 0 else SHORT
                 side_d = 1 if side == LONG else -1

@@ -22,7 +22,7 @@ from ..strategy.brain import TradingBrain
 from ..strategy.exits import AdaptiveExitManager
 from ..strategy.features import FeatureFrame, mtf_from_row
 from ..util import now_ms
-from .backtest import (_entry_signal_ok, gate_funding, gate_mtf_veto,
+from .backtest import (_entry_signal_ok, gate_ev, gate_funding, gate_mtf_veto,
                        gate_regime)
 from .brokers import Broker, LiveBroker
 from .portfolio import Portfolio
@@ -39,6 +39,13 @@ REACT_TAIL = 640     # bars for reactive intra-bar scans: the widest rolling
                      # the full tail so the 1h ladder rung stays populated.
 REACT_MS = 850       # min gap between reactive intra-bar scans, per symbol
 ADOPTED_FULL_GRADED = 30  # adopted symbols trade at reduced size until this many graded calls
+# champion probation: a freshly promoted parameter set trades at reduced risk
+# until it has a REAL sample with an acceptable profit factor. Every champion
+# to reach live so far failed its validation numbers on contact — verify
+# before compounding is what protects the snowball.
+PROBATION_TRADES = 8
+PROBATION_PF = 0.9
+PROBATION_MULT = 0.5
 
 # Execution-cycle stages surfaced to the UI pipeline.
 STAGES = ("SCAN", "DETECT", "VALIDATE", "SIZE", "FILL", "MANAGE", "SETTLE")
@@ -460,8 +467,12 @@ class TraderEngine:
             return
         spec = self.specs.get(symbol, ContractSpec(symbol))
         fees_rt, slip = self._entry_costs(symbol)
-        if not _entry_signal_ok(ctx.brain, self.cfg.strategy, edge, p_win, row, ev, fees_rt, slip):
-            ctx.last_entry_block = self._block_reason(ctx.brain, edge, p_win, row, ev, fees_rt, spread, slip)
+        style0 = "scalp" if ev["regime"] == "RANGE" else "trend"
+        payoff_b = self.risk.payoff_ratio(style0)
+        if not _entry_signal_ok(ctx.brain, self.cfg.strategy, self.cfg.risk, edge, p_win,
+                                row, ev, fees_rt, slip, payoff_b):
+            ctx.last_entry_block = self._block_reason(ctx.brain, edge, p_win, row, ev,
+                                                     fees_rt, spread, slip, payoff_b)
             return
         if self.cfg.strategy.micro_confirm and not ctx.brain.micro_confirms(edge, st.micro_snapshot()):
             ctx.last_entry_block = "order-flow veto"
@@ -469,7 +480,7 @@ class TraderEngine:
         ctx.set_stage("VALIDATE")
 
         side = LONG if edge > 0 else SHORT
-        style = "scalp" if ev["regime"] == "RANGE" else "trend"
+        style = style0
         price = st.mark_price() or row["close"]
         atr = row.get("atr", 0.0)
         # pullback entry: plan the trade AT the resting limit (bracket, sizing,
@@ -483,8 +494,8 @@ class TraderEngine:
         if bracket is None:
             ctx.last_entry_block = "no volatility for bracket"
             return
-        kelly = ctx.brain.kelly_size_mult(p_win, self.risk.payoff_ratio(style)) if self.cfg.strategy.use_kelly else 1.0
-        size_mult = kelly * self.risk.health.scalar
+        kelly = ctx.brain.kelly_size_mult(p_win, payoff_b) if self.cfg.strategy.use_kelly else 1.0
+        size_mult = kelly * self.risk.health.scalar * self._champion_probation()
         # a freshly ADOPTED symbol trades small until its brain has real graded
         # evidence — adoption gives it a seat, not full conviction on day one.
         if symbol in self.adopted and getattr(ctx.brain, "graded", 0) < ADOPTED_FULL_GRADED:
@@ -599,7 +610,34 @@ class TraderEngine:
             "vwap24_dev": _fin(row.get("vwap24_dev"), 3, None),
         }
 
-    def _block_reason(self, brain, edge, p_win, row, ev, fees_rt, spread, slip) -> str:
+    def _champion_probation(self) -> float:
+        """Prove-it sizing: the ACTIVE parameter set (vault champion or the
+        defaults, keyed by champion id) trades at PROBATION_MULT risk until it
+        shows PROBATION_TRADES real closed trades at an acceptable profit
+        factor in this mode. Signals, learning and the journal are untouched —
+        only the size of the tuition is."""
+        if self.journal is None:
+            return 1.0
+        cid = self.active_champion_id
+        wins = losses = 0.0
+        n = 0
+        for r in reversed(self.journal.rows[-300:]):
+            if r.get("mode") != self.portfolio.mode or r.get("champion_id") != cid:
+                continue
+            pnl = float(r.get("pnl", 0.0))
+            if pnl > 0:
+                wins += pnl
+            else:
+                losses += -pnl
+            n += 1
+            if n >= 40:
+                break
+        if n < PROBATION_TRADES:
+            return PROBATION_MULT
+        pf = wins / losses if losses > 0 else (999.0 if wins > 0 else 0.0)
+        return 1.0 if pf >= PROBATION_PF else PROBATION_MULT
+
+    def _block_reason(self, brain, edge, p_win, row, ev, fees_rt, spread, slip, payoff_b) -> str:
         """The FIRST failing gate, with its live numbers — never a vague label.
         'trend ER 0.14 < 0.27' tells you exactly what the machine is waiting for;
         'awaiting aligned trend' told you nothing."""
@@ -612,6 +650,9 @@ class TraderEngine:
             if not ok:
                 return d
         ok, d = gate_regime(strat, edge, row, ev["regime"])
+        if not ok:
+            return d
+        ok, d = gate_ev(self.cfg.risk, payoff_b, p_win, row, fees_rt, spread, slip)
         return d if not ok else ""
 
     def _entry_costs(self, symbol: str) -> tuple[float, float]:
@@ -639,14 +680,15 @@ class TraderEngine:
             gates.append({"n": name, "ok": g_ok, "d": d})
         r_ok, r_d = gate_regime(strat, edge, row, ev["regime"])
         gates.append({"n": "regime", "ok": r_ok, "d": f"{ev['regime']} · {r_d}"})
+        style = "scalp" if ev["regime"] == "RANGE" else "trend"
+        ev_ok, ev_d = gate_ev(self.cfg.risk, self.risk.payoff_ratio(style), p_win, row,
+                              fees_rt, spread or 1.0, slip)
+        gates.append({"n": "EV floor", "ok": ev_ok, "d": ev_d})
         if strat.micro_confirm:
             micro = st.micro_snapshot()
             lean = 0.6 * micro.get("flow", 0.0) + 0.4 * micro.get("obi", 0.0)
             gates.append({"n": "order-flow", "ok": ctx.brain.micro_confirms(edge, micro),
                           "d": f"lean {lean:+.2f} vs edge {edge:+.2f}"})
-        need = max(1, strat.entry_confirm_scans)
-        gates.append({"n": "confirm", "ok": ctx.react_confirm >= need,
-                      "d": f"{min(ctx.react_confirm, need)}/{need} scans agree"})
         ctx.gates = gates
 
     # ------------------------------------------------------------ tick logic
@@ -710,9 +752,13 @@ class TraderEngine:
         ctx.mtf = mtf_from_row(row, ff.ladder)
         self._build_gates(ctx, st, row, ev)
 
-        # confirmation buffer: an intra-bar signal must persist in the same
-        # direction across a few scans before we act, so a transient tick that
-        # crosses threshold and immediately reverses can't trigger a whipsaw entry.
+        # ENTRIES DECIDE AT BAR CLOSE ONLY. The reactive scan keeps the UI, the
+        # gate X-ray and the exits fed with live data, but it no longer opens
+        # positions: an intra-bar signal is computed on a PARTIAL bar — a state
+        # the backtester (which validated every parameter driving this brain)
+        # never sees and never priced. All ten live losses entered through this
+        # door. If the signal is real it will still be there when the bar
+        # closes; if it isn't, it was exactly the trade we shouldn't take.
         edge, thr = ev["edge"], ev.get("threshold", 0.3)
         sig_dir = (1 if edge > 0 else -1) if abs(edge) >= thr else 0
         if sig_dir != 0 and sig_dir == ctx.react_dir:
@@ -720,16 +766,8 @@ class TraderEngine:
         else:
             ctx.react_dir = sig_dir
             ctx.react_confirm = 1 if sig_dir != 0 else 0
-        if sig_dir == 0 or ctx.react_confirm < max(1, self.cfg.strategy.entry_confirm_scans):
-            if sig_dir != 0:
-                ctx.last_entry_block = f"confirming {ctx.react_confirm}/{self.cfg.strategy.entry_confirm_scans}"
-            return
-
-        ctx.busy = True
-        try:
-            await self._try_enter(ctx, st, row, ev)
-        finally:
-            ctx.busy = False
+        if sig_dir != 0:
+            ctx.last_entry_block = "signal live — decides at bar close"
 
     async def _close(self, symbol: str, reason: str) -> None:
         ctx = self.ctx.get(symbol)

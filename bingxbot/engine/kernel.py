@@ -58,10 +58,13 @@ REG_EXIT = np.array([[REGIME_EXIT_MULT[r]["sl"], REGIME_EXIT_MULT[r]["tp"],
 MTF_EXIT_GUARD = 0.35
 EDGE_EXIT_OVERRIDE = 0.55
 EDGE_FLIP_BARS = 2
-# backtest.py constants
+# backtest.py constants (mirrored — test_kernel asserts they stay equal)
 ASSUMED_SPREAD_BPS = 1.0
 FUNDING_MS = 8 * 3600 * 1000
 ASSUMED_FUNDING_8H = 0.0001
+EV_MARGIN = 0.02
+FILL_THROUGH_BPS = 1.0
+STOP_SLIP_MULT = 2.0
 # risk manager constants
 MAINT_MARGIN_RATE = 0.005
 LIQ_STOP_HEADROOM = 0.8
@@ -287,7 +290,8 @@ def run_kernel(feats, amat, regs, p, warmup, taker, maker_fee, slip_bps,
             if pend_taker:
                 fill = True; fpx = o; fmaker = False
             else:
-                hitp = (lo <= pend_limit) if pend_long else (hi >= pend_limit)
+                thru = FILL_THROUGH_BPS / 10_000.0
+                hitp = (lo <= pend_limit * (1.0 - thru)) if pend_long else (hi >= pend_limit * (1.0 + thru))
                 if hitp:
                     fill = True; fpx = pend_limit; fmaker = True
                 elif i >= pend_expires:
@@ -366,7 +370,8 @@ def run_kernel(feats, amat, regs, p, warmup, taker, maker_fee, slip_bps,
             if pos_stop > 0 and ((lo <= pos_stop) if pos_long else (hi >= pos_stop)):
                 gap = (o < pos_stop) if pos_long else (o > pos_stop)
                 px = o if gap else pos_stop
-                px = px * (1.0 - slip) if pos_long else px * (1.0 + slip)
+                s2 = slip * STOP_SLIP_MULT   # stops fire into momentum
+                px = px * (1.0 - s2) if pos_long else px * (1.0 + s2)
                 fee = pos_qty * px * taker
                 gross = (px - pos_entry) * pos_qty * d
                 cash += gross - fee
@@ -838,36 +843,47 @@ def run_kernel(feats, amat, regs, p, warmup, taker, maker_fee, slip_bps,
                             allow = p[P_TVOL] > 0.5
                         if allow:
                             scalp = scalp or reg == 2
-                            # kelly sizing
-                            if p[P_USEK] > 0.5:
-                                prior_b = p[P_SERR] if scalp else p[P_ERR]
-                                nw = 0
-                                nl = 0
-                                sw = 0.0
-                                sl2 = 0.0
-                                for q in range(rh_n):
-                                    rv = r_hist[(rh_head - rh_n + q) % 30]
-                                    if rv > 0:
-                                        nw += 1
-                                        sw += rv
-                                    elif rv < 0:
-                                        nl += 1
-                                        sl2 += -rv
-                                b3 = prior_b
-                                if nw >= 8 and nl >= 8:
-                                    measured = _clamp((sw / nw) / max(sl2 / nl, 1e-9), 0.6, 4.0)
-                                    wgt = _clamp(rh_n / 30.0, 0.0, 1.0)
-                                    b3 = (1.0 - wgt) * prior_b + wgt * measured
-                                bb = max(b3, 0.1)
-                                fK = p_win - (1.0 - p_win) / bb
-                                kel = 0.0 if fK <= 0 else _clamp(p[P_KF] * fK * 4.0, 0.25, 1.75)
-                            else:
-                                kel = 1.0
-                            # NOTE: python does NOT gate on kelly > 0 — sizing
-                            # clamps eff_mult to >= 0.1, so a zero-Kelly signal
-                            # still trades at floor size. Mirror that exactly.
-                            size_mult = kel * health_scalar
-                            if True:
+                            # measured payoff blend — shared by the EV floor
+                            # and Kelly (mirror of risk.payoff_ratio)
+                            prior_b = p[P_SERR] if scalp else p[P_ERR]
+                            nw = 0
+                            nl = 0
+                            sw = 0.0
+                            sl2 = 0.0
+                            for q in range(rh_n):
+                                rv = r_hist[(rh_head - rh_n + q) % 30]
+                                if rv > 0:
+                                    nw += 1
+                                    sw += rv
+                                elif rv < 0:
+                                    nl += 1
+                                    sl2 += -rv
+                            b3 = prior_b
+                            if nw >= 8 and nl >= 8:
+                                measured = _clamp((sw / nw) / max(sl2 / nl, 1e-9), 0.6, 4.0)
+                                wgt = _clamp(rh_n / 30.0, 0.0, 1.0)
+                                b3 = (1.0 - wgt) * prior_b + wgt * measured
+                            # EV floor — exact mirror of backtest.gate_ev:
+                            # p(win) must clear breakeven at the measured
+                            # payoff with real costs in stop-distance units
+                            stop_pct = max(p[P_SLMIN] * atr_pct, 1e-9)
+                            cost_r = (fees_rt + (ASSUMED_SPREAD_BPS + 2.0 * slip_bps) / 10_000.0) / stop_pct
+                            bb0 = b3 if b3 > 0.1 else 0.1
+                            need = (1.0 + cost_r) / (1.0 + bb0) + EV_MARGIN
+                            if need > 0.92:
+                                need = 0.92
+                            if p_win >= need:
+                                # kelly sizing
+                                if p[P_USEK] > 0.5:
+                                    bb = max(b3, 0.1)
+                                    fK = p_win - (1.0 - p_win) / bb
+                                    kel = 0.0 if fK <= 0 else _clamp(p[P_KF] * fK * 4.0, 0.25, 1.75)
+                                else:
+                                    kel = 1.0
+                                # NOTE: python does NOT gate on kelly > 0 — sizing
+                                # clamps eff_mult to >= 0.1, so a zero-Kelly signal
+                                # still trades at floor size. Mirror that exactly.
+                                size_mult = kel * health_scalar
                                 pend = True
                                 pend_long = edge > 0
                                 pend_atr = atr
