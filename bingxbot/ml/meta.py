@@ -41,10 +41,18 @@ from ..config import ROOT
 log = logging.getLogger("meta")
 
 MODEL_PATH = ROOT / "data_cache" / "meta_model.pkl"
-SCHEMA_VER = 1
+SCHEMA_VER = 2   # v2: labeler decoupled from the live config (fixed LABEL_THRESHOLD)
 MIN_AUC = 0.53          # below this the model has no measured skill -> no vote
 MIN_SAMPLES = 3000
-CAND_EDGE_FRAC = 0.8    # candidate = |edge| >= this x base_threshold (the gate zone)
+LABEL_THRESHOLD = 0.10  # the LABELER's own fixed candidate bar. The dataset must
+                        # NEVER depend on the live config: labeling through the
+                        # tuner's current base_threshold starved training whenever
+                        # a conservative set was running (thr 0.30 -> ~1.4k samples,
+                        # forever "insufficient data") and would have changed the
+                        # dataset's meaning on every champion swap. The model
+                        # learns P(win) across the whole gate zone; the live gate
+                        # then queries whatever slice of it today's config trades.
+CAND_EDGE_FRAC = 0.8    # candidate = |edge| >= this x LABEL_THRESHOLD
 BARRIER_RISK_ATR = 1.8  # risk unit for labeling, mid of the sl_atr search box
 MAX_HOLD_BARS = 96      # time barrier for labeling
 
@@ -140,16 +148,18 @@ def build_samples(candles: list, interval: str, strat, risk) -> tuple[np.ndarray
     ff = FeatureFrame(arrays, interval=interval)
     o, h, l = arrays["open"], arrays["high"], arrays["low"]
     bph = 3_600_000 / interval_ms(interval)
-    brain = TradingBrain(horizon_bars=strat.horizon_bars, base_threshold=strat.base_threshold,
-                         threshold_adapt=True, target_trades_per_hour=strat.target_trades_per_hour,
-                         bars_per_hour=bph)
+    # a FIXED labeling rule, decoupled from the live config: same horizon (the
+    # grading clock is structural) but its own broad candidate threshold, no
+    # adaptation — so the dataset means the same thing whatever champion runs.
+    brain = TradingBrain(horizon_bars=strat.horizon_bars, base_threshold=LABEL_THRESHOLD,
+                         threshold_adapt=False, bars_per_hour=bph)
     brain.use_meta = False      # the labeler must never consult the model it feeds
     X, y = [], []
     for i in range(300, ff.n):
         row = ff.row(i)
         ev = brain.evaluate(row, NO_MICRO, {})
         edge = ev["edge"]
-        if abs(edge) < CAND_EDGE_FRAC * brain.threshold:
+        if abs(edge) < CAND_EDGE_FRAC * LABEL_THRESHOLD:
             continue
         lab = triple_barrier_label(o, h, l, i, 1 if edge > 0 else -1,
                                    BARRIER_RISK_ATR * row.get("atr", 0.0), risk.expected_rr)
