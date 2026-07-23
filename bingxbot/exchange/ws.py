@@ -131,6 +131,14 @@ class _BaseWS:
                     await self._ws.close()
                 return
 
+    async def kick(self, reason: str = "") -> None:
+        """Force a reconnect cycle NOW (the run-loop re-subscribes everything).
+        For when frames still flow but a specific channel has gone dead — the
+        frame-level watchdog above can't see that kind of half-death."""
+        if self._ws is not None and not self._ws.closed:
+            log.warning("%s kicked (%s) -> reconnect", self.name, reason or "forced")
+            await self._ws.close()
+
 
 class BingXMarketWS(_BaseWS):
     """Public market stream: klines, trades, book ticker, partial depth."""
@@ -232,6 +240,12 @@ class BingXMarketWS(_BaseWS):
             if not isinstance(k, dict):
                 continue
             ts = int(safe_float(k.get("T") or k.get("t") or row.get("T")))
+            if ts <= 0:
+                # a payload without a resolvable bar time must NOT enter the
+                # rollover tracker: one ts=0 row would pin _kline_open at 0 and
+                # `ts > prev_ts` would never fire again — no bar would ever
+                # close while every other channel kept streaming happily.
+                continue
             candle = Candle(
                 ts=ts,
                 open=safe_float(k.get("o")),

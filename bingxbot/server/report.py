@@ -223,6 +223,20 @@ def build_report(orch) -> str:
                 info["backtest_kernel"] = "available — training folds run compiled"
             except Exception as e:  # noqa: BLE001
                 info["backtest_kernel"] = f"unavailable ({type(e).__name__}: {e}) — python fallback"
+        # bar-pipeline freshness — THE first thing to check when the terminal
+        # looks frozen: a live-looking price with an old last bar means the
+        # kline stream starved and the brain has stopped evaluating.
+        eng = orch.engine
+        if eng is not None:
+            from ..util import now_ms as _nm
+            ages = {}
+            for sym in eng.ctx:
+                st0 = eng.feed.states.get(sym)
+                lt = st0.candles.last_ts if st0 is not None and len(st0.candles) else 0
+                ages[sym] = round((_nm() - lt) / 1000.0, 1) if lt else None
+            info["feed"] = {"healthy": eng.feed.healthy(),
+                            "last_bar_age_s": ages,
+                            "interval": orch.cfg.strategy.interval}
         return _dump(info)
 
     def config():

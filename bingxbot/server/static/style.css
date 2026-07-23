@@ -96,6 +96,10 @@ a { color: var(--accent-2); }
 .feed { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 10.5px; font-family: var(--mono); }
 .feed .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--bad); }
 .feed .dot.ok { background: var(--good); box-shadow: 0 0 9px var(--good); }
+/* bar-pipeline starvation: prices may look live while no bar closes arrive —
+   the one failure the terminal must never hide. */
+.feed .dot.stale { background: var(--bad); animation: pulse 0.9s infinite; box-shadow: 0 0 9px var(--bad); }
+.feed #feed-label.stale { color: var(--bad); font-weight: 700; letter-spacing: 0.4px; }
 
 .tstats { display: flex; gap: 18px; margin-left: auto; }
 .tstat { text-align: right; }

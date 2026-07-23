@@ -15,7 +15,7 @@ import time
 from dataclasses import asdict as dc_asdict
 
 from ..config import BotConfig, MODE_LIVE
-from ..data.feed import BaseFeed, MarketState
+from ..data.feed import BaseFeed, MarketState, bars_overdue
 from ..exchange.models import LONG, SHORT, ContractSpec
 from ..risk.manager import RiskManager
 from ..strategy.brain import TradingBrain
@@ -170,6 +170,12 @@ class TraderEngine:
                 kind, symbol = await asyncio.wait_for(self.feed.events.get(), timeout=5.0)
             except asyncio.TimeoutError:
                 continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — if intake itself can die, the whole
+                log.exception("event intake failed")   # terminal freezes silently
+                await asyncio.sleep(1.0)
+                continue
             try:
                 if kind == "bar":
                     await self._on_bar(symbol)
@@ -202,40 +208,49 @@ class TraderEngine:
         while self.running:
             await asyncio.sleep(5)
             beat += 1
-            self.settle_risk()   # catch closes that bypassed the engine exit path
-            marks = {s: st.mark_price() for s, st in self.feed.states.items()}
-            now = now_ms()
-            if now // FUNDING_MS != self._funding_ms // FUNDING_MS:
-                self._settle_paper_funding(marks)
-            self._funding_ms = now
-            self._funding_rates = {s: getattr(st, "funding_rate", None)
-                                   for s, st in self.feed.states.items()}
-            self.portfolio.record_equity(now, marks)
-            self.risk.health.mark_equity(self.portfolio.equity(marks))
-            if isinstance(self.broker, LiveBroker) and beat % 6 == 0:
-                await self.broker.reconcile(self.cfg.symbols)
-            if self.risk.state.killed and self.portfolio.positions:
-                await self.broker.flatten_all("kill switch")
-            if self.record is not None:
-                try:
-                    self.record.maybe_roll(self.portfolio, self.portfolio.mode)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("track record roll failed: %s", e)
-            if self.portfolio.mode == "paper" and beat % 6 == 0:   # every 30s
-                from .persist import save_paper_state
-                # the state dicts are built on the loop (cheap); the multi-MB
-                # json.dumps + disk write run on a thread — doing them inline
-                # froze the event loop (ws pushes, ticks, everything) for up to
-                # ~100ms every 30s: the exact cyclic stutter on the dashboard.
-                await asyncio.to_thread(save_paper_state, self.portfolio, self.risk.state,
-                                        brains=self.brain_states(),
-                                        entry_ctx=self.entry_contexts(),
-                                        health=self.risk.health.state_dict())
-            # full-state refresh every 30s — prices/uPnL/stage already ride the
-            # 0.4s hot channel. OFFSET from the save beat by 15s so the two
-            # heaviest periodic jobs never land in the same instant.
-            if self.on_update and beat % 6 == 3:
-                await self.on_update("state")
+            # one armored beat: if ANY step raises, the next beat still runs.
+            # An unguarded surprise here used to kill this task silently —
+            # taking equity recording, paper saves, funding settlement AND the
+            # kill-switch flatten down with it, with nothing on screen.
+            try:
+                self.settle_risk()   # catch closes that bypassed the engine exit path
+                marks = {s: st.mark_price() for s, st in self.feed.states.items()}
+                now = now_ms()
+                if now // FUNDING_MS != self._funding_ms // FUNDING_MS:
+                    self._settle_paper_funding(marks)
+                self._funding_ms = now
+                self._funding_rates = {s: getattr(st, "funding_rate", None)
+                                       for s, st in self.feed.states.items()}
+                self.portfolio.record_equity(now, marks)
+                self.risk.health.mark_equity(self.portfolio.equity(marks))
+                if isinstance(self.broker, LiveBroker) and beat % 6 == 0:
+                    await self.broker.reconcile(self.cfg.symbols)
+                if self.risk.state.killed and self.portfolio.positions:
+                    await self.broker.flatten_all("kill switch")
+                if self.record is not None:
+                    try:
+                        self.record.maybe_roll(self.portfolio, self.portfolio.mode)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("track record roll failed: %s", e)
+                if self.portfolio.mode == "paper" and beat % 6 == 0:   # every 30s
+                    from .persist import save_paper_state
+                    # the state dicts are built on the loop (cheap); the multi-MB
+                    # json.dumps + disk write run on a thread — doing them inline
+                    # froze the event loop (ws pushes, ticks, everything) for up to
+                    # ~100ms every 30s: the exact cyclic stutter on the dashboard.
+                    await asyncio.to_thread(save_paper_state, self.portfolio, self.risk.state,
+                                            brains=self.brain_states(),
+                                            entry_ctx=self.entry_contexts(),
+                                            health=self.risk.health.state_dict())
+                # full-state refresh every 30s — prices/uPnL/stage already ride the
+                # 0.4s hot channel. OFFSET from the save beat by 15s so the two
+                # heaviest periodic jobs never land in the same instant.
+                if self.on_update and beat % 6 == 3:
+                    await self.on_update("state")
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                log.exception("housekeeping beat failed")
 
     def _settle_paper_funding(self, marks: dict[str, float]) -> None:
         """An 8h funding window just settled: transfer REAL signed funding on
@@ -928,9 +943,25 @@ class TraderEngine:
         prices, per-symbol edge/stage, open-position uPnL, equity — no brain
         internals, equity curve or trade history (those ride the slow channel)."""
         marks = {s: st.mark_price() for s, st in self.feed.states.items()}
+        # bar-pipeline freshness: age of the newest CLOSED bar across traded
+        # symbols. Stale here = the brain is starving even if prices look live
+        # (the exact failure mode of a half-dead kline stream) — the UI turns
+        # the feed chip red instead of letting the terminal freeze silently.
+        now = now_ms()
+        iv = self._interval_ms()
+        worst_age = 0
+        stale = False
+        for sym in self.ctx:
+            st0 = self.feed.states.get(sym)
+            lt = st0.candles.last_ts if st0 is not None and len(st0.candles) else 0
+            if lt:
+                worst_age = max(worst_age, now - lt)
+                stale = stale or bars_overdue(lt, now, iv)
         return {
             "running": self.running,
             "feed_healthy": self.feed.healthy(),
+            "bar_age_s": int(worst_age / 1000),
+            "bar_stale": stale,
             "equity": round(self.portfolio.equity(marks), 4),
             "killed": self.risk.state.killed,
             "focus": self.focus_symbol(),

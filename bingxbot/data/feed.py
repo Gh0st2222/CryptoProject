@@ -36,6 +36,14 @@ def bars_24h(interval: str) -> int:
     return max(4, int(round(86_400_000 / interval_ms(interval))))
 
 
+def bars_overdue(last_ts_ms: int, now: int, iv_ms: int) -> bool:
+    """True when the last CLOSED bar is old enough that at least one close must
+    have been missed. 3x the interval tolerates both bar-time conventions
+    (open-stamped bars sit up to ~2 intervals old on a healthy stream) plus
+    delivery slack — beyond that, the kline pipeline is broken, full stop."""
+    return last_ts_ms > 0 and now - last_ts_ms > 3 * iv_ms
+
+
 DISPLAY_MS = 60_000    # the UI chart always renders 1m bars, whatever the signal TF
 
 
@@ -211,6 +219,9 @@ class LiveFeed(BaseFeed):
         for s in symbols:
             self.ws.subscribe_symbol(s, interval)
         self._ctx_task: asyncio.Task | None = None
+        self._bar_task: asyncio.Task | None = None
+        self._resync_ts: dict[str, float] = {}   # per-symbol resync throttle
+        self._kick_ts = 0.0                      # ws kick throttle
 
     async def _seed_symbol(self, s: str) -> None:
         # cover the 24h range window too, so hi/lo/vwap_24h are live from bar
@@ -235,6 +246,7 @@ class LiveFeed(BaseFeed):
             await self._seed_symbol(s)
         await self.ws.start()
         self._ctx_task = asyncio.create_task(self._poll_context(), name="ctx-poller")
+        self._bar_task = asyncio.create_task(self._bar_watchdog(), name="bar-watchdog")
         self.started = True
 
     async def add_symbol(self, s: str) -> bool:
@@ -260,15 +272,71 @@ class LiveFeed(BaseFeed):
         await self.ws.unsubscribe_now(s, self.interval)
 
     async def stop(self) -> None:
-        if self._ctx_task:
-            self._ctx_task.cancel()
-            try:
-                await self._ctx_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._ctx_task = None
+        for t in (self._ctx_task, self._bar_task):
+            if t:
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self._ctx_task = self._bar_task = None
         await self.ws.stop()
         self.started = False
+
+    async def _bar_watchdog(self) -> None:
+        """The guard for the failure the frame-level ws watchdog CANNOT see:
+        trades/book keep streaming (socket looks perfectly healthy) while the
+        kline channel alone has gone dead — no bar ever closes, the brain
+        starves, and the whole terminal freezes with a live-looking price.
+        Detection is consumer-side truth: 'when did the last closed bar
+        arrive?' Healing is the REST path (the same one that seeds the chart):
+        backfill every missed closed bar, emit its event, and kick the socket
+        so streaming gets a fresh start too."""
+        iv = interval_ms(self.interval)
+        while True:
+            await asyncio.sleep(max(10.0, iv / 6000.0))
+            now = now_ms()
+            stale = []
+            for s in list(self.symbols):
+                st = self.states.get(s)
+                if st is None or len(st.candles) == 0:
+                    continue
+                if bars_overdue(st.candles.last_ts, now, iv):
+                    stale.append(s)
+            for s in stale:
+                if time.time() - self._resync_ts.get(s, 0.0) < iv / 1000.0:
+                    continue   # one resync attempt per interval per symbol
+                self._resync_ts[s] = time.time()
+                try:
+                    n = await self._resync_symbol(s)
+                    log.warning("bar stream stale on %s -> REST resync backfilled %d bars", s, n)
+                except Exception as e:  # noqa: BLE001 — the watchdog must outlive anything
+                    log.warning("bar resync %s failed: %s", s, e)
+            if stale and time.time() - self._kick_ts > 180.0:
+                self._kick_ts = time.time()
+                try:
+                    await self.ws.kick(f"kline starvation on {','.join(stale)}")
+                except Exception as e:  # noqa: BLE001
+                    log.warning("ws kick failed: %s", e)
+
+    async def _resync_symbol(self, s: str) -> int:
+        """REST-backfill closed bars the stream missed and emit a 'bar' event
+        for each one stored, so the engine evaluates them in order. The stream
+        is the fast path; REST is the truth path — any gap heals here."""
+        st = self.states.get(s)
+        if st is None:
+            return 0
+        iv = interval_ms(self.interval)
+        gap = (now_ms() - st.candles.last_ts) // iv + 2 if st.candles.last_ts else 3
+        candles = await self.rest.klines(s, self.interval, limit=int(min(max(gap, 3), 1440)))
+        if candles:
+            candles = candles[:-1]   # last row is the still-open bar
+        added = 0
+        for c in sorted(candles or [], key=lambda x: x.ts):
+            if st.candles.append(c):
+                added += 1
+                self._emit("bar", s)
+        return added
 
     async def _poll_context(self) -> None:
         """Periodically pull funding rate, mark price and open interest so the
