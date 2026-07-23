@@ -897,29 +897,23 @@ class Orchestrator:
             self._save_overlays()
 
     async def maybe_adopt(self) -> None:
-        """Radar-driven universe: adopt the strongest liquid 4h trends beyond the
-        user's symbols (up to strategy.adopt_symbols), drop adopted ones the radar
-        stopped liking for two consecutive scans — never with an open position."""
+        """Radar-driven universe: fill FREE seats with the strongest liquid 4h
+        trends beyond the user's symbols (up to strategy.adopt_symbols). An
+        incumbent keeps its seat while it stays a decent trend — hysteresis,
+        see plan_adoption — and is never dropped with an open position."""
         eng = self.engine
         if eng is None or self.scanner is None:
             return
+        from ..engine.scanner import plan_adoption
         cap = max(0, int(getattr(self.cfg.strategy, "adopt_symbols", 0)))
-        user = set(self.cfg.symbols)
-        good = [r for r in self.scanner.rows
-                if r["symbol"] not in user and r.get("kind") == "trend"
-                and r.get("er_4h", 0.0) >= 0.4 and r.get("dir_4h", 0) != 0
-                # never adopt a token that already has a position (e.g. a live
-                # carry trade) — one desk per token, one manager per position.
-                and eng.portfolio.positions.get(r["symbol"]) is None]
-        want = [r["symbol"] for r in good[:cap]]
-        for sym in list(eng.adopted):
-            if sym in want:
+        drops, adds = plan_adoption(
+            self.scanner.rows, set(eng.adopted), set(self.cfg.symbols),
+            lambda s: eng.portfolio.positions.get(s) is not None,
+            cap, self._adopt_miss)
+        for sym in drops:
+            if await eng.drop_symbol(sym):
                 self._adopt_miss.pop(sym, None)
-                continue
-            self._adopt_miss[sym] = self._adopt_miss.get(sym, 0) + 1
-            if self._adopt_miss[sym] >= 2 and await eng.drop_symbol(sym):
-                self._adopt_miss.pop(sym, None)
-        for sym in want:
+        for sym in adds:
             if len(eng.adopted) >= cap:
                 break
             if sym not in eng.ctx:
@@ -942,6 +936,8 @@ class Orchestrator:
             pf.starting_balance = self.cfg.paper.starting_balance
             pf.cash = pf.starting_balance
             pf.funding_paid = 0.0
+            pf.peak_equity = 0.0
+            pf.max_dd = 0.0
             eng.risk.state = type(eng.risk.state)()
             eng.risk.health.__init__()
             if self.carry is not None:

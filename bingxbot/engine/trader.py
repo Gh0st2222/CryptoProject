@@ -22,8 +22,8 @@ from ..strategy.brain import TradingBrain
 from ..strategy.exits import AdaptiveExitManager
 from ..strategy.features import FeatureFrame, mtf_from_row
 from ..util import now_ms
-from .backtest import (_entry_signal_ok, gate_ev, gate_funding, gate_mtf_veto,
-                       gate_regime)
+from .backtest import (FUNDING_MS, _entry_signal_ok, gate_ev, gate_funding,
+                       gate_mtf_veto, gate_regime)
 from .brokers import Broker, LiveBroker
 from .portfolio import Portfolio
 
@@ -115,6 +115,12 @@ class TraderEngine:
         self.running = False
         self.started_ts = 0
         self.tape: list[dict] = []      # recent fills/exits for the UI ticker
+        # paper funding settlement: the last housekeeping timestamp (boundary
+        # detection) and the pre-boundary snapshot of each symbol's funding
+        # rate — the rate PAID at a settlement is the one that was in force
+        # just before it, not whatever the feed rolls to seconds after.
+        self._funding_ms = now_ms()
+        self._funding_rates: dict[str, float | None] = {}
 
     def _interval_ms(self) -> int:
         from ..util import interval_ms
@@ -151,7 +157,8 @@ class TraderEngine:
             from .persist import save_paper_state
             save_paper_state(self.portfolio, self.risk.state,
                              brains=self.brain_states(),   # the session AND the learning survive
-                             entry_ctx=self.entry_contexts())
+                             entry_ctx=self.entry_contexts(),
+                             health=self.risk.health.state_dict())
         await self.feed.stop()
         log.info("trader stopped")
 
@@ -197,7 +204,13 @@ class TraderEngine:
             beat += 1
             self.settle_risk()   # catch closes that bypassed the engine exit path
             marks = {s: st.mark_price() for s, st in self.feed.states.items()}
-            self.portfolio.record_equity(now_ms(), marks)
+            now = now_ms()
+            if now // FUNDING_MS != self._funding_ms // FUNDING_MS:
+                self._settle_paper_funding(marks)
+            self._funding_ms = now
+            self._funding_rates = {s: getattr(st, "funding_rate", None)
+                                   for s, st in self.feed.states.items()}
+            self.portfolio.record_equity(now, marks)
             self.risk.health.mark_equity(self.portfolio.equity(marks))
             if isinstance(self.broker, LiveBroker) and beat % 6 == 0:
                 await self.broker.reconcile(self.cfg.symbols)
@@ -216,12 +229,34 @@ class TraderEngine:
                 # ~100ms every 30s: the exact cyclic stutter on the dashboard.
                 await asyncio.to_thread(save_paper_state, self.portfolio, self.risk.state,
                                         brains=self.brain_states(),
-                                        entry_ctx=self.entry_contexts())
+                                        entry_ctx=self.entry_contexts(),
+                                        health=self.risk.health.state_dict())
             # full-state refresh every 30s — prices/uPnL/stage already ride the
             # 0.4s hot channel. OFFSET from the save beat by 15s so the two
             # heaviest periodic jobs never land in the same instant.
             if self.on_update and beat % 6 == 3:
                 await self.on_update("state")
+
+    def _settle_paper_funding(self, marks: dict[str, float]) -> None:
+        """An 8h funding window just settled: transfer REAL signed funding on
+        every open paper position, exactly as the exchange debits/credits a
+        live account and the backtest charges at every boundary. Without this,
+        paper silently kept every payment a held position would have made —
+        an optimism live can't reproduce. Carry-desk positions are skipped
+        (that desk books its own settlements — collecting them is its job)."""
+        if self.portfolio.mode != "paper":
+            return   # live equity comes from the exchange, funding included
+        for sym, pos in list(self.portfolio.positions.items()):
+            if str(pos.entry_reason or "").startswith("carry"):
+                continue
+            rate = self._funding_rates.get(sym)
+            mark = marks.get(sym) or pos.entry_price
+            if not rate or not mark:
+                continue   # offline/synthetic feeds print no funding
+            transfer = pos.qty * mark * float(rate) * pos.direction()
+            self.portfolio.charge_funding(transfer)
+            log.info("funding settled on %s: %+.6f USDT (rate %+.4f%%)",
+                     sym, -transfer, float(rate) * 100)
 
     async def _fast_push_loop(self) -> None:
         """High-cadence 'hot' pushes so live prices / uPnL / stage refresh in
@@ -544,13 +579,19 @@ class TraderEngine:
             entry_ref = price * (1 - off) if side == LONG else price * (1 + off)
             sized.allow_taker_fallback = True   # touch limit: a post-only reject means
                                                 # price came to us — taking is honest
-        if entry_ref != price:
+            sized.entry_limit = entry_ref       # set even at offset 0 (the tuner may
+                                                # pin the bound): maker mode must never
+                                                # fall through to the inline await — a
+                                                # live post-only wait would park the
+                                                # whole event loop for the window
+        elif entry_ref != price:
             sized.entry_limit = entry_ref
+        if sized.entry_limit > 0:
             # synthetic fast-forward compresses bar time; the resting window
             # must live in the same clock or demo entries never resolve.
             speed = max(1.0, float(getattr(self.feed, "speed", 1.0)))
             sized.entry_wait_s = max(1, self.cfg.strategy.maker_wait_bars) * self._interval_ms() / 1000.0 / speed
-            ctx.last_entry_block = f"resting limit @ {entry_ref:.6g}"
+            ctx.last_entry_block = f"resting limit @ {sized.entry_limit:.6g}"
             ctx.pending_task = asyncio.create_task(
                 self._rest_entry(ctx, symbol, side, sized, reason, row, ev, style, bracket.init_risk, atr),
                 name=f"entry-{symbol}")

@@ -17,6 +17,7 @@ from ..exchange.models import BUY, LONG, SELL, SHORT, ContractSpec, OrderResult,
 from ..exchange.rest import BingXRest
 from ..risk.manager import SizedOrder
 from ..util import now_ms, round_step, safe_float
+from .backtest import FILL_THROUGH_BPS
 from .portfolio import Portfolio
 
 log = logging.getLogger("broker")
@@ -65,10 +66,12 @@ class PaperBroker(Broker):
         return px * (1 + self.slip) if is_buy else px * (1 - self.slip)
 
     def _fill_open(self, symbol: str, side: str, sized: SizedOrder, reason: str,
-                   bar_ts: int, px: float, maker: bool) -> OrderResult:
-        if maker:
-            # honest adverse-selection penalty on the passive fill — a resting
-            # limit gets filled when price moves through it, same as the backtest.
+                   bar_ts: int, px: float, maker: bool, adverse: bool = True) -> OrderResult:
+        if maker and adverse:
+            # adverse-selection penalty on an INSTANT passive fill (no resting
+            # wait modeled). A genuinely rested limit pays its honesty through
+            # the trade-through requirement instead and fills AT its price — a
+            # limit can never fill worse than the price it rested at.
             d = 1 if side == LONG else -1
             px *= 1 + d * self.maker_adverse
         fee = sized.qty * px * (self.maker_fee if maker else self.taker_fee)
@@ -99,17 +102,22 @@ class PaperBroker(Broker):
 
     async def _open_resting(self, symbol: str, side: str, sized: SizedOrder,
                             reason: str, bar_ts: int) -> OrderResult:
-        """Pullback entry: the limit RESTS until the live tape trades through it
-        or the window expires — mirroring exactly what the backtest models and
-        what the live broker does on the exchange. No touch, no trade."""
+        """Resting entry (pullback-depth or maker-at-touch): the limit RESTS
+        until the live tape trades THROUGH it or the window expires — the same
+        trade-through margin the backtest demands (`FILL_THROUGH_BPS`) before
+        assuming a queued maker fill. A mere touch does not fill: on the real
+        book, price kissing the level fills the queue ahead of us and leaves;
+        counting those flattered paper against both the backtest and live."""
         lim = sized.entry_limit
         deadline = asyncio.get_running_loop().time() + max(sized.entry_wait_s, 5.0)
         d = 1 if side == LONG else -1
+        need = lim * (1 - d * FILL_THROUGH_BPS / 10_000.0)
         while asyncio.get_running_loop().time() < deadline:
             st = self.states.get(symbol)
             px = st.last_price if st is not None else 0.0
-            if px > 0 and (px - lim) * d <= 0:      # tape touched/through the limit
-                return self._fill_open(symbol, side, sized, reason, bar_ts, lim, maker=True)
+            if px > 0 and (px - need) * d <= 0:     # tape traded through the limit
+                return self._fill_open(symbol, side, sized, reason, bar_ts, lim,
+                                       maker=True, adverse=False)
             await asyncio.sleep(0.5)
         log.info("[paper] pullback limit %s %s unfilled @ %.6g — entry abandoned",
                  side, symbol, lim)

@@ -26,7 +26,8 @@ CURVE_TAIL = 4000
 
 
 def save_paper_state(portfolio, risk_state, path: Path = STATE_PATH,
-                     brains: dict | None = None, entry_ctx: dict | None = None) -> None:
+                     brains: dict | None = None, entry_ctx: dict | None = None,
+                     health: dict | None = None) -> None:
     try:
         data = {
             "ts": now_ms(),
@@ -34,10 +35,13 @@ def save_paper_state(portfolio, risk_state, path: Path = STATE_PATH,
             "starting_balance": portfolio.starting_balance,
             "cash": portfolio.cash,
             "funding_paid": portfolio.funding_paid,
+            "peak_equity": portfolio.peak_equity,
+            "max_dd": portfolio.max_dd,
             "positions": [dataclasses.asdict(p) for p in portfolio.positions.values()],
             "trades": [dataclasses.asdict(t) for t in portfolio.trades[-TRADE_TAIL:]],
             "equity_curve": list(portfolio.equity_curve)[-CURVE_TAIL:],
             "risk": dataclasses.asdict(risk_state),
+            "health": health or {},       # the throttle's memory (recent R, peak)
             "brains": brains or {},        # per-symbol online learning survives too
             "entry_ctx": entry_ctx or {},  # open positions keep their decision context
         }
@@ -78,6 +82,8 @@ def restore_into(portfolio, risk, snapshot: dict) -> int:
     of open positions restored."""
     portfolio.cash = float(snapshot.get("cash", portfolio.cash))
     portfolio.funding_paid = float(snapshot.get("funding_paid", 0.0))
+    portfolio.peak_equity = float(snapshot.get("peak_equity", 0.0))
+    portfolio.max_dd = float(snapshot.get("max_dd", 0.0))
     portfolio.trades = [_build(TradeRecord, t) for t in snapshot.get("trades", [])]
     curve = [(int(ts), float(eq)) for ts, eq in snapshot.get("equity_curve", [])]
     try:
@@ -96,7 +102,9 @@ def restore_into(portfolio, risk, snapshot: dict) -> int:
     for k, v in rs.items():
         if hasattr(risk.state, k):
             setattr(risk.state, k, v)
-    # rebuild the health governor's equity anchor so drawdown math continues
+    # restore the throttle's memory FIRST (recent R window + equity peak),
+    # then re-anchor on current cash so drawdown math continues from here.
+    risk.health.load_state(snapshot.get("health"))
     eq = portfolio.cash
     risk.health.mark_equity(eq)
     log.info("paper state restored: %d open positions, %d trades, cash %.2f",

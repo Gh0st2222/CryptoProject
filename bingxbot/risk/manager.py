@@ -118,6 +118,25 @@ class HealthGovernor:
             "sample": n,
         }
 
+    def state_dict(self) -> dict:
+        """Everything needed to resume throttling exactly where it left off —
+        without this, a restart during a cold streak silently restores full
+        size until 8 fresh trades rebuild the window."""
+        return {"r_hist": list(self.r_hist), "peak_equity": self.peak_equity}
+
+    def load_state(self, d: dict | None) -> None:
+        if not isinstance(d, dict):
+            return
+        try:
+            hist = [float(x) for x in d.get("r_hist", [])]
+            peak = float(d.get("peak_equity", 0.0))
+        except (TypeError, ValueError):
+            return
+        self.r_hist.clear()
+        self.r_hist.extend(hist[-self.r_hist.maxlen:])
+        self.peak_equity = max(0.0, peak)
+        self._recompute()
+
 
 class RiskManager:
     def __init__(self, cfg: RiskConfig, clock=time.time):
@@ -131,7 +150,16 @@ class RiskManager:
     def _roll_day(self, equity: float) -> None:
         day = time.strftime("%Y-%m-%d", time.gmtime(self.clock()))
         if day != self.state.day_key:
+            old = self.state
             self.state = RiskState(day_key=day, day_start_equity=equity)
+            # Only DAILY counters reset at midnight. The daily-loss kill clears
+            # with the new day (that's its semantics), but a manual stop must
+            # never un-stop itself at 00:00 UTC, and an active loss-streak
+            # cooldown is a streak brake, not a calendar counter.
+            if old.killed and not old.kill_reason.startswith("daily loss"):
+                self.state.killed = True
+                self.state.kill_reason = old.kill_reason
+            self.state.cooldown_until = old.cooldown_until
 
     def on_trade_closed(self, trade: TradeRecord, equity: float) -> None:
         self._roll_day(equity)
