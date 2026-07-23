@@ -656,7 +656,8 @@ class TraderEngine:
         ok, d = gate_regime(strat, edge, row, ev["regime"])
         if not ok:
             return d
-        ok, d = gate_ev(self.cfg.risk, payoff_b, p_win, row, fees_rt, spread, slip)
+        style = "scalp" if ev["regime"] == "RANGE" else "trend"
+        ok, d = gate_ev(self.cfg.risk, payoff_b, p_win, row, fees_rt, spread, slip, style)
         return d if not ok else ""
 
     def _entry_costs(self, symbol: str) -> tuple[float, float]:
@@ -686,7 +687,7 @@ class TraderEngine:
         gates.append({"n": "regime", "ok": r_ok, "d": f"{ev['regime']} · {r_d}"})
         style = "scalp" if ev["regime"] == "RANGE" else "trend"
         ev_ok, ev_d = gate_ev(self.cfg.risk, self.risk.payoff_ratio(style), p_win, row,
-                              fees_rt, spread or 1.0, slip)
+                              fees_rt, spread or 1.0, slip, style)
         gates.append({"n": "EV floor", "ok": ev_ok, "d": ev_d})
         if strat.micro_confirm:
             micro = st.micro_snapshot()

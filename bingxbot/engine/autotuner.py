@@ -53,7 +53,9 @@ MIN_ABS_FITNESS = 0.15      # ...and be clearly profitable (positive risk-adjust
                             # to the old flattering scale would have quietly
                             # made promotion stricter than anyone decided.
 TOP_K_VALIDATE = 5          # validate this many training-best members OOS, keep the best generalizer
-OOS_FOLDS = 3               # purged sequential portfolio folds a champion must earn across
+OOS_FOLDS = 4               # purged sequential portfolio folds a champion must earn
+                            # across — 4 gives the median+worst composite a real
+                            # median (undersized folds self-drop in portfolio_folds)
 VAULT_CANDIDATES = 4        # also re-validate this many top vault champions each cycle (candidate pool, not graveyard)
 STALL_REINJECT = 20         # cycles without a promotion before a diversity restart
 DEMOTE_FLOOR = -0.5         # incumbent scoring below this on the TRADED basket is
@@ -66,7 +68,9 @@ LIVE_MIN_SAMPLE = 8         # real trades before live evidence can demote: 1 win
                             # coincidence — waiting longer just pays more tuition
 LIVE_RECENT_N = 20          # judge a champion on its most recent real trades
 LIVE_PF_FLOOR = 0.7         # real profit factor below this (and < 1/2 expectation) -> demote
-LOOKBACK_DAYS = 60.0
+LOOKBACK_DAYS = 90.0        # more history = wider regime coverage per fold and
+                            # ~50% more meta-training samples; recency weighting
+                            # on training folds keeps the search current
 DATA_TTL_S = 1800
 GAP_FAST = 20               # cadence right after a promotion (keep hammering)
 GAP_SLOW = 60               # cadence when stable
@@ -194,6 +198,7 @@ class AutoTuner:
         self._champ_bad_streak = 0  # consecutive cycles the incumbent scored toxic on traded symbols
         self.next_run_ts = 0.0
         self.champion_fitness = 0.0
+        self._val_cache: dict[tuple, dict] = {}   # OOS validations memoized per data window
         self.last_cycle: dict | None = None
         self.last_meta: dict | None = None   # latest meta-model training result
         self.history: list[dict] = []
@@ -406,6 +411,7 @@ class AutoTuner:
         need_members = (self._scored_ts != self._data_ts) or any(f <= -1e8 for f in self.de.fitness)
         if self._scored_ts != self._data_ts:
             self._tested_oos = 0    # fresh OOS window -> the multiple-testing meter resets
+            self._val_cache.clear()  # ...and cached OOS validations expire with it
         self._scored_ts = self._data_ts
         candidates = (list(self.de.pop) + trials) if need_members else list(trials)
         args = [(fold, symbol, interval, spec, taker, slip, strat, risk, candidates) for fold in folds]
@@ -462,11 +468,28 @@ class AutoTuner:
             return False
         nf_oos = len(folds_cbs)
         specs_map = {s: self.orch.specs.get(s, ContractSpec(s)) for s in cbs_full}
-        val_args = []
+        # MEMOIZED within the OOS window: the champion and the vault candidates
+        # are re-validated every cycle on the SAME folds (the window refreshes
+        # every ~30 min) — identical inputs, identical outputs. Only genuinely
+        # NEW candidates pay for full-fidelity python backtests; stasis cycles
+        # drop from ~40 portfolio runs to a handful, and the saved duty budget
+        # becomes more DE generations of actual search.
+        def _psig(params: dict) -> tuple:
+            return tuple(sorted((k, round(float(v), 10)) for k, v in params.items()))
+        all_keys, miss_args, miss_keys = [], [], []
         for c in cands + [{"params": champ}]:
-            for fc in folds_cbs:
-                val_args.append((c["params"], fc, interval, specs_map, taker, slip, strat, risk))
-        val_res = await self.orch.map_cpu(validate_params_portfolio, val_args, research=True)
+            sig = _psig(c["params"])
+            for fi, fc in enumerate(folds_cbs):
+                key = (sig, fi)
+                all_keys.append(key)
+                if key not in self._val_cache and key not in miss_keys:
+                    miss_args.append((c["params"], fc, interval, specs_map, taker, slip, strat, risk))
+                    miss_keys.append(key)
+        if miss_args:
+            miss_res = await self.orch.map_cpu(validate_params_portfolio, miss_args, research=True)
+            for key, r in zip(miss_keys, miss_res):
+                self._val_cache[key] = r
+        val_res = [self._val_cache[k] for k in all_keys]
 
         def cand_fit(idx: int) -> tuple[float, dict, list[float]]:
             rs = val_res[idx * nf_oos:(idx + 1) * nf_oos]
@@ -476,6 +499,7 @@ class AutoTuner:
         champ_fit, _, champ_folds = cand_fit(len(cands))
         best, best_i, best_adj, best_stats = None, -1, -1e18, {}
         best_folds: list[float] = []
+        pf_passed = 0    # candidates whose newest-fold PF cleared 1.0 (promotable pool)
         for i, c in enumerate(cands):
             oos, stats0, fold_fits_oos = cand_fit(i)
             # NO in-sample-vs-OOS value penalty anymore: training fitness is a
@@ -495,6 +519,7 @@ class AutoTuner:
             # PF 0 (no trades) fails — an unverifiable candidate isn't promotable.
             if float(stats0.get("profit_factor", 0.0) or 0.0) < 1.0:
                 continue
+            pf_passed += 1
             if adj > best_adj:
                 best, best_i, best_adj, best_stats = c, i, adj, stats0
                 best_folds = fold_fits_oos
@@ -693,6 +718,9 @@ class AutoTuner:
             # surface null, not the -1e18 selection sentinel
             "champion_fitness": round(champ_fit, 3),
             "best_fitness": round(best_adj, 3) if best is not None else None,
+            # promotion transparency: how close is anything to taking the seat?
+            "pf_passed": pf_passed, "cands_judged": len(cands),
+            "bar": round(max(champ_fit * margin, MIN_ABS_FITNESS), 3),
             "promoted": promoted, "candidates": len(candidates),
             "vault_candidates": len(vault), "de_candidates": len(topk),
             "champion_source": (best["source"] if best else None),

@@ -230,6 +230,16 @@ class CarryDesk:
         stop = price - stop_dist if side == LONG else price + stop_dist
         sized = SizedOrder(qty=qty, notional=qty * price, leverage=cfg.carry.leverage,
                            stop_price=stop, take_profit=0.0, risk_amount=qty * stop_dist)
+        # MAKER entry, always. The desk's whole edge is a few bp per funding
+        # print: at the 35% APR floor one 8h print pays ~3.2bp, so a taker
+        # round trip (~10bp + slip) consumed the ENTIRE expected collection of
+        # a max-hold position — the desk was structurally donating. Carry has
+        # hours of patience (the entry window is 3h): rest an at-touch limit,
+        # earn the maker rate, and if it doesn't fill the next loop simply
+        # tries again while the window lasts. Never fall back to taker here.
+        sized.entry_limit = price
+        sized.entry_wait_s = 120.0
+        sized.allow_taker_fallback = False
         apr = row.get("funding_apr", 0.0)
         reason = f"carry {apr*100:+.0f}% APR"
         res = await eng.broker.open_position(sym, side, sized, reason, bar_ts=now_ms())

@@ -866,7 +866,9 @@ def run_kernel(feats, amat, regs, p, warmup, taker, maker_fee, slip_bps,
                             # EV floor — exact mirror of backtest.gate_ev:
                             # p(win) must clear breakeven at the measured
                             # payoff with real costs in stop-distance units
-                            stop_pct = max(p[P_SLMIN] * atr_pct, 1e-9)
+                            # (each style judged by its OWN stop)
+                            stop_mult = p[P_SSL] if scalp else p[P_SLMIN]
+                            stop_pct = max(stop_mult * atr_pct, 1e-9)
                             cost_r = (fees_rt + (ASSUMED_SPREAD_BPS + 2.0 * slip_bps) / 10_000.0) / stop_pct
                             bb0 = b3 if b3 > 0.1 else 0.1
                             need = (1.0 + cost_r) / (1.0 + bb0) + EV_MARGIN

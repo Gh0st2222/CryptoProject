@@ -144,7 +144,8 @@ class CarryConfig:
     risk_frac: float = 0.5          # fraction of risk_per_trade to use per carry trade
     leverage: int = 2               # fixed low leverage — carry is a yield trade
     stop_atr_4h: float = 2.5        # stop distance in 4h ATRs
-    max_hold_hours: int = 30        # ~3 funding windows, then out regardless
+    max_hold_hours: int = 48        # ~6 funding windows: more prints per (maker)
+                                    # fee paid — the stop + trend veto carry the risk
     trend_veto_er: float = 0.35     # skip if the 4h trend opposes the side this strongly
 
 

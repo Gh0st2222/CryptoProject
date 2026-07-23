@@ -440,6 +440,11 @@ def test_ev_floor_refuses_coin_flips():
     assert not ok and "EV floor" in why
     # no volatility estimate -> refuse
     assert not gate_ev(rc, 2.65, 0.9, {"atr_pct": 0.0}, fees, spread, slip)[0]
+    # style-correct risk unit: scalps run tighter stops, so the same absolute
+    # cost is a bigger fraction of their R — the scalp floor must sit HIGHER
+    rc.scalp_sl_atr = 1.0
+    assert gate_ev(rc, 2.65, 0.35, row, fees, spread, slip, "trend")[0]
+    assert not gate_ev(rc, 2.65, 0.35, row, fees, spread, slip, "scalp")[0]
 
 
 def test_oos_composite_resists_one_lucky_fold():
