@@ -350,7 +350,10 @@
           <label class="check"><input type="checkbox" id="cfg-autotune"> auto-tuner running</label>
           <label class="check"><input type="checkbox" id="cfg-carry"> funding-carry desk</label>
           <div class="ff"><label>Max carry positions</label><input class="field" id="cfg-carrymax" type="number" step="1" min="0" max="4"></div>
-          <div class="hint">The bot auto-adapts leverage <i>within</i> your band based on volatility &amp; conviction. Carry positions count toward the global position cap.</div>
+          <label class="check"><input type="checkbox" id="cfg-clocktrial"> clock trial — research an alternate bar clock in parallel</label>
+          <div class="ff"><label>Trial clock</label><select class="btn" id="cfg-trialint"><option>1m</option><option>3m</option><option>5m</option><option>15m</option><option>30m</option></select></div>
+          <label class="check"><input type="checkbox" id="cfg-tape"> record BingX tape (own tick archive, disk-capped)</label>
+          <div class="hint">The bot auto-adapts leverage <i>within</i> your band based on volatility &amp; conviction. Carry positions count toward the global position cap. <b>Clock trial</b>: the tuner alternates research cycles between your live interval and the trial clock — champions are tagged (e.g. 5m / 15m) and the trial side is never traded; each clock advances at half cadence while the trial runs. Switch the main Bar interval to act on the evidence.</div>
         </div>
         <div class="sgroup">
           <h3 style="color:var(--accent-2)">Auto-managed <span style="color:var(--muted)">· live values</span></h3>

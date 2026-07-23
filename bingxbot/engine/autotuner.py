@@ -31,7 +31,7 @@ from ..config import MODE_IDLE
 from ..exchange.models import ContractSpec
 from ..util import clamp
 from .backtest import TUNABLES
-from .search import (DEOptimizer, portfolio_folds, recency_weights,
+from .search import (STATE_PATH, DEOptimizer, portfolio_folds, recency_weights,
                      robust_aggregate, score_fold, validate_params,
                      validate_params_portfolio)
 
@@ -202,6 +202,15 @@ class AutoTuner:
         self.last_cycle: dict | None = None
         self.last_meta: dict | None = None   # latest meta-model training result
         self.history: list[dict] = []
+        # clock trial: the alternate-interval research track (own gene pool,
+        # own candle cache — never mixed with the primary clock's)
+        self.trial_de: DEOptimizer | None = None
+        self._trial_cache: dict[str, tuple[list, float]] = {}
+        self._turn = 0
+        self.last_trial: dict | None = None
+        # regime gauntlet: (params-sig, interval, window) -> result. Windows
+        # are immutable history, so entries never expire.
+        self._gauntlet_cache: dict[tuple, dict] = {}
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -226,7 +235,18 @@ class AutoTuner:
             t0 = time.monotonic()
             if cfg.strategy.auto_tune and self.orch.mode != MODE_IDLE and self.orch.engine is not None:
                 try:
-                    promoted = await self._cycle()
+                    # clock trial ON: research time alternates between the live
+                    # clock and the trial clock (each cycle is one or the other,
+                    # so the CPU envelope never doubles — the honest cost is
+                    # that each clock advances at half cadence while trialing).
+                    self._turn += 1
+                    trial_turn = (cfg.strategy.clock_trial
+                                  and cfg.strategy.trial_interval != cfg.strategy.interval
+                                  and self._turn % 2 == 0)
+                    if trial_turn:
+                        await self._trial_cycle()
+                    else:
+                        promoted = await self._cycle()
                 except Exception as e:  # noqa: BLE001
                     log.warning("auto-tune cycle failed: %s", e)
             cycle_s = time.monotonic() - t0
@@ -251,18 +271,24 @@ class AutoTuner:
                 uni.append(s)
         return uni or list(self.orch.cfg.symbols)
 
-    async def _get_candles(self, symbol: str) -> list:
-        hit = self._cache.get(symbol)
+    async def _get_candles(self, symbol: str, interval: str | None = None,
+                           cache: dict | None = None) -> list:
+        """Research candles for one symbol. The primary clock uses the shared
+        cache; the trial clock passes its OWN interval + cache so the two never
+        collide (same key, different bar sizes = silent corruption)."""
+        cache = self._cache if cache is None else cache
+        hit = cache.get(symbol)
         if hit and time.time() - hit[1] < DATA_TTL_S:
             return hit[0]
         cfg = self.orch.cfg
         candles = await self.orch._get_backtest_candles(
-            symbol, cfg.strategy.interval, LOOKBACK_DAYS, cfg.feed == "synthetic", _NullJob())
-        self._cache[symbol] = (candles, time.time())
-        if len(self._cache) > 10:  # bound the cache to the working set
-            oldest = min(self._cache, key=lambda s: self._cache[s][1])
+            symbol, interval or cfg.strategy.interval, LOOKBACK_DAYS,
+            cfg.feed == "synthetic", _NullJob())
+        cache[symbol] = (candles, time.time())
+        if len(cache) > 10:  # bound the cache to the working set
+            oldest = min(cache, key=lambda s: cache[s][1])
             if oldest != symbol:
-                self._cache.pop(oldest, None)
+                cache.pop(oldest, None)
         return candles
 
     async def _ensure_data(self) -> list:
@@ -435,7 +461,14 @@ class AutoTuner:
         # the incumbent. The vault is a candidate pool, not a graveyard — the best
         # available champion drives trading, wherever it came from.
         topk = self.de.top_k(TOP_K_VALIDATE)          # (params, train_fit)
-        vault = sorted((c for c in self.orch.champions if not c.get("live_flag")),
+        # only same-clock champions are candidates: a 5m-born set's bar-count
+        # parameters (horizon, time stops, maker windows) mean different real
+        # time on a 15m engine — validating it here would burn basket runs on
+        # a set that could never be honestly applied. (Entries without a clock
+        # tag predate the trial feature and are treated as current-clock.)
+        vault = sorted((c for c in self.orch.champions
+                        if not c.get("live_flag")
+                        and (c.get("clock") or interval) == interval),
                        key=lambda c: c.get("fitness", 0.0), reverse=True)[:VAULT_CANDIDATES]
         cands: list[dict] = [{"source": "de", "params": p, "train_fit": tfit, "cid": None}
                              for p, tfit in topk]
@@ -538,8 +571,21 @@ class AutoTuner:
         # challenger must beat it in a MAJORITY of the purged folds — a set
         # that wins on average but loses most windows is one lucky window.
         beat = sum(1 for a, b in zip(best_folds, champ_folds) if a > b)
+        gaunt = None
         if (different and best_adj > max(champ_fit * margin, MIN_ABS_FITNESS)
                 and beat * 2 > nf_oos):
+            # REGIME GAUNTLET: score the incoming champion across five years of
+            # Binance regime eras (2021 top, 2022 crash, 2023 chop, ...) —
+            # same portfolio simulator, same BingX fees, Binance prices. This
+            # is SOFT evidence by design: it can never block a promotion (a
+            # 2022-shaped failure says little about a 2026 edge, and no
+            # internet must never mean no tuning) — but a champion that loses
+            # money in most eras carries a 'weak' stamp that DOUBLES its live
+            # probation: more proof required before full-size tuition.
+            try:
+                gaunt = await self._gauntlet(best_params, interval, taker, slip, strat, risk)
+            except Exception as e:  # noqa: BLE001 — evidence, never a dependency
+                log.debug("gauntlet failed: %s", e)
             self.orch.apply_params(best_params)
             self.improvements += 1
             promoted = True
@@ -548,7 +594,13 @@ class AutoTuner:
             # tag the champion now driving live trades: reuse the vault entry if
             # the winner came from the vault, otherwise mint a new one.
             cid = best["cid"] if (best["source"] == "vault" and best["cid"]) \
-                else self.orch.record_champion(best_params, best_adj, vs)
+                else self.orch.record_champion(best_params, best_adj, vs, clock=interval)
+            ch = self.orch.find_champion(cid)
+            if ch is not None:
+                ch["clock"] = interval
+                if gaunt is not None:
+                    ch["gauntlet"] = gaunt
+                    ch["gauntlet_weak"] = bool(gaunt.get("weak"))
             self.orch.mark_champion_used(cid)
             self.history.append({
                 "ts": int(time.time() * 1000),
@@ -578,7 +630,8 @@ class AutoTuner:
             if self._champ_bad_streak >= DEMOTE_PATIENCE:
                 self._champ_bad_streak = 0
                 alt = max((c for c in self.orch.champions
-                           if c.get("fitness", 0.0) > 0 and not c.get("live_flag")),
+                           if c.get("fitness", 0.0) > 0 and not c.get("live_flag")
+                           and (c.get("clock") or interval) == interval),
                           key=lambda c: c.get("fitness", 0.0), default=None)
                 fb_params = alt["params"] if alt else _default_params()
                 fb_name = "vault fallback" if alt else "baseline reset"
@@ -631,7 +684,8 @@ class AutoTuner:
                                     "ts": int(time.time() * 1000)}
                 alt = max((c for c in self.orch.champions
                            if c.get("fitness", 0.0) > 0 and c["id"] != act["id"]
-                           and not c.get("live_flag")),
+                           and not c.get("live_flag")
+                           and (c.get("clock") or interval) == interval),
                           key=lambda c: c.get("fitness", 0.0), default=None)
                 fb = alt["params"] if alt else _default_params()
                 self.orch.apply_params(fb)
@@ -726,10 +780,152 @@ class AutoTuner:
             "champion_source": (best["source"] if best else None),
             "research_symbol": symbol,
             "basket": [s for s, _ in basket],
+            "clock": interval,
+            "gauntlet": ({"median": gaunt["median"], "pf_ge1": gaunt["pf_ge1"],
+                          "n": gaunt["n"], "weak": gaunt["weak"]}
+                         if gaunt else None),
         }
         if self.orch._notify:
             await self.orch._notify("autotune")
         return promoted
+
+    async def _gauntlet(self, params: dict, interval: str, taker: float, slip: float,
+                        strat, risk) -> dict | None:
+        """Regime stress-test: run one parameter set through the shared-account
+        portfolio simulator over five years of Binance regime eras (free
+        data.binance.vision archive, disk-cached forever — a finished month
+        never changes), with BingX fee assumptions. Memoized per (params,
+        interval, window): a champion is only ever gauntleted once per era.
+        Returns a summary dict, or None when fewer than 3 eras have data
+        (offline, unlisted symbol, first run without internet)."""
+        from ..data.binance_hist import GAUNTLET_WINDOWS, load_window
+
+        def _psig(p: dict) -> tuple:
+            return tuple(sorted((k, round(float(v), 10)) for k, v in p.items()))
+
+        syms = [s for s in self._traded_symbols()[:2]] or ["BTC-USDT"]
+        sig = _psig(params)
+        results: dict[str, dict] = {}
+        args, keys = [], []
+        for name, months in GAUNTLET_WINDOWS:
+            ck = (sig, interval, name)
+            hit = self._gauntlet_cache.get(ck)
+            if hit is not None:
+                results[name] = hit
+                continue
+            cbs = await load_window(syms, interval, months)
+            if not cbs:
+                continue
+            specs_map = {s: self.orch.specs.get(s, ContractSpec(s)) for s in cbs}
+            args.append((params, cbs, interval, specs_map, taker, slip, strat, risk))
+            keys.append((name, ck))
+        if args:
+            res = await self.orch.map_cpu(validate_params_portfolio, args, research=True)
+            for (name, ck), r in zip(keys, res):
+                entry = {"fit": round(float(r.get("fitness", -1.0)), 3),
+                         "pf": round(float(r.get("stats", {}).get("profit_factor", 0.0) or 0.0), 3)}
+                self._gauntlet_cache[ck] = entry
+                results[name] = entry
+        if len(results) < 3:
+            return None
+        fits = [r["fit"] for r in results.values()]
+        pf_ge1 = sum(1 for r in results.values() if r["pf"] >= 1.0)
+        med = statistics.median(fits)
+        return {"n": len(results), "median": round(med, 3), "worst": round(min(fits), 3),
+                "pf_ge1": pf_ge1, "weak": med < 0.0, "windows": results,
+                "symbols": syms}
+
+    async def _trial_cycle(self) -> None:
+        """One research cycle on the TRIAL clock (clock_trial setting): its own
+        gene pool and candle cache, the same fold machinery and OOS standards —
+        but lean: no specialists, no meta training, no vault revalidation, and
+        its champions are TAGGED with their clock and never applied to the live
+        engine. The point is a fair, continuously-updated answer to 'which bar
+        clock earns more OOS?', visible in the tuner panel and the vault."""
+        cfg = self.orch.cfg
+        interval = cfg.strategy.trial_interval
+        strat, risk = cfg.strategy, cfg.risk
+        syms = self._traded_symbols()[:2] or list(cfg.symbols)[:2]
+        if not syms:
+            return
+        symbol = syms[0]
+        candles = await self._get_candles(symbol, interval=interval, cache=self._trial_cache)
+        if len(candles) < MIN_BARS:
+            self.last_trial = {"ts": int(time.time() * 1000), "clock": interval,
+                               "note": f"insufficient data ({len(candles)} bars)"}
+            return
+        spec = self.orch.specs.get(symbol, ContractSpec(symbol))
+        taker, slip = spec.taker_fee, cfg.paper.slippage_bps
+
+        if self.trial_de is None:
+            self.trial_de = DEOptimizer(pop_size=POP_SIZE,
+                                        state_path=STATE_PATH.with_name("tuner_state_trial.json"))
+            if not self.trial_de.load():
+                self.trial_de.seed_population(_current_params(cfg))
+        de = self.trial_de
+
+        val_cut = int(len(candles) * 0.75)
+        train = candles[:val_cut]
+        max_folds_by_data = max(1, len(train) // MIN_FOLD_BARS)
+        nf = int(clamp(min(self.orch.research_workers, max_folds_by_data), 1, 8))
+        folds = _make_folds(train, nf)
+        trials = de.trials()
+        candidates = list(de.pop) + trials
+        args = [(fold, symbol, interval, spec, taker, slip, strat, risk, candidates) for fold in folds]
+        fold_fits = await self.orch.map_cpu(score_fold, args, research=True)
+        fold_fits = [ff for ff in fold_fits if ff and len(ff) == len(candidates)]
+        if not fold_fits:
+            return
+        w = recency_weights(len(fold_fits))
+        robust = [robust_aggregate(list(fc), w) for fc in zip(*fold_fits)]
+        p = len(de.pop)
+        de.select(trials, robust[p:p + len(trials)], robust[:p])
+        de.save()
+
+        # OOS judging on the trial clock's own basket folds — same standards
+        # as the live clock (portfolio fitness, median+worst composite, PF>=1
+        # on the newest fold), so the two clocks' numbers are comparable.
+        cbs_full: dict[str, list] = {}
+        for tsym in syms:
+            try:
+                tc = await self._get_candles(tsym, interval=interval, cache=self._trial_cache)
+                if len(tc) >= MIN_BARS:
+                    cbs_full[tsym] = tc
+            except Exception as e:  # noqa: BLE001
+                log.debug("trial basket %s: %s", tsym, e)
+        if not cbs_full:
+            return
+        folds_cbs = portfolio_folds(cbs_full, k=OOS_FOLDS)
+        if not folds_cbs:
+            return
+        specs_map = {s: self.orch.specs.get(s, ContractSpec(s)) for s in cbs_full}
+        topk = de.top_k(3)
+        vargs = [(prm, fc, interval, specs_map, taker, slip, strat, risk)
+                 for prm, _ in topk for fc in folds_cbs]
+        vres = await self.orch.map_cpu(validate_params_portfolio, vargs, research=True)
+        nfo = len(folds_cbs)
+        best_fit, best_params, best_pf = None, None, 0.0
+        for i, (prm, _tf) in enumerate(topk):
+            rs = vres[i * nfo:(i + 1) * nfo]
+            fit = _oos_composite([r["fitness"] for r in rs])
+            pf = float(rs[-1]["stats"].get("profit_factor", 0.0) or 0.0)
+            if (best_fit is None or fit > best_fit) and pf >= 1.0:
+                best_fit, best_params, best_pf = fit, prm, pf
+        recorded = None
+        if best_params is not None and best_fit is not None and best_fit > MIN_ABS_FITNESS:
+            # same promotion floor as the live clock — the vault only ever
+            # holds sets that cleared a real bar. Tagged with the trial clock,
+            # they become instant candidates the day the user switches interval.
+            recorded = self.orch.record_champion(best_params, best_fit,
+                                                 {"profit_factor": best_pf}, clock=interval)
+        self.last_trial = {
+            "ts": int(time.time() * 1000), "clock": interval,
+            "generation": de.generation, "population": len(de.pop),
+            "best_fitness": round(best_fit, 3) if best_fit is not None else None,
+            "recorded": recorded, "basket": list(cbs_full),
+        }
+        if self.orch._notify:
+            await self.orch._notify("autotune")
 
     async def _revalidate_vault(self, basket, interval, slip, strat, risk) -> None:
         """Re-score every saved champion on the TRADED basket's freshest windows
@@ -737,7 +933,10 @@ class AutoTuner:
         so 'current fitness' always means 'on what we trade today'. We DON'T drop
         the temporarily-cold — pruning ages out the never-used and protects the
         most-used, so a proven champion having a bad week survives."""
-        vault = self.orch.champions
+        # other-clock champions are skipped: scoring a 5m-born set on 15m
+        # basket bars would overwrite its honest evaluation with nonsense.
+        vault = [c for c in self.orch.champions
+                 if (c.get("clock") or interval) == interval]
         if not vault or not basket:
             return
         nb = len(basket)
@@ -769,6 +968,8 @@ class AutoTuner:
             "research_symbol": self.research_symbol,
             "next_run_ts": int(self.next_run_ts * 1000),
             "last_cycle": self.last_cycle,
+            "last_trial": self.last_trial,
+            "clock_trial": self.orch.cfg.strategy.clock_trial,
             "meta": self._meta_status(),
             "history": self.history[-12:][::-1],
         }

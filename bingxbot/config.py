@@ -53,6 +53,13 @@ class StrategyConfig:
     target_trades_per_hour: float = 2.5
     cost_multiple: float = 1.85     # predicted move must exceed round-trip cost x this
     micro_confirm: bool = True      # order-flow agreement gate at entry (live/paper)
+    # clock trial (manual research switch): the tuner alternates cycles between
+    # the live interval and trial_interval, each with its own gene pool, and
+    # records TAGGED champions for both — evidence for "which bar clock earns
+    # more", gathered in parallel. Trial-clock champions are never traded; to
+    # act on the evidence the user switches `interval` deliberately.
+    clock_trial: bool = False
+    trial_interval: str = "5m"
     trend_align_gate: bool = True   # in trends, only trade with multi-TF alignment
     discipline: bool = True         # regime-appropriate entries (the big anti-bleed fix)
     min_efficiency: float = 0.35    # trend entries need this Kaufman efficiency ratio
@@ -172,6 +179,16 @@ USER_OWNED_TOP = {"symbols", "radar_extra", "mode", "feed", "allow_live", "data_
 
 
 @dataclass
+class TapeConfig:
+    """Recording of our OWN BingX market data (trades + best bid/ask). BingX
+    publishes no historical tick data — this archive is the only way it ever
+    exists. Live feed only; capped on disk; crash-safe (see data/tape.py)."""
+    enabled: bool = True
+    max_disk_mb: int = 2000
+    book_ms: int = 250            # min gap between recorded book-top rows per symbol
+
+
+@dataclass
 class BotConfig:
     version: int = CONFIG_VERSION
     symbols: list[str] = field(default_factory=lambda: ["BTC-USDT", "ETH-USDT"])
@@ -187,6 +204,7 @@ class BotConfig:
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     carry: CarryConfig = field(default_factory=CarryConfig)
+    tape: TapeConfig = field(default_factory=TapeConfig)
     paper: PaperConfig = field(default_factory=PaperConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
 
@@ -234,7 +252,9 @@ _NESTED_USER_OWNED = {
     "paper": {"starting_balance", "slippage_bps"},
     # auto_tune is user-owned (Settings toggle) — a migration must not silently
     # re-enable a tuner the user turned off.
-    "strategy": {"interval", "warmup_bars", "adopt_symbols", "auto_tune"},
+    "strategy": {"interval", "warmup_bars", "adopt_symbols", "auto_tune",
+                 "clock_trial", "trial_interval"},
+    "tape": {"enabled", "max_disk_mb", "book_ms"},
     # leverage band and max_open_positions intentionally omitted so migrating an
     # old config picks up the current defaults (2-7x band, 3 concurrent tokens);
     # both stay UI-editable afterwards. max_risk_hard_pct is UI-editable and kept.

@@ -419,6 +419,9 @@ function renderAutotuner(){
     ["Promotion bar",lc?.bar!=null?lc.bar:"—"],
     ["PF gate",lc&&lc.cands_judged!=null?`${lc.pf_passed??0}/${lc.cands_judged} passed`:"—"],
     ["Last challenger",lc?(lc.best_fitness==null?"none passed profit gate":`${lc.best_fitness} (${lc.promoted?"adopted":"kept"})`):"—"],
+    ["Cycle clock",lc?.clock??"—"],
+    ["Trial clock",at.clock_trial?(at.last_trial?`${at.last_trial.clock} · best ${at.last_trial.best_fitness??"—"} · gen ${at.last_trial.generation??0}`:"warming up…"):"off"],
+    ["Gauntlet",lc?.gauntlet?`med ${lc.gauntlet.median} · ${lc.gauntlet.pf_ge1}/${lc.gauntlet.n} eras PF≥1${lc.gauntlet.weak?" ⚠ weak":""}`:"—"],
     ["Diversity",lc?.diversity??"—"],
     ["Next cycle",next],
   ].map(([k,v])=>`<div class="at-badge"><div class="k">${k}</div><div class="v">${esc(String(v))}</div></div>`).join("");
@@ -449,6 +452,8 @@ function renderSettings(){
   $("cfg-dayloss").value=c.risk.max_daily_loss_pct; $("cfg-hardrisk").value=c.risk.max_risk_hard_pct;
   $("cfg-autotune").checked=c.strategy.auto_tune; $("cfg-allowlive").checked=c.allow_live;
   $("cfg-adopt").value=c.strategy.adopt_symbols??2;
+  $("cfg-clocktrial").checked=!!c.strategy.clock_trial; $("cfg-trialint").value=c.strategy.trial_interval||"5m";
+  if(c.tape) $("cfg-tape").checked=!!c.tape.enabled;
   if(c.carry){ $("cfg-carry").checked=c.carry.enabled; $("cfg-carrymax").value=c.carry.max_positions; }
   $("cfg-keys").textContent=c.has_keys?"configured ✓":"not set (paper/backtest only)"; $("cfg-keys").style.color=c.has_keys?"var(--good)":"";
   $("auto-params").innerHTML=AUTO_PARAMS.map(([k,lab,grp])=>{
@@ -587,7 +592,9 @@ $("cfg-save").onclick=async()=>{
     radar_extra:$("cfg-radarextra").value.split(",").map(s=>s.trim().toUpperCase()).filter(Boolean),
     feed:$("cfg-feed").value, allow_live:$("cfg-allowlive").checked,
     strategy:{ interval:$("cfg-interval").value, auto_tune:$("cfg-autotune").checked,
-      adopt_symbols:parseInt($("cfg-adopt").value,10) },
+      adopt_symbols:parseInt($("cfg-adopt").value,10),
+      clock_trial:$("cfg-clocktrial").checked, trial_interval:$("cfg-trialint").value },
+    tape:{ enabled:$("cfg-tape").checked },
     risk:{ min_leverage:parseInt($("cfg-levmin").value,10), max_leverage:parseInt($("cfg-levmax").value,10),
       max_daily_loss_pct:parseFloat($("cfg-dayloss").value), max_risk_hard_pct:parseFloat($("cfg-hardrisk").value),
       max_open_positions:parseInt($("cfg-maxpos").value,10) },
@@ -750,7 +757,10 @@ function renderChampions(){
     const lv=c.live||{trades:0,pnl:0};
     const liveCell=lv.trades?`${lv.trades} · <span class="${pnlCls(lv.pnl)}">${fmt.signed(lv.pnl,2)}</span>`
                             :`<span style="color:var(--muted)">—</span>`;
+    const g=c.gauntlet;
     const badges=(c.active?`<span class="champ-live" title="Currently driving live trading">LIVE</span> `:"")
+                +(c.clock?`<span class="clock-chip" title="Bar clock this set was validated on — only same-clock champions are candidates for the live engine">${esc(c.clock)}</span> `:"")
+                +(g?`<span title="Regime gauntlet (Binance archive, BingX fees): median fitness ${g.median} across ${g.n} historical eras, ${g.pf_ge1} with PF≥1${g.weak?" — WEAK: live probation doubled":""}">${g.weak?"🧪⚠":"🧪"}</span> `:"")
                 +(c.top_used?`<span title="Top-10 most used — protected from pruning">🔥</span> `:"")
                 +(c.live_flag?`<span title="Demoted on LIVE evidence: real PF ${(c.live_flag.pf??0).toFixed(2)} over ${c.live_flag.trades??0} trades — excluded as a candidate for 48h">⚠</span> `:"");
     return `<tr class="${c.active?'champ-active':''}">

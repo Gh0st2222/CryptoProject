@@ -287,7 +287,8 @@ class Orchestrator:
     def find_champion(self, cid: str | None) -> dict | None:
         return next((c for c in self.champions if c.get("id") == cid), None) if cid else None
 
-    def record_champion(self, params: dict, fitness: float, stats: dict) -> str:
+    def record_champion(self, params: dict, fitness: float, stats: dict,
+                        clock: str | None = None) -> str:
         """Save a freshly promoted set as a vault champion and return its id.
         Stores BOTH the birth evaluation (now, at generation time) and the current
         evaluation (identical at birth; they diverge as the set is re-validated
@@ -306,6 +307,9 @@ class Orchestrator:
         tr = int(stats.get("trades", 0))
         self.champions.append({
             "id": cid, "born_ts": now_ms(), "fver": FITNESS_VER,
+            "clock": clock or self.cfg.strategy.interval,   # the bar clock this
+            # set was validated on — bar-count params mean different real time
+            # on a different clock, so application always filters by this tag
             "birth_fitness": fit, "birth_wr": wr, "birth_pf": pf, "birth_trades": tr,
             "fitness": fit, "win_rate": wr, "profit_factor": pf, "cur_trades": tr,
             "cur_ts": now_ms(), "uses": 0, "last_used_ts": 0, "params": dict(params),
@@ -338,6 +342,9 @@ class Orchestrator:
         self.active_champion_id = cid
         if self.engine is not None:
             self.engine.active_champion_id = cid
+            # a weak regime-gauntlet stamp doubles live probation: this set
+            # needs twice the real-trade proof before full-size tuition
+            self.engine.champion_gauntlet_weak = bool(c.get("gauntlet_weak"))
         self.save_champions()
 
     def prune_champions(self) -> None:
@@ -485,8 +492,19 @@ class Orchestrator:
             speed = float(os.getenv("BOT_SYNTH_SPEED", "1.0"))
             return SyntheticFeed(self.cfg.symbols, s.interval,
                                  warmup_bars=s.warmup_bars + 80, speed=speed)
+        recorder = None
+        if self.cfg.tape.enabled:
+            # our own BingX tick archive — the venue publishes none, so this
+            # recorder is the only source of BingX microstructure that will
+            # ever exist. Thread-backed, fsync'd, disk-capped; the feed owns
+            # its lifecycle (stops with the feed).
+            from ..config import ROOT as _ROOT
+            from ..data.tape import TapeRecorder
+            recorder = TapeRecorder(_ROOT / self.cfg.data_dir / "tape",
+                                    max_disk_mb=self.cfg.tape.max_disk_mb,
+                                    book_ms=self.cfg.tape.book_ms)
         return LiveFeed(rest, self.cfg.exchange.ws_url, self.cfg.symbols,
-                        s.interval, s.warmup_bars)
+                        s.interval, s.warmup_bars, recorder=recorder)
 
     # ---------------------------------------------------------------- modes
 
@@ -1000,10 +1018,14 @@ class Orchestrator:
 
     def update_cfg(self, patch: dict) -> dict:
         # Only data-shape changes need an engine restart; risk band, max
-        # positions and auto-tune toggle all take effect live (read by ref).
-        before = (tuple(self.cfg.symbols), self.cfg.feed, self.cfg.strategy.interval)
+        # positions, auto-tune and clock-trial toggles all take effect live
+        # (read by ref). The tape recorder is built with the feed, so toggling
+        # it also needs a restart to attach/detach.
+        before = (tuple(self.cfg.symbols), self.cfg.feed, self.cfg.strategy.interval,
+                  self.cfg.tape.enabled)
         update_config(self.cfg, patch)
-        after = (tuple(self.cfg.symbols), self.cfg.feed, self.cfg.strategy.interval)
+        after = (tuple(self.cfg.symbols), self.cfg.feed, self.cfg.strategy.interval,
+                 self.cfg.tape.enabled)
         needs_restart = before != after and self.mode != MODE_IDLE
         return {"ok": True, "needs_restart": needs_restart,
                 "config": config_public_dict(self.cfg)}

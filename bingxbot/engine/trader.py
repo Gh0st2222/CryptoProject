@@ -107,6 +107,7 @@ class TraderEngine:
         self.journal = journal      # TradeJournal (records closed trades + context)
         self.record = record        # TrackRecord (daily performance snapshots)
         self.active_champion_id: str | None = None  # vault champion currently driving trades (journal tag)
+        self.champion_gauntlet_weak = False  # weak regime-gauntlet stamp -> double probation
         self.overlays: dict[str, dict] = {}   # per-symbol brain-scalar overlays (tuner-owned)
         self.ctx: dict[str, SymbolCtx] = {sym: self._make_ctx(sym) for sym in cfg.symbols}
         self.adopted: set[str] = set()   # radar-adopted symbols (beyond the user's list)
@@ -696,7 +697,10 @@ class TraderEngine:
             n += 1
             if n >= 40:
                 break
-        if n < PROBATION_TRADES:
+        # a champion that lost money across most historical regimes (weak
+        # gauntlet) must show TWICE the live evidence before full size
+        need = PROBATION_TRADES * (2 if self.champion_gauntlet_weak else 1)
+        if n < need:
             return PROBATION_MULT
         pf = wins / losses if losses > 0 else (999.0 if wins > 0 else 0.0)
         return 1.0 if pf >= PROBATION_PF else PROBATION_MULT

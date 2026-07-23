@@ -237,6 +237,8 @@ def build_report(orch) -> str:
             info["feed"] = {"healthy": eng.feed.healthy(),
                             "last_bar_age_s": ages,
                             "interval": orch.cfg.strategy.interval}
+            rec = getattr(eng.feed, "recorder", None)
+            info["tape_recorder"] = rec.stats() if rec is not None else None
         return _dump(info)
 
     def config():
