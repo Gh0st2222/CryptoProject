@@ -107,7 +107,7 @@ def gate_regime(strat, edge: float, row: dict, regime: str) -> tuple[bool, str]:
 
 
 def gate_ev(risk_cfg, payoff_b: float, p_win: float, row: dict, fees_rt: float,
-            spread_bps: float, slippage_bps: float) -> tuple[bool, str]:
+            spread_bps: float, slippage_bps: float, style: str = "trend") -> tuple[bool, str]:
     """Expected-value floor — the gate that refuses coin-flip entries.
 
     P(win) must clear the breakeven probability at the MEASURED payoff ratio
@@ -120,7 +120,11 @@ def gate_ev(risk_cfg, payoff_b: float, p_win: float, row: dict, fees_rt: float,
     atr_pct = row.get("atr_pct", 0.0)
     if not (isinstance(atr_pct, float) and math.isfinite(atr_pct)) or atr_pct <= 0:
         return False, "no volatility estimate"
-    stop_pct = max(risk_cfg.sl_atr_min * atr_pct, 1e-9)
+    # the style's OWN stop defines the risk unit: scalps run tighter stops, so
+    # the same absolute cost is a BIGGER fraction of their R — judging them by
+    # the trend stop understated their true cost load
+    stop_mult = risk_cfg.scalp_sl_atr if style == "scalp" else risk_cfg.sl_atr_min
+    stop_pct = max(stop_mult * atr_pct, 1e-9)
     cost_r = (fees_rt + (spread_bps + 2.0 * slippage_bps) / 10_000.0) / stop_pct
     b = max(payoff_b, 0.1)
     need = min((1.0 + cost_r) / (1.0 + b) + EV_MARGIN, 0.92)
@@ -143,7 +147,9 @@ def _entry_signal_ok(brain, strat, risk_cfg, edge: float, p_win: float, row: dic
         return False
     if not gate_regime(strat, edge, row, ev["regime"])[0]:
         return False
-    return gate_ev(risk_cfg, payoff_b, p_win, row, fees_rt, ASSUMED_SPREAD_BPS, slippage_bps)[0]
+    style = "scalp" if ev["regime"] == "RANGE" else "trend"
+    return gate_ev(risk_cfg, payoff_b, p_win, row, fees_rt, ASSUMED_SPREAD_BPS,
+                   slippage_bps, style)[0]
 
 
 def candles_to_arrays(candles: list[Candle]) -> dict[str, np.ndarray]:

@@ -411,6 +411,8 @@ function renderAutotuner(){
     ["Cycles run",at.cycles],
     ["Improvements",at.improvements],
     ["Champion fitness",at.champion_fitness??"—"],
+    ["Promotion bar",lc?.bar!=null?lc.bar:"—"],
+    ["PF gate",lc&&lc.cands_judged!=null?`${lc.pf_passed??0}/${lc.cands_judged} passed`:"—"],
     ["Last challenger",lc?(lc.best_fitness==null?"none passed profit gate":`${lc.best_fitness} (${lc.promoted?"adopted":"kept"})`):"—"],
     ["Diversity",lc?.diversity??"—"],
     ["Next cycle",next],
