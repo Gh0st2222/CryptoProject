@@ -33,7 +33,7 @@ from ..util import clamp
 
 # Structural discipline on the edge-flip exit, mirroring the entry chain: the
 # entry refuses to trade against a decided 15m/1h trend (hard MTF veto) and
-# demands a persistent signal (entry_confirm_scans), but the exit used to fire
+# only ever decides on a CLOSED bar, but the exit used to fire
 # on a single bar's shallow negative edge — selling with-trend longs at pullback
 # lows the entry gate would never have shorted. Constants, not tunables, for the
 # same reason the entry veto is one: the tuner must never optimize discipline away.

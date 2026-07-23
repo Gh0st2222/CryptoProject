@@ -205,10 +205,12 @@ class BaseFeed:
 class LiveFeed(BaseFeed):
     """Real BingX market data: REST seed + WebSocket streaming."""
 
-    def __init__(self, rest: BingXRest, ws_url: str, symbols: list[str], interval: str, warmup_bars: int):
+    def __init__(self, rest: BingXRest, ws_url: str, symbols: list[str], interval: str,
+                 warmup_bars: int, recorder=None):
         super().__init__(symbols, interval)
         self.rest = rest
         self.warmup_bars = warmup_bars
+        self.recorder = recorder   # TapeRecorder | None — owned: starts/stops with the feed
         self.ws = BingXMarketWS(
             ws_url,
             on_kline=self._on_kline,
@@ -244,6 +246,8 @@ class LiveFeed(BaseFeed):
     async def start(self) -> None:
         for s in self.symbols:
             await self._seed_symbol(s)
+        if self.recorder is not None:
+            self.recorder.start()
         await self.ws.start()
         self._ctx_task = asyncio.create_task(self._poll_context(), name="ctx-poller")
         self._bar_task = asyncio.create_task(self._bar_watchdog(), name="bar-watchdog")
@@ -281,6 +285,8 @@ class LiveFeed(BaseFeed):
                     pass
         self._ctx_task = self._bar_task = None
         await self.ws.stop()
+        if self.recorder is not None:
+            await asyncio.to_thread(self.recorder.stop)   # joins the writer thread
         self.started = False
 
     async def _bar_watchdog(self) -> None:
@@ -369,12 +375,16 @@ class LiveFeed(BaseFeed):
         if st is None:
             return
         st.on_tick(t)
+        if self.recorder is not None:   # enqueue only — a writer THREAD does the IO
+            self.recorder.record_trade(symbol, t.ts, t.price, t.qty, t.is_buyer_maker)
         self._emit("tick", symbol)
 
     async def _on_book(self, symbol: str, b: BookTop) -> None:
         st = self.states.get(symbol)
         if st is not None:
             st.on_book(b)
+            if self.recorder is not None:
+                self.recorder.record_book(symbol, b.ts or now_ms(), b.bid, b.ask)
 
     async def _on_depth(self, symbol: str, d: DepthSnapshot) -> None:
         st = self.states.get(symbol)

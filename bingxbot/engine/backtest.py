@@ -69,7 +69,14 @@ def gate_mtf_veto(strat, edge: float, row: dict) -> tuple[bool, str]:
 def gate_funding(strat, edge: float, row: dict) -> tuple[bool, str]:
     """Funding awareness: if we'd pay meaningful funding to hold this side and the
     edge is only marginal, skip — the carry quietly eats a thin edge. (Funding is
-    0 in the backtester's synthetic/historical klines, so this is live-only.)"""
+    0 in the backtester's synthetic/historical klines, so this is live-only.)
+
+    The 3bp/8h bar (~33% APR) and the 1.3x base_threshold "thin" band are
+    deliberate constants for the same reason micro_confirms' are: with funding
+    absent from historical data the tuner has no way to validate them, so a
+    knob here would be an unvalidatable free parameter. base_threshold (not
+    the adaptive threshold) anchors "thin" because it is the one number OOS
+    validation actually priced."""
     funding = row.get("funding_rate", 0.0) or 0.0
     if abs(funding) >= 0.0003 and (1 if edge > 0 else -1) * funding > 0 and abs(edge) < strat.base_threshold * 1.3:
         return False, f"funding {funding*100:+.4f}% vs thin edge {edge:+.2f}"

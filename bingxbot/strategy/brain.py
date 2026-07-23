@@ -342,6 +342,12 @@ class TradingBrain:
         return clamp(self.kelly_fraction * f * 4.0, 0.25, 1.75)
 
     def micro_confirms(self, edge: float, micro: dict) -> bool:
+        """Order-flow NON-OPPOSITION veto (live/paper only — historical klines
+        carry no book or tape, so the backtest never sees it). The 0.6/0.4
+        blend and 0.35 bar are deliberate constants, not tunables: with no way
+        to validate them out-of-sample they would be free parameters the tuner
+        could only ever overfit; as constants they are discipline — a strongly
+        opposed tape blocks, anything else abstains."""
         lean = 0.6 * micro.get("flow", 0.0) + 0.4 * micro.get("obi", 0.0)
         return not (abs(lean) > 0.35 and lean * edge < 0)
 

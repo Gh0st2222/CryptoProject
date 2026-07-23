@@ -100,6 +100,10 @@ a { color: var(--accent-2); }
    the one failure the terminal must never hide. */
 .feed .dot.stale { background: var(--bad); animation: pulse 0.9s infinite; box-shadow: 0 0 9px var(--bad); }
 .feed #feed-label.stale { color: var(--bad); font-weight: 700; letter-spacing: 0.4px; }
+/* champion bar-clock tag (5m / 15m) — which clock the set was validated on */
+.clock-chip { display: inline-block; padding: 0 5px; border: 1px solid var(--accent-2);
+  color: var(--accent-2); border-radius: 3px; font-size: 9.5px; font-family: var(--mono);
+  letter-spacing: 0.5px; vertical-align: middle; }
 
 .tstats { display: flex; gap: 18px; margin-left: auto; }
 .tstat { text-align: right; }
