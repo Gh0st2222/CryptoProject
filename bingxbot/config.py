@@ -53,7 +53,6 @@ class StrategyConfig:
     target_trades_per_hour: float = 2.5
     cost_multiple: float = 1.85     # predicted move must exceed round-trip cost x this
     micro_confirm: bool = True      # order-flow agreement gate at entry (live/paper)
-    entry_confirm_scans: int = 2    # reactive intra-bar signal must persist this many scans
     trend_align_gate: bool = True   # in trends, only trade with multi-TF alignment
     discipline: bool = True         # regime-appropriate entries (the big anti-bleed fix)
     min_efficiency: float = 0.35    # trend entries need this Kaufman efficiency ratio

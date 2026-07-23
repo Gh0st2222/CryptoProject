@@ -388,7 +388,7 @@ def run_kernel(feats, amat, regs, p, warmup, taker, maker_fee, slip_bps,
                 day2 = ts // 86_400_000
                 if day2 != day_key:
                     day_key = day2; day_start_eq = eq_after; day_realized = 0.0
-                    consec_losses = 0; cooldown_until = 0.0; killed = False
+                    consec_losses = 0; killed = False   # cooldown brakes across midnight (mirror)
                 r_hist[rh_head] = _clamp(rmul, -3.0, 5.0); rh_head = (rh_head + 1) % 30
                 if rh_n < 30:
                     rh_n += 1
@@ -429,7 +429,7 @@ def run_kernel(feats, amat, regs, p, warmup, taker, maker_fee, slip_bps,
                 day2 = ts // 86_400_000
                 if day2 != day_key:
                     day_key = day2; day_start_eq = eq_after; day_realized = 0.0
-                    consec_losses = 0; cooldown_until = 0.0; killed = False
+                    consec_losses = 0; killed = False   # cooldown brakes across midnight (mirror)
                 r_hist[rh_head] = _clamp(rmul, -3.0, 5.0); rh_head = (rh_head + 1) % 30
                 if rh_n < 30:
                     rh_n += 1
@@ -741,7 +741,7 @@ def run_kernel(feats, amat, regs, p, warmup, taker, maker_fee, slip_bps,
                     day2 = ts // 86_400_000
                     if day2 != day_key:
                         day_key = day2; day_start_eq = eq_after; day_realized = 0.0
-                        consec_losses = 0; cooldown_until = 0.0; killed = False
+                        consec_losses = 0; killed = False   # cooldown brakes across midnight (mirror)
                     r_hist[rh_head] = _clamp(rmul, -3.0, 5.0); rh_head = (rh_head + 1) % 30
                     if rh_n < 30:
                         rh_n += 1
@@ -780,7 +780,7 @@ def run_kernel(feats, amat, regs, p, warmup, taker, maker_fee, slip_bps,
                 day2 = ts // 86_400_000
                 if day2 != day_key:
                     day_key = day2; day_start_eq = eq_after; day_realized = 0.0
-                    consec_losses = 0; cooldown_until = 0.0; killed = False
+                    consec_losses = 0; killed = False   # cooldown brakes across midnight (mirror)
                 r_hist[rh_head] = _clamp(rmul, -3.0, 5.0); rh_head = (rh_head + 1) % 30
                 if rh_n < 30:
                     rh_n += 1
@@ -809,8 +809,11 @@ def run_kernel(feats, amat, regs, p, warmup, taker, maker_fee, slip_bps,
             eq2 = cash
             day2 = ts // 86_400_000
             if day2 != day_key:
+                # daily counters only — an active loss-streak cooldown keeps
+                # braking across midnight (mirror of RiskManager._roll_day);
+                # the daily-loss kill clears with its new day by design.
                 day_key = day2; day_start_eq = eq2; day_realized = 0.0
-                consec_losses = 0; cooldown_until = 0.0; killed = False
+                consec_losses = 0; killed = False
             ok = (not killed) and (clock >= cooldown_until) and (0 < int(p[P_MAXPOS])) \
                 and (ASSUMED_SPREAD_BPS <= p[P_MAXSPR]) and eq2 > 0
             if ok and abs(edge) >= threshold and p_win >= p[P_MINPW] and atr_pct > 0:

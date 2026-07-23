@@ -22,8 +22,8 @@ from ..strategy.brain import TradingBrain
 from ..strategy.exits import AdaptiveExitManager
 from ..strategy.features import FeatureFrame, mtf_from_row
 from ..util import now_ms
-from .backtest import (FUNDING_MS, _entry_signal_ok, gate_ev, gate_funding,
-                       gate_mtf_veto, gate_regime)
+from .backtest import (ASSUMED_SPREAD_BPS, FUNDING_MS, _entry_signal_ok,
+                       gate_ev, gate_funding, gate_mtf_veto, gate_regime)
 from .brokers import Broker, LiveBroker
 from .portfolio import Portfolio
 
@@ -38,6 +38,12 @@ REACT_TAIL = 640     # bars for reactive intra-bar scans: the widest rolling
                      # Used only when the base interval >= 5m; a 1m base keeps
                      # the full tail so the 1h ladder rung stays populated.
 REACT_MS = 850       # min gap between reactive intra-bar scans, per symbol
+# Live slippage assumption for the cost/EV gates, in bps. Deliberately the same
+# order as the backtest's modeled slippage: the entry chain must price trades
+# with the exact arithmetic OOS validation priced them with. (Future upgrade:
+# measure realized slip from live fills and feed the EWMA here — needs
+# fill-vs-mark bookkeeping the journal doesn't collect yet.)
+LIVE_SLIPPAGE_BPS = 1.0
 ADOPTED_FULL_GRADED = 30  # adopted symbols trade at reduced size until this many graded calls
 # champion probation: a freshly promoted parameter set trades at reduced risk
 # until it has a REAL sample with an acceptable profit factor. Every champion
@@ -76,8 +82,6 @@ class SymbolCtx:
         self.stage_ts = 0
         self.eval_ms = 0.0
         self.react_ts = 0             # last reactive intra-bar scan (ms)
-        self.react_dir = 0            # sign of the last reactive signal (confirmation)
-        self.react_confirm = 0        # consecutive scans agreeing on direction
         self.entry_ctx: dict = {}     # decision context captured at the open (for the journal)
         self.gates: list[dict] = []   # live entry-gate X-ray [{n, ok, d}] for the UI
         self.busy = False  # guards against overlapping broker calls
@@ -700,8 +704,14 @@ class TraderEngine:
     def _block_reason(self, brain, edge, p_win, row, ev, fees_rt, spread, slip, payoff_b) -> str:
         """The FIRST failing gate, with its live numbers — never a vague label.
         'trend ER 0.14 < 0.27' tells you exactly what the machine is waiting for;
-        'awaiting aligned trend' told you nothing."""
-        ok, why = brain.entry_ok(edge, p_win, row, fees_rt, spread, slip)
+        'awaiting aligned trend' told you nothing.
+
+        Cost-bearing gates are recomputed with ASSUMED_SPREAD_BPS — the same
+        number the DECIDING chain uses — never the measured book spread. A
+        report built with different inputs than the decision can contradict it
+        (panel red, trade taken); the measured spread has its own gate
+        (risk.can_enter's max_spread_bps) and is shown on that row."""
+        ok, why = brain.entry_ok(edge, p_win, row, fees_rt, ASSUMED_SPREAD_BPS, slip)
         if not ok:
             return why
         strat = self.cfg.strategy
@@ -713,13 +723,14 @@ class TraderEngine:
         if not ok:
             return d
         style = "scalp" if ev["regime"] == "RANGE" else "trend"
-        ok, d = gate_ev(self.cfg.risk, payoff_b, p_win, row, fees_rt, spread, slip, style)
+        ok, d = gate_ev(self.cfg.risk, payoff_b, p_win, row, fees_rt,
+                        ASSUMED_SPREAD_BPS, slip, style)
         return d if not ok else ""
 
     def _entry_costs(self, symbol: str) -> tuple[float, float]:
         spec = self.specs.get(symbol, ContractSpec(symbol))
         fees_rt = spec.taker_fee + (spec.maker_fee if self.cfg.strategy.entry_mode == "maker" else spec.taker_fee)
-        slip = self.cfg.paper.slippage_bps if self.portfolio.mode != "live" else 1.0
+        slip = self.cfg.paper.slippage_bps if self.portfolio.mode != "live" else LIVE_SLIPPAGE_BPS
         return fees_rt, slip
 
     def _build_gates(self, ctx: SymbolCtx, st: MarketState, row: dict, ev: dict) -> None:
@@ -734,8 +745,14 @@ class TraderEngine:
         risk_ok, risk_why = self.risk.can_enter(
             self.portfolio.equity(marks),
             len(self.portfolio.positions) + self.pending_entries(), spread)
-        gates = [{"n": "risk", "ok": risk_ok, "d": risk_why or "clear"}]
-        gates += ctx.brain.entry_report(edge, p_win, row, fees_rt, spread or 1.0, slip)
+        # the MEASURED spread lives on this row (can_enter is its real gate);
+        # every cost-bearing row below prices with ASSUMED_SPREAD_BPS because
+        # that is what the deciding chain uses — an X-ray computed with
+        # different inputs than the decision can show red on a trade the
+        # machine just took (or green on one it refused).
+        gates = [{"n": "risk", "ok": risk_ok,
+                  "d": (risk_why if not risk_ok else f"clear · spread {spread:.1f}bp")}]
+        gates += ctx.brain.entry_report(edge, p_win, row, fees_rt, ASSUMED_SPREAD_BPS, slip)
         for name, (g_ok, d) in (("mtf veto", gate_mtf_veto(strat, edge, row)),
                                 ("funding", gate_funding(strat, edge, row))):
             gates.append({"n": name, "ok": g_ok, "d": d})
@@ -743,7 +760,7 @@ class TraderEngine:
         gates.append({"n": "regime", "ok": r_ok, "d": f"{ev['regime']} · {r_d}"})
         style = "scalp" if ev["regime"] == "RANGE" else "trend"
         ev_ok, ev_d = gate_ev(self.cfg.risk, self.risk.payoff_ratio(style), p_win, row,
-                              fees_rt, spread or 1.0, slip, style)
+                              fees_rt, ASSUMED_SPREAD_BPS, slip, style)
         gates.append({"n": "EV floor", "ok": ev_ok, "d": ev_d})
         if strat.micro_confirm:
             micro = st.micro_snapshot()
@@ -821,13 +838,7 @@ class TraderEngine:
         # door. If the signal is real it will still be there when the bar
         # closes; if it isn't, it was exactly the trade we shouldn't take.
         edge, thr = ev["edge"], ev.get("threshold", 0.3)
-        sig_dir = (1 if edge > 0 else -1) if abs(edge) >= thr else 0
-        if sig_dir != 0 and sig_dir == ctx.react_dir:
-            ctx.react_confirm += 1
-        else:
-            ctx.react_dir = sig_dir
-            ctx.react_confirm = 1 if sig_dir != 0 else 0
-        if sig_dir != 0:
+        if abs(edge) >= thr:
             ctx.last_entry_block = "signal live — decides at bar close"
 
     async def _close(self, symbol: str, reason: str) -> None:
