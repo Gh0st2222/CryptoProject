@@ -91,8 +91,13 @@ function setSymbol(sym,force=false){ if(!sym||(sym===curSymbol&&!force)) return;
 function renderTop(){
   const mode=S.mode, pill=$("mode-pill"); pill.className=`pill ${mode}`; $("mode-text").textContent=mode.toUpperCase();
   if($("mode-select").value!==mode) $("mode-select").value=mode;
-  const healthy=!!S.engine?.feed_healthy; $("feed-dot").className="dot"+(healthy?" ok":"");
-  $("feed-label").textContent=S.engine?(S.config.feed==="synthetic"?"synthetic":"BingX"):"no feed";
+  const healthy=!!S.engine?.feed_healthy, stale=!!S.engine?.bar_stale;
+  $("feed-dot").className="dot"+(stale?" stale":healthy?" ok":"");
+  // a red STALE chip beats a silently frozen terminal: prices can look live
+  // while the kline stream is dead and the brain starves for bar closes.
+  $("feed-label").textContent=stale?`STALE ${S.engine?.bar_age_s??"?"}s`
+    :S.engine?(S.config.feed==="synthetic"?"synthetic":"BingX"):"no feed";
+  $("feed-label").className=stale?"stale":"";
   const es=engSym(); $("lat").textContent=es?`${es.eval_ms} ms`:"— ms";
   const pf=S.engine?.portfolio, st=pf?.stats;
   $("t-eq").textContent=pf?fmt.usd(pf.equity):"—";
@@ -481,6 +486,7 @@ function applyHot(h){
   const pf=S.engine.portfolio; if(pf) pf.equity=he.equity;
   if(typeof he.killed==="boolean"&&S.engine.risk) S.engine.risk.killed=he.killed;
   if(typeof he.feed_healthy==="boolean") S.engine.feed_healthy=he.feed_healthy;
+  if(typeof he.bar_stale==="boolean"){ S.engine.bar_stale=he.bar_stale; S.engine.bar_age_s=he.bar_age_s; }
   if(he.focus) S.engine.focus=he.focus;
   if(he.adopted) S.engine.adopted=he.adopted;
   for(const [sym,hs] of Object.entries(he.symbols||{})){
