@@ -201,6 +201,54 @@ def rank_universe(premium: list[dict], tickers: list[dict],
     return rows
 
 
+ADOPT_ER = 0.40      # a NEW symbol must be a decided, quality 4h trend
+KEEP_ER = 0.30       # an ADOPTED symbol holds its seat down to here
+
+
+def plan_adoption(rows: list[dict], adopted: set[str], user: set[str],
+                  has_pos, cap: int, miss: dict[str, int]) -> tuple[list[str], list[str]]:
+    """Pure seat plan for radar adoption -> (drops, adds).
+
+    Seats have HYSTERESIS, mirroring the specialist bench: an incumbent is
+    never evicted merely for being outranked. Churn is expensive — a dropped
+    symbol's brain (hedge weights, calibration, graded count) dies with its
+    ctx, so re-adopting minutes later restarts it cold at the adopted-size
+    haircut. An incumbent leaves only after failing the KEEP standard (still
+    a liquid, directional 4h trend — a band below the adopt bar) on two
+    consecutive scans tracked in `miss` (mutated in place, caller owns it),
+    or to trim seats after the cap shrank. Never with an open position.
+    New symbols only fill FREE seats and must clear the full adopt bar;
+    `rows` arrive ranked, so the strongest candidates are taken first."""
+    by_sym = {r["symbol"]: r for r in rows}
+
+    def keeps_seat(sym: str) -> bool:
+        r = by_sym.get(sym)
+        return (r is not None and r.get("dir_4h", 0) != 0
+                and r.get("er_4h", 0.0) >= KEEP_ER
+                and r.get("quote_volume", 0.0) >= TREND_MIN_QVOL)
+
+    drops: list[str] = []
+    for sym in sorted(adopted):
+        if has_pos(sym) or keeps_seat(sym):
+            miss.pop(sym, None)
+            continue
+        miss[sym] = miss.get(sym, 0) + 1
+        if miss[sym] >= 2:
+            drops.append(sym)
+    keep = [s for s in sorted(adopted) if s not in drops]
+    if len(keep) > cap:
+        droppable = sorted((s for s in keep if not has_pos(s)),
+                           key=lambda s: by_sym.get(s, {}).get("er_4h", 0.0))
+        drops += droppable[:len(keep) - cap]
+        keep = [s for s in keep if s not in drops]
+    free = max(0, cap - len(keep))
+    adds = [r["symbol"] for r in rows
+            if r["symbol"] not in user and r["symbol"] not in adopted
+            and r.get("kind") == "trend" and r.get("dir_4h", 0) != 0
+            and r.get("er_4h", 0.0) >= ADOPT_ER and not has_pos(r["symbol"])][:free]
+    return drops, adds
+
+
 def top_volume_universe(tickers: list[dict], n: int = 10,
                         allowed: set[str] | None = None) -> list[str]:
     """The tuner's research universe: the ACTUAL top-N BingX perps by 24h USDT

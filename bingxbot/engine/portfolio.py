@@ -22,6 +22,11 @@ class Portfolio:
         self.trades: list[TradeRecord] = []
         self.equity_curve: deque[tuple[int, float]] = deque(maxlen=6000)
         self._last_curve_ts = 0
+        # running peak / max drawdown, updated on every equity record: the
+        # curve deque only holds ~8h at the 5s cadence, so a dip that scrolls
+        # out of it must not scroll out of the drawdown statistic too.
+        self.peak_equity = 0.0
+        self.max_dd = 0.0
 
     # ------------------------------------------------------------- equity
 
@@ -39,8 +44,12 @@ class Portfolio:
     def record_equity(self, ts: int, marks: dict[str, float] | None = None,
                       min_gap_ms: int = 5_000) -> None:
         if ts - self._last_curve_ts >= min_gap_ms:
-            self.equity_curve.append((ts, round(self.equity(marks), 6)))
+            eq = round(self.equity(marks), 6)
+            self.equity_curve.append((ts, eq))
             self._last_curve_ts = ts
+            self.peak_equity = max(self.peak_equity, eq)
+            if self.peak_equity > 0:
+                self.max_dd = max(self.max_dd, (self.peak_equity - eq) / self.peak_equity)
 
     # ------------------------------------------------------------- trades
 
@@ -152,6 +161,9 @@ class Portfolio:
             peak = max(peak, e)
             if peak > 0:
                 max_dd = max(max_dd, (peak - e) / peak)
+        # the visible curve is a tail; the running tracker remembers dips that
+        # already scrolled out of it (and, via persistence, past restarts).
+        max_dd = max(max_dd, self.max_dd)
         rets = [t.pnl for t in trades]
         mean = sum(rets) / n if n else 0.0
         var = sum((r - mean) ** 2 for r in rets) / (n - 1) if n > 1 else 0.0
