@@ -421,6 +421,9 @@ function renderAutotuner(){
     ["Last challenger",lc?(lc.best_fitness==null?"none passed profit gate":`${lc.best_fitness} (${lc.promoted?"adopted":"kept"})`):"—"],
     ["Cycle clock",lc?.clock??"—"],
     ["Trial clock",at.clock_trial?(at.last_trial?`${at.last_trial.clock} · best ${at.last_trial.best_fitness??"—"} · gen ${at.last_trial.generation??0}`:"warming up…"):"off"],
+    ["Shadow race",S.shadow?(S.shadow.equity!=null
+      ?`${S.shadow.clock}: ${fmt.usd(S.shadow.equity)} · ${S.shadow.stats?.trades??0} trades · PF ${S.shadow.stats?.trades?(S.shadow.stats.profit_factor??0).toFixed(2):"—"}`
+      :S.shadow.status||"waiting"):"—"],
     ["Gauntlet",lc?.gauntlet?`med ${lc.gauntlet.median} · ${lc.gauntlet.pf_ge1}/${lc.gauntlet.n} eras PF≥1${lc.gauntlet.weak?" ⚠ weak":""}`:"—"],
     ["Diversity",lc?.diversity??"—"],
     ["Next cycle",next],

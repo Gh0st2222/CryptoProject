@@ -177,7 +177,8 @@ class _SymSim:
     — that is what the portfolio backtest is."""
 
     def __init__(self, symbol, interval, candles, strat, risk_cfg, spec,
-                 taker_fee, slippage_bps, collect_series, ff=None, pending_slots=None):
+                 taker_fee, slippage_bps, collect_series, ff=None, pending_slots=None,
+                 use_meta: bool = True):
         self.symbol = symbol
         self.strat = strat
         self.spec = spec
@@ -212,6 +213,10 @@ class _SymSim:
             target_trades_per_hour=strat.target_trades_per_hour,
             bars_per_hour=bph, cost_multiple=strat.cost_multiple,
             min_p_win=strat.min_p_win, kelly_fraction=strat.kelly_fraction)
+        # meta-free evidence lanes: the GBM head is trained on the LIVE clock's
+        # recent bars — consulting it while judging another clock (trial) or
+        # another era (gauntlet) measures the mismatch, not the parameters.
+        self.brain.use_meta = use_meta
         self.exits = AdaptiveExitManager(risk_cfg)
         self.taker = taker_fee
         self.maker_fee = getattr(spec, "maker_fee", 0.0002)
@@ -499,6 +504,7 @@ def run_portfolio_backtest(
     slippage_bps: float = 1.5,
     warmup: int = 300,
     progress_cb=None,
+    use_meta: bool = True,
 ) -> dict:
     """Trade several symbols on ONE shared account. Sizing, the position cap,
     the daily-loss kill switch and the health governor are all portfolio-level,
@@ -512,7 +518,7 @@ def run_portfolio_backtest(
     shared_slots = {"n": 0}   # pendings reserve position slots account-wide
     sims = {s: _SymSim(s, interval, candles_by_symbol[s], strat, risk_cfg,
                        specs.get(s, ContractSpec(s)), taker_fee, slippage_bps, True,
-                       pending_slots=shared_slots)
+                       pending_slots=shared_slots, use_meta=use_meta)
             for s in syms}
     # align on the intersection of timestamps
     ts_index = {s: {int(t): i for i, t in enumerate(sim.ts)} for s, sim in sims.items()}

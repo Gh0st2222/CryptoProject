@@ -159,9 +159,12 @@ class BingXMarketWS(_BaseWS):
         self.on_book = on_book
         self.on_depth = on_depth
         self._channels: set[str] = set()
-        # kline rollover detection: last open-time per (symbol, interval)
-        self._kline_open: dict[str, int] = {}
-        self._kline_last: dict[str, Candle] = {}
+        # kline rollover detection, keyed (symbol, interval): with the shadow
+        # clock subscribed, 5m and 15m streams for the SAME symbol interleave —
+        # a shared key would let one clock's newer open-time falsely close the
+        # other clock's bar.
+        self._kline_open: dict[tuple[str, str], int] = {}
+        self._kline_last: dict[tuple[str, str], Candle] = {}
 
     @staticmethod
     def _symbol_channels(symbol: str, interval: str, depth_level: int = 20) -> set[str]:
@@ -174,6 +177,24 @@ class BingXMarketWS(_BaseWS):
 
     def subscribe_symbol(self, symbol: str, interval: str = "1m", depth_level: int = 20) -> None:
         self._channels.update(self._symbol_channels(symbol, interval, depth_level))
+
+    def subscribe_kline(self, symbol: str, interval: str) -> None:
+        """Register ONE extra kline channel (e.g. the shadow clock) — sent on
+        (re)connect like every registered channel."""
+        self._channels.add(f"{symbol}@kline_{interval}")
+
+    async def subscribe_kline_now(self, symbol: str, interval: str) -> None:
+        """Runtime variant: register AND send the sub frame on a live socket."""
+        ch = f"{symbol}@kline_{interval}"
+        if ch in self._channels:
+            return
+        self._channels.add(ch)
+        if self.connected and self._ws is not None and not self._ws.closed:
+            try:
+                await self._ws.send_str(
+                    json.dumps({"id": str(uuid.uuid4()), "reqType": "sub", "dataType": ch}))
+            except Exception as e:  # noqa: BLE001 — reconnect will re-sub anyway
+                log.warning("kline subscribe %s failed: %s", ch, e)
 
     async def subscribe_now(self, symbol: str, interval: str = "1m") -> None:
         """Runtime adoption: register the channels AND send the sub frames on the
@@ -223,7 +244,7 @@ class BingXMarketWS(_BaseWS):
         symbol = data_type.split("@", 1)[0]
         try:
             if "@kline_" in data_type:
-                await self._handle_kline(symbol, data)
+                await self._handle_kline(symbol, data, data_type.split("@kline_", 1)[1])
             elif data_type.endswith("@trade"):
                 await self._handle_trades(symbol, data)
             elif data_type.endswith("@bookTicker"):
@@ -233,8 +254,9 @@ class BingXMarketWS(_BaseWS):
         except Exception:  # noqa: BLE001
             log.exception("handler failed for %s", data_type)
 
-    async def _handle_kline(self, symbol: str, data) -> None:
+    async def _handle_kline(self, symbol: str, data, interval: str = "") -> None:
         rows = data if isinstance(data, list) else [data]
+        key = (symbol, interval)
         for row in rows:
             k = row.get("K", row) if isinstance(row, dict) else None
             if not isinstance(k, dict):
@@ -255,17 +277,17 @@ class BingXMarketWS(_BaseWS):
                 volume=safe_float(k.get("v")),
                 closed=False,
             )
-            prev_ts = self._kline_open.get(symbol)
+            prev_ts = self._kline_open.get(key)
             if prev_ts is not None and ts > prev_ts:
                 # New bar started -> the previous one just closed.
-                prev = self._kline_last.get(symbol)
+                prev = self._kline_last.get(key)
                 if prev is not None and self.on_kline:
                     prev.closed = True
-                    await self.on_kline(symbol, prev)
-            self._kline_open[symbol] = ts
-            self._kline_last[symbol] = candle
+                    await self.on_kline(symbol, interval, prev)
+            self._kline_open[key] = ts
+            self._kline_last[key] = candle
             if self.on_kline:
-                await self.on_kline(symbol, candle)
+                await self.on_kline(symbol, interval, candle)
 
     async def _handle_trades(self, symbol: str, data) -> None:
         if not self.on_tick:

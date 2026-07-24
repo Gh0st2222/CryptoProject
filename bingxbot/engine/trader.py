@@ -95,7 +95,7 @@ class SymbolCtx:
 class TraderEngine:
     def __init__(self, cfg: BotConfig, feed: BaseFeed, broker: Broker, portfolio: Portfolio,
                  risk: RiskManager, specs: dict[str, ContractSpec], on_update=None, journal=None,
-                 record=None):
+                 record=None, persist_path=None, react_enabled: bool = True):
         self.cfg = cfg
         self.feed = feed
         self.broker = broker
@@ -108,6 +108,12 @@ class TraderEngine:
         self.record = record        # TrackRecord (daily performance snapshots)
         self.active_champion_id: str | None = None  # vault champion currently driving trades (journal tag)
         self.champion_gauntlet_weak = False  # weak regime-gauntlet stamp -> double probation
+        self.persist_path = persist_path     # None = the default paper snapshot; the
+                                             # SHADOW engine gets its own file so the
+                                             # two accounts can never overwrite each other
+        self.react_enabled = react_enabled   # the shadow skips reactive scans (its
+                                             # entries are bar-close anyway; stops
+                                             # still run on every tick)
         self.overlays: dict[str, dict] = {}   # per-symbol brain-scalar overlays (tuner-owned)
         self.ctx: dict[str, SymbolCtx] = {sym: self._make_ctx(sym) for sym in cfg.symbols}
         self.adopted: set[str] = set()   # radar-adopted symbols (beyond the user's list)
@@ -159,8 +165,9 @@ class TraderEngine:
         if flatten:
             await self.broker.flatten_all("engine stop")
         if self.portfolio.mode == "paper":
-            from .persist import save_paper_state
+            from .persist import STATE_PATH, save_paper_state
             save_paper_state(self.portfolio, self.risk.state,
+                             path=self.persist_path or STATE_PATH,
                              brains=self.brain_states(),   # the session AND the learning survive
                              entry_ctx=self.entry_contexts(),
                              health=self.risk.health.state_dict())
@@ -238,12 +245,13 @@ class TraderEngine:
                     except Exception as e:  # noqa: BLE001
                         log.warning("track record roll failed: %s", e)
                 if self.portfolio.mode == "paper" and beat % 6 == 0:   # every 30s
-                    from .persist import save_paper_state
+                    from .persist import STATE_PATH, save_paper_state
                     # the state dicts are built on the loop (cheap); the multi-MB
                     # json.dumps + disk write run on a thread — doing them inline
                     # froze the event loop (ws pushes, ticks, everything) for up to
                     # ~100ms every 30s: the exact cyclic stutter on the dashboard.
                     await asyncio.to_thread(save_paper_state, self.portfolio, self.risk.state,
+                                            path=self.persist_path or STATE_PATH,
                                             brains=self.brain_states(),
                                             entry_ctx=self.entry_contexts(),
                                             health=self.risk.health.state_dict())
@@ -784,7 +792,10 @@ class TraderEngine:
         if pos is None:
             # flat: hunt for an entry on the live-forming bar + order book + flow,
             # throttled — this is what stops us waiting for a bar to close.
-            await self._maybe_react(symbol, ctx, st)
+            # (The shadow engine skips this: its entries are bar-close anyway,
+            # and one reactive scanner per account is CPU the race doesn't need.)
+            if self.react_enabled:
+                await self._maybe_react(symbol, ctx, st)
             return
         price = st.last_price
         if price <= 0:

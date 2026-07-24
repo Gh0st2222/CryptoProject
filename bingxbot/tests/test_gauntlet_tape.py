@@ -77,6 +77,7 @@ class _StubOrch:
 
     async def map_cpu(self, fn, args, research=False):
         self.map_calls += 1
+        self.last_args = list(args)
         return [{"fitness": self._fits[i % len(self._fits)],
                  "stats": {"profit_factor": 1.2 if self._fits[i % len(self._fits)] > 0 else 0.7}}
                 for i in range(len(args))]
@@ -100,6 +101,9 @@ async def test_gauntlet_summary_and_forever_cache(monkeypatch, tmp_path):
     g = await at._gauntlet(params, "15m", 5e-4, 1.0, orch.cfg.strategy, orch.cfg.risk)
     assert g is not None and g["n"] == len(bh.GAUNTLET_WINDOWS)
     assert g["weak"] is False and g["pf_ge1"] >= 1
+    assert g["meta_free"] is True
+    assert all(a[-1] is False for a in orch.last_args), \
+        "era runs must judge the CORE brain — today's meta on 2021 data is hindsight"
     calls_before = orch.map_calls
     g2 = await at._gauntlet(params, "15m", 5e-4, 1.0, orch.cfg.strategy, orch.cfg.risk)
     assert orch.map_calls == calls_before, "same params must be served from cache"
@@ -122,6 +126,24 @@ def test_weak_gauntlet_doubles_probation(tmp_path):
     eng.champion_gauntlet_weak = True
     assert eng._champion_probation() == PROBATION_MULT, \
         "a weak-gauntlet champion needs 16 trades, not 8"
+
+
+def test_symsim_honors_use_meta_flag():
+    """The evidence lanes (trial clock, era gauntlet) must judge the CORE
+    brain: the meta head is a live-clock, recent-regime attachment whose
+    blend weight (~0.85) would otherwise dominate cross-clock scores."""
+    from bingxbot.engine.backtest import _SymSim
+    from bingxbot.exchange.models import ContractSpec
+    cfg = BotConfig()
+    candles = [Candle(ts=i * 900_000, open=1, high=2, low=0.5, close=1.5, volume=3)
+               for i in range(400)]
+    spec = ContractSpec("BTC-USDT")
+    sim = _SymSim("BTC-USDT", "15m", candles, cfg.strategy, cfg.risk, spec,
+                  5e-4, 1.0, False, use_meta=False)
+    assert sim.brain.use_meta is False
+    sim2 = _SymSim("BTC-USDT", "15m", candles, cfg.strategy, cfg.risk, spec,
+                   5e-4, 1.0, False)
+    assert sim2.brain.use_meta is True, "primary promotion keeps live parity (meta on)"
 
 
 # ----------------------------------------------------------- clock trial cfg

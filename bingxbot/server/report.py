@@ -257,6 +257,27 @@ def build_report(orch) -> str:
     section("META-MODEL (learned P(win) blender)", meta_model)
     section(f"CHAMPION VAULT (top {VAULT_N})", vault)
     section("PER-SYMBOL OVERLAYS", overlays)
+    def shadow():
+        sh = getattr(orch, "shadow", None)
+        if sh is None:
+            return _dump({"running": False,
+                          "clock_trial": orch.cfg.strategy.clock_trial,
+                          "status": getattr(orch, "_shadow_status", "")})
+        spf = sh.portfolio
+        marks = {s: s0.mark_price() for s, s0 in sh.feed.states.items()}
+        return _dump({
+            "running": True,
+            "clock": sh.cfg.strategy.interval,
+            "champion_id": sh.active_champion_id,
+            "equity": round(spf.equity(marks), 4),
+            "starting_balance": spf.starting_balance,
+            "stats": spf.stats(),
+            "open_positions": {s: {"side": p.side, "qty": p.qty, "entry": p.entry_price}
+                               for s, p in spf.positions.items()},
+            "status": getattr(orch, "_shadow_status", ""),
+        })
+
+    section("SHADOW CLOCK (trial-interval live paper race)", shadow)
     section("RADAR (universe + board)", radar)
     section("CARRY DESK", carry)
     section(f"TRACK RECORD (last {RECORD_DAYS_N} days)", record)

@@ -86,15 +86,24 @@ def validate_params(params, valid_candles, symbol, interval, spec, taker, slip,
 
 def validate_params_portfolio(params, candles_by_symbol: dict, interval, specs: dict,
                               taker, slip, base_strat: StrategyConfig,
-                              base_risk: RiskConfig) -> dict:
+                              base_risk: RiskConfig, use_meta: bool = True) -> dict:
     """Score one param-set the way the ACCOUNT actually experiences it: a
     shared-portfolio backtest over the traded basket's window — one equity
     pool, one position cap, correlation haircut, one kill switch. This is the
     promotion gate's unit of evidence; a single-symbol run can flatter a set
-    that the portfolio (which is what compounds) would reject."""
+    that the portfolio (which is what compounds) would reject.
+
+    `use_meta=False` is for the evidence lanes that must judge the CORE brain
+    only: the alt-clock trial and the regime gauntlet. The meta head is
+    trained on the LIVE clock's recent bars — blending it (at its full
+    measured weight) into a 5m validation or a 2021 era measures the model's
+    clock/era mismatch, not the parameter set. Primary promotion keeps
+    use_meta=True: live trades WITH the meta on THIS clock, so the judge must
+    too (parity)."""
     s, r = _apply_params(base_strat, base_risk, params)
     res = run_portfolio_backtest(candles_by_symbol, interval, s, r, specs,
-                                 taker_fee=taker, slippage_bps=slip, warmup=300)
+                                 taker_fee=taker, slippage_bps=slip, warmup=300,
+                                 use_meta=use_meta)
     if "error" in res:
         return {"fitness": -1.0, "stats": {}}
     st = res.get("stats", {})
