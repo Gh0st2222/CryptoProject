@@ -817,7 +817,9 @@ class AutoTuner:
             if not cbs:
                 continue
             specs_map = {s: self.orch.specs.get(s, ContractSpec(s)) for s in cbs}
-            args.append((params, cbs, interval, specs_map, taker, slip, strat, risk))
+            # meta-free: applying TODAY'S meta model to a 2021 era would mix
+            # impossible hindsight into the score — eras judge the core brain
+            args.append((params, cbs, interval, specs_map, taker, slip, strat, risk, False))
             keys.append((name, ck))
         if args:
             res = await self.orch.map_cpu(validate_params_portfolio, args, research=True)
@@ -833,7 +835,7 @@ class AutoTuner:
         med = statistics.median(fits)
         return {"n": len(results), "median": round(med, 3), "worst": round(min(fits), 3),
                 "pf_ge1": pf_ge1, "weak": med < 0.0, "windows": results,
-                "symbols": syms}
+                "symbols": syms, "meta_free": True}
 
     async def _trial_cycle(self) -> None:
         """One research cycle on the TRIAL clock (clock_trial setting): its own
@@ -900,29 +902,36 @@ class AutoTuner:
             return
         specs_map = {s: self.orch.specs.get(s, ContractSpec(s)) for s in cbs_full}
         topk = de.top_k(3)
-        vargs = [(prm, fc, interval, specs_map, taker, slip, strat, risk)
+        # meta-free: the GBM head is trained on the LIVE clock's labels —
+        # blending it (at weight ~0.85) into another clock's validation would
+        # score the mismatch, not the parameters. The trial judges CORE brains.
+        vargs = [(prm, fc, interval, specs_map, taker, slip, strat, risk, False)
                  for prm, _ in topk for fc in folds_cbs]
         vres = await self.orch.map_cpu(validate_params_portfolio, vargs, research=True)
         nfo = len(folds_cbs)
-        best_fit, best_params, best_pf = None, None, 0.0
+        best_fit, best_params, best_stats = None, None, {}
         for i, (prm, _tf) in enumerate(topk):
             rs = vres[i * nfo:(i + 1) * nfo]
             fit = _oos_composite([r["fitness"] for r in rs])
-            pf = float(rs[-1]["stats"].get("profit_factor", 0.0) or 0.0)
+            stats0 = rs[-1]["stats"]
+            pf = float(stats0.get("profit_factor", 0.0) or 0.0)
             if (best_fit is None or fit > best_fit) and pf >= 1.0:
-                best_fit, best_params, best_pf = fit, prm, pf
+                best_fit, best_params, best_stats = fit, prm, stats0
         recorded = None
         if best_params is not None and best_fit is not None and best_fit > MIN_ABS_FITNESS:
             # same promotion floor as the live clock — the vault only ever
             # holds sets that cleared a real bar. Tagged with the trial clock,
-            # they become instant candidates the day the user switches interval.
+            # they become instant candidates the day the user switches
+            # interval. Full newest-fold stats travel with the record: the old
+            # pf-only dict made the vault show wr 0% / 0 trades / PF 999 —
+            # numbers that read like a bug instead of like evidence.
             recorded = self.orch.record_champion(best_params, best_fit,
-                                                 {"profit_factor": best_pf}, clock=interval)
+                                                 best_stats, clock=interval)
         self.last_trial = {
             "ts": int(time.time() * 1000), "clock": interval,
             "generation": de.generation, "population": len(de.pop),
             "best_fitness": round(best_fit, 3) if best_fit is not None else None,
-            "recorded": recorded, "basket": list(cbs_full),
+            "recorded": recorded, "basket": list(cbs_full), "meta_free": True,
         }
         if self.orch._notify:
             await self.orch._notify("autotune")
