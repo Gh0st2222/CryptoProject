@@ -233,6 +233,14 @@ class AutoTuner:
             cfg = self.orch.cfg
             promoted = False
             t0 = time.monotonic()
+            # turning the clock trial OFF takes effect within one loop tick,
+            # not at the next restart: the shadow flattens, finalizes its
+            # record and stops — "off" must mean off.
+            if not cfg.strategy.clock_trial and getattr(self.orch, "shadow", None) is not None:
+                try:
+                    await self.orch.stop_shadow()
+                except Exception as e:  # noqa: BLE001
+                    log.warning("shadow shutdown failed: %s", e)
             if cfg.strategy.auto_tune and self.orch.mode != MODE_IDLE and self.orch.engine is not None:
                 try:
                     # clock trial ON: research time alternates between the live

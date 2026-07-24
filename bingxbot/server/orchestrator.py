@@ -660,6 +660,23 @@ class Orchestrator:
             log.info("shadow clock: hot-swapped to %s champion %s (fit %.2f)",
                      ti, best["id"], best.get("fitness", 0.0))
 
+    async def stop_shadow(self, flatten: bool = True) -> None:
+        """Deliberate end of the race (clock_trial turned OFF): flatten the
+        shadow's paper positions so its record is final, stop the engine, and
+        keep its snapshot + journal in data_cache as the experiment's result.
+        Re-enabling the trial resumes from those files; 'Reset paper account'
+        wipes them."""
+        if self.shadow is None:
+            return
+        try:
+            await self.shadow.stop(flatten=flatten)
+        except Exception as e:  # noqa: BLE001 — ending the race must never wedge the app
+            log.warning("shadow stop failed: %s", e)
+        finally:
+            self.shadow = None
+            self._shadow_status = "off (race ended — record kept in data_cache)"
+            log.info("shadow clock race ended by the user — record kept")
+
     async def _start_shadow(self, champion: dict) -> None:
         import copy
 
