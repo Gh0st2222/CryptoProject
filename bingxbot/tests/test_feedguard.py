@@ -23,20 +23,44 @@ async def test_kline_ts_zero_never_poisons_rollover():
     streamed happily. Good rows after a bad one must still roll over."""
     seen = []
 
-    async def rec(symbol, c):
-        seen.append((c.ts, c.closed))
+    async def rec(symbol, interval, c):
+        seen.append((interval, c.ts, c.closed))
 
     ws = BingXMarketWS("wss://example", on_kline=rec)
     bad = {"o": "1", "h": "1", "l": "1", "c": "1", "v": "0"}          # no T/t at all
     live1 = {"T": 60_000, "o": "1", "h": "2", "l": "1", "c": "2", "v": "3"}
     live2 = {"T": 120_000, "o": "2", "h": "3", "l": "2", "c": "3", "v": "4"}
-    await ws._handle_kline("BTC-USDT", [bad])
-    await ws._handle_kline("BTC-USDT", [live1])
-    await ws._handle_kline("BTC-USDT", [bad])       # mid-stream garbage, same story
-    await ws._handle_kline("BTC-USDT", [live2])
-    closed = [ts for ts, c in seen if c]
+    await ws._handle_kline("BTC-USDT", [bad], "1m")
+    await ws._handle_kline("BTC-USDT", [live1], "1m")
+    await ws._handle_kline("BTC-USDT", [bad], "1m")   # mid-stream garbage, same story
+    await ws._handle_kline("BTC-USDT", [live2], "1m")
+    closed = [ts for _i, ts, c in seen if c]
     assert closed == [60_000], "the first bar must close exactly once on rollover"
-    assert all(ts > 0 for ts, _ in seen), "ts=0 rows must never reach the engine"
+    assert all(ts > 0 for _i, ts, _ in seen), "ts=0 rows must never reach the engine"
+
+
+async def test_dual_interval_klines_never_cross_close():
+    """With the shadow clock subscribed, 5m and 15m streams for the SAME
+    symbol interleave on one socket. Rollover state is keyed per (symbol,
+    interval): a 5m bar's newer open-time must never falsely close a 15m bar."""
+    seen = []
+
+    async def rec(symbol, interval, c):
+        if c.closed:
+            seen.append((interval, c.ts))
+
+    ws = BingXMarketWS("wss://example", on_kline=rec)
+    k15_a = {"T": 900_000, "o": "1", "h": "1", "l": "1", "c": "1", "v": "1"}
+    k5_a = {"T": 1_500_000, "o": "1", "h": "1", "l": "1", "c": "1", "v": "1"}
+    k5_b = {"T": 1_800_000, "o": "1", "h": "1", "l": "1", "c": "1", "v": "1"}
+    k15_b = {"T": 1_800_000, "o": "1", "h": "1", "l": "1", "c": "1", "v": "1"}
+    await ws._handle_kline("BTC-USDT", [k15_a], "15m")
+    await ws._handle_kline("BTC-USDT", [k5_a], "5m")   # newer ts on the OTHER clock
+    assert seen == [], "the 5m stream must not close the 15m bar"
+    await ws._handle_kline("BTC-USDT", [k5_b], "5m")
+    assert seen == [("5m", 1_500_000)]
+    await ws._handle_kline("BTC-USDT", [k15_b], "15m")
+    assert seen == [("5m", 1_500_000), ("15m", 900_000)]
 
 
 class _FakeRest:

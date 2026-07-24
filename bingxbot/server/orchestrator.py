@@ -32,6 +32,10 @@ log = logging.getLogger("orchestrator")
 LIVE_CONFIRM_PHRASE = "TRADE LIVE"
 CHAMPIONS_PATH = ROOT / "data_cache" / "champions.json"
 OVERLAYS_PATH = ROOT / "data_cache" / "overlays.json"
+# the shadow-clock paper account (clock_trial live race) keeps its own files —
+# it must never be able to overwrite the real session's snapshot or journal
+SHADOW_STATE_PATH = ROOT / "data_cache" / "paper_state_shadow.json"
+SHADOW_JOURNAL_PATH = ROOT / "data_cache" / "journal_shadow.jsonl"
 LIVE_FLAG_TTL_MS = 48 * 3600 * 1000   # a live-evidence flag expires after 2 days
 CHAMPIONS_KEEP = 100         # vault capacity
 CHAMPIONS_PROTECT_USED = 15  # the most-used champions are never pruned (proven, not just high-scoring)
@@ -189,6 +193,8 @@ class Orchestrator:
         self._alert_task: asyncio.Task | None = None
         self.scanner = None         # MarketScanner (universe radar), set on engine start
         self.carry = None           # CarryDesk (funding harvest), set on engine start
+        self.shadow = None          # TraderEngine | None — the trial clock's live paper race
+        self._shadow_status = ""
         self._adopt_miss: dict[str, int] = {}   # consecutive radar misses per adopted symbol
         try:
             self.symbol_overlays: dict[str, dict] = json.loads(OVERLAYS_PATH.read_text())
@@ -503,8 +509,14 @@ class Orchestrator:
             recorder = TapeRecorder(_ROOT / self.cfg.data_dir / "tape",
                                     max_disk_mb=self.cfg.tape.max_disk_mb,
                                     book_ms=self.cfg.tape.book_ms)
+        # clock trial ON -> the feed also maintains the trial interval's candle
+        # series (one extra kline subscription per symbol on the same socket),
+        # so the shadow account can trade the same tape on its own clock.
+        alt = (self.cfg.strategy.trial_interval
+               if (self.cfg.strategy.clock_trial
+                   and self.cfg.strategy.trial_interval != s.interval) else None)
         return LiveFeed(rest, self.cfg.exchange.ws_url, self.cfg.symbols,
-                        s.interval, s.warmup_bars, recorder=recorder)
+                        s.interval, s.warmup_bars, recorder=recorder, alt_interval=alt)
 
     # ---------------------------------------------------------------- modes
 
@@ -596,6 +608,7 @@ class Orchestrator:
             self.engine.load_brain_states(snap.get("brains"))
             self.engine.load_entry_contexts(snap.get("entry_ctx"))
         await self.engine.start()
+        await self.maybe_refresh_shadow()   # start the trial clock's live race if it can
 
         from ..engine.autotuner import AutoTuner
         self.autotuner = AutoTuner(self)
@@ -608,7 +621,98 @@ class Orchestrator:
         self.carry.start()
         self._alert_task = asyncio.create_task(self._alert_loop(), name="alert-loop")
 
+    async def maybe_refresh_shadow(self) -> None:
+        """The LIVE half of the clock trial: a paper account trading the best
+        trial-clock champion on the SAME tape, in parallel with the real
+        engine — equity curve vs equity curve, the comparison backtest folds
+        can only approximate. Hard rules: always a PaperBroker (never live
+        orders, whatever the mode), meta-free brains (the meta head belongs to
+        the primary clock), own risk manager, own journal, own snapshot file.
+        Starts lazily the moment the trial records its first champion — an
+        unvalidated parameter set never races — and hot-swaps when the trial
+        finds a better one."""
+        eng = self.engine
+        cfg = self.cfg
+        ti = cfg.strategy.trial_interval
+        feed = getattr(eng, "feed", None) if eng is not None else None
+        if eng is None or not cfg.strategy.clock_trial or ti == cfg.strategy.interval:
+            self._shadow_status = "off"
+            return
+        if getattr(feed, "alt_interval", None) != ti:
+            self._shadow_status = "requires the BingX feed (restart after enabling)"
+            return
+        best = max((c for c in self.champions
+                    if c.get("clock") == ti and c.get("fitness", 0.0) > 0
+                    and not c.get("live_flag")),
+                   key=lambda c: c.get("fitness", 0.0), default=None)
+        if best is None:
+            self._shadow_status = f"waiting for the first {ti} champion (only validated sets race)"
+            return
+        if self.shadow is None:
+            await self._start_shadow(best)
+        elif self.shadow.active_champion_id != best["id"]:
+            from ..engine.backtest import apply_tunables_inplace
+            apply_tunables_inplace(self.shadow.cfg.strategy, self.shadow.cfg.risk,
+                                   best.get("params", {}))
+            self.shadow.hot_swap_params(self.shadow.cfg.strategy)
+            self.shadow.active_champion_id = best["id"]
+            self._shadow_status = f"racing champion {best['id']}"
+            log.info("shadow clock: hot-swapped to %s champion %s (fit %.2f)",
+                     ti, best["id"], best.get("fitness", 0.0))
+
+    async def _start_shadow(self, champion: dict) -> None:
+        import copy
+
+        from ..data.feed import AltClockView
+        from ..engine.backtest import apply_tunables_inplace
+        from ..engine.journal import TradeJournal as _TJ
+        from ..engine.persist import load_paper_state, restore_into
+        eng = self.engine
+        scfg = copy.deepcopy(self.cfg)
+        scfg.strategy.interval = scfg.strategy.trial_interval
+        scfg.strategy.clock_trial = False
+        scfg.strategy.auto_tune = False
+        apply_tunables_inplace(scfg.strategy, scfg.risk, champion.get("params", {}))
+        view = AltClockView(eng.feed, list(self.cfg.symbols))
+        if not view.states:
+            self._shadow_status = "no alt-clock data yet"
+            return
+        pf = Portfolio(self.cfg.paper.starting_balance, mode="paper")
+        spec0 = self.specs.get(self.cfg.symbols[0]) if self.specs else None
+        taker = spec0.taker_fee if spec0 else self.cfg.exchange.taker_fee
+        maker = spec0.maker_fee if spec0 else self.cfg.exchange.maker_fee
+        broker = PaperBroker(pf, eng.feed.states, self.specs,
+                             taker_fee=taker, slippage_bps=self.cfg.paper.slippage_bps,
+                             maker_fee=maker, entry_mode=scfg.strategy.entry_mode,
+                             maker_adverse_bps=scfg.risk.maker_adverse_bps)
+        risk = RiskManager(scfg.risk)
+        snap = load_paper_state(self.cfg.paper.starting_balance, path=SHADOW_STATE_PATH)
+        if snap:
+            restore_into(pf, risk, snap)
+        shadow = TraderEngine(scfg, view, broker, pf, risk, self.specs,
+                              on_update=None, journal=_TJ(SHADOW_JOURNAL_PATH),
+                              persist_path=SHADOW_STATE_PATH, react_enabled=False)
+        for c in shadow.ctx.values():
+            c.brain.use_meta = False   # the meta head belongs to the primary clock
+        shadow.active_champion_id = champion["id"]
+        if snap:
+            shadow.load_brain_states(snap.get("brains"))
+            shadow.load_entry_contexts(snap.get("entry_ctx"))
+        await shadow.start()
+        self.shadow = shadow
+        self._shadow_status = f"racing champion {champion['id']}"
+        log.info("SHADOW CLOCK STARTED: %.0f paper on %s bars, champion %s (fit %.2f)",
+                 self.cfg.paper.starting_balance, scfg.strategy.interval,
+                 champion["id"], champion.get("fitness", 0.0))
+
     async def _stop_engine(self) -> None:
+        if self.shadow is not None:
+            try:
+                await self.shadow.stop(flatten=False)
+            except Exception as e:  # noqa: BLE001 — the shadow must never block shutdown
+                log.warning("shadow stop failed: %s", e)
+            finally:
+                self.shadow = None
         if self._alert_task is not None:
             self._alert_task.cancel()
             try:
@@ -961,6 +1065,24 @@ class Orchestrator:
             if self.carry is not None:
                 self.carry.meta.clear()
             log.info("paper account reset to %.2f", pf.cash)
+        # the shadow account resets WITH the primary: the race only means
+        # something if both cars leave the same start line.
+        try:
+            SHADOW_STATE_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+        if self.shadow is not None:
+            spf = self.shadow.portfolio
+            spf.positions.clear()
+            spf.trades.clear()
+            spf.equity_curve.clear()
+            spf.starting_balance = self.cfg.paper.starting_balance
+            spf.cash = spf.starting_balance
+            spf.funding_paid = 0.0
+            spf.peak_equity = 0.0
+            spf.max_dd = 0.0
+            self.shadow.risk.state = type(self.shadow.risk.state)()
+            self.shadow.risk.health.__init__()
         return {"ok": True}
 
     def apply_params(self, params: dict) -> None:
@@ -1007,6 +1129,21 @@ class Orchestrator:
             d["radar"] = self.scanner.snapshot()
         if self.carry is not None:
             d["carry"] = self.carry.snapshot()
+        if self.shadow is not None:
+            spf = self.shadow.portfolio
+            marks = {s: st.mark_price() for s, st in self.shadow.feed.states.items()}
+            d["shadow"] = {
+                "clock": self.shadow.cfg.strategy.interval,
+                "champion_id": self.shadow.active_champion_id,
+                "equity": round(spf.equity(marks), 4),
+                "starting_balance": spf.starting_balance,
+                "positions": len(spf.positions),
+                "stats": spf.stats(),
+                "status": self._shadow_status,
+            }
+        elif self.cfg.strategy.clock_trial and self.engine is not None:
+            d["shadow"] = {"clock": self.cfg.strategy.trial_interval, "equity": None,
+                           "status": self._shadow_status or "waiting"}
         return d
 
     def hot(self) -> dict:
@@ -1022,10 +1159,12 @@ class Orchestrator:
         # (read by ref). The tape recorder is built with the feed, so toggling
         # it also needs a restart to attach/detach.
         before = (tuple(self.cfg.symbols), self.cfg.feed, self.cfg.strategy.interval,
-                  self.cfg.tape.enabled)
+                  self.cfg.tape.enabled, self.cfg.strategy.clock_trial,
+                  self.cfg.strategy.trial_interval)
         update_config(self.cfg, patch)
         after = (tuple(self.cfg.symbols), self.cfg.feed, self.cfg.strategy.interval,
-                 self.cfg.tape.enabled)
+                 self.cfg.tape.enabled, self.cfg.strategy.clock_trial,
+                 self.cfg.strategy.trial_interval)
         needs_restart = before != after and self.mode != MODE_IDLE
         return {"ok": True, "needs_restart": needs_restart,
                 "config": config_public_dict(self.cfg)}

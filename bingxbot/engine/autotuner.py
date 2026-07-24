@@ -933,6 +933,12 @@ class AutoTuner:
             "best_fitness": round(best_fit, 3) if best_fit is not None else None,
             "recorded": recorded, "basket": list(cbs_full), "meta_free": True,
         }
+        # the live half of the trial: (re)start or hot-swap the shadow paper
+        # account the moment a (better) trial-clock champion exists.
+        try:
+            await self.orch.maybe_refresh_shadow()
+        except Exception as e:  # noqa: BLE001 — the shadow must never break tuning
+            log.warning("shadow refresh failed: %s", e)
         if self.orch._notify:
             await self.orch._notify("autotune")
 

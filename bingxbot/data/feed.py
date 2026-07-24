@@ -51,6 +51,9 @@ class MarketState:
     def __init__(self, symbol: str, capacity: int = 3000):
         self.symbol = symbol
         self.candles = CandleSeries(capacity)
+        # ALT-interval series for the shadow clock (clock_trial): same symbol,
+        # same ticks/book, a second bar clock. None unless the feed enables it.
+        self.candles_alt: CandleSeries | None = None
         # 1m DISPLAY series, aggregated from raw ticks — the chart follows the
         # market at 1m no matter what timeframe the brain trades on.
         self.display = CandleSeries(1500)
@@ -206,11 +209,16 @@ class LiveFeed(BaseFeed):
     """Real BingX market data: REST seed + WebSocket streaming."""
 
     def __init__(self, rest: BingXRest, ws_url: str, symbols: list[str], interval: str,
-                 warmup_bars: int, recorder=None):
+                 warmup_bars: int, recorder=None, alt_interval: str | None = None):
         super().__init__(symbols, interval)
         self.rest = rest
         self.warmup_bars = warmup_bars
         self.recorder = recorder   # TapeRecorder | None — owned: starts/stops with the feed
+        # shadow clock: one EXTRA kline subscription per symbol on the same
+        # socket; ticks/book/depth are shared. Bar events for this clock go to
+        # their own queue so the shadow engine never steals the primary's.
+        self.alt_interval = alt_interval if alt_interval != interval else None
+        self.events_alt: asyncio.Queue[tuple[str, str]] = asyncio.Queue(maxsize=20_000)
         self.ws = BingXMarketWS(
             ws_url,
             on_kline=self._on_kline,
@@ -220,6 +228,8 @@ class LiveFeed(BaseFeed):
         )
         for s in symbols:
             self.ws.subscribe_symbol(s, interval)
+            if self.alt_interval:
+                self.ws.subscribe_kline(s, self.alt_interval)
         self._ctx_task: asyncio.Task | None = None
         self._bar_task: asyncio.Task | None = None
         self._resync_ts: dict[str, float] = {}   # per-symbol resync throttle
@@ -234,6 +244,16 @@ class LiveFeed(BaseFeed):
         if candles:
             candles = candles[:-1]  # last row is the still-open bar
         n = self.states[s].candles.seed(candles)
+        if self.alt_interval:
+            st = self.states[s]
+            st.candles_alt = CandleSeries(3000)
+            try:
+                alt_n = min(max(self.warmup_bars + 60, bars_24h(self.alt_interval) + 1), 1440)
+                ac = await self.rest.klines(s, self.alt_interval, limit=alt_n)
+                if ac:
+                    st.candles_alt.seed(ac[:-1])
+            except Exception as e:  # noqa: BLE001 — the shadow clock must never block the primary
+                log.warning("alt seed %s %s: %s", s, self.alt_interval, e)
         # 1m display backdrop so the chart has history before ticks accumulate
         try:
             disp = await self.rest.klines(s, "1m", limit=400)
@@ -267,6 +287,8 @@ class LiveFeed(BaseFeed):
         if s not in self.symbols:
             self.symbols.append(s)
         await self.ws.subscribe_now(s, self.interval)
+        if self.alt_interval:
+            await self.ws.subscribe_kline_now(s, self.alt_interval)
         return True
 
     async def remove_symbol(self, s: str) -> None:
@@ -302,46 +324,61 @@ class LiveFeed(BaseFeed):
         while True:
             await asyncio.sleep(max(10.0, iv / 6000.0))
             now = now_ms()
-            stale = []
+            stale: list[tuple[str, bool]] = []
             for s in list(self.symbols):
                 st = self.states.get(s)
-                if st is None or len(st.candles) == 0:
+                if st is None:
                     continue
-                if bars_overdue(st.candles.last_ts, now, iv):
-                    stale.append(s)
-            for s in stale:
-                if time.time() - self._resync_ts.get(s, 0.0) < iv / 1000.0:
-                    continue   # one resync attempt per interval per symbol
-                self._resync_ts[s] = time.time()
+                if len(st.candles) and bars_overdue(st.candles.last_ts, now, iv):
+                    stale.append((s, False))
+                if (self.alt_interval and st.candles_alt is not None and len(st.candles_alt)
+                        and bars_overdue(st.candles_alt.last_ts, now,
+                                         interval_ms(self.alt_interval))):
+                    stale.append((s, True))
+            for s, alt in stale:
+                key = f"{s}@{'alt' if alt else 'pri'}"
+                gap_iv = interval_ms(self.alt_interval if alt else self.interval)
+                if time.time() - self._resync_ts.get(key, 0.0) < gap_iv / 1000.0:
+                    continue   # one resync attempt per interval per series
+                self._resync_ts[key] = time.time()
                 try:
-                    n = await self._resync_symbol(s)
-                    log.warning("bar stream stale on %s -> REST resync backfilled %d bars", s, n)
+                    n = await self._resync_symbol(s, alt=alt)
+                    log.warning("bar stream stale on %s (%s) -> REST resync backfilled %d bars",
+                                s, self.alt_interval if alt else self.interval, n)
                 except Exception as e:  # noqa: BLE001 — the watchdog must outlive anything
                     log.warning("bar resync %s failed: %s", s, e)
             if stale and time.time() - self._kick_ts > 180.0:
                 self._kick_ts = time.time()
                 try:
-                    await self.ws.kick(f"kline starvation on {','.join(stale)}")
+                    await self.ws.kick(f"kline starvation on {','.join(s for s, _ in stale)}")
                 except Exception as e:  # noqa: BLE001
                     log.warning("ws kick failed: %s", e)
 
-    async def _resync_symbol(self, s: str) -> int:
+    async def _resync_symbol(self, s: str, alt: bool = False) -> int:
         """REST-backfill closed bars the stream missed and emit a 'bar' event
         for each one stored, so the engine evaluates them in order. The stream
-        is the fast path; REST is the truth path — any gap heals here."""
+        is the fast path; REST is the truth path — any gap heals here. Covers
+        BOTH clocks: the shadow's series starves the same ways the primary's can."""
         st = self.states.get(s)
         if st is None:
             return 0
-        iv = interval_ms(self.interval)
-        gap = (now_ms() - st.candles.last_ts) // iv + 2 if st.candles.last_ts else 3
-        candles = await self.rest.klines(s, self.interval, limit=int(min(max(gap, 3), 1440)))
+        interval = self.alt_interval if alt else self.interval
+        series = st.candles_alt if alt else st.candles
+        if series is None:
+            return 0
+        iv = interval_ms(interval)
+        gap = (now_ms() - series.last_ts) // iv + 2 if series.last_ts else 3
+        candles = await self.rest.klines(s, interval, limit=int(min(max(gap, 3), 1440)))
         if candles:
             candles = candles[:-1]   # last row is the still-open bar
         added = 0
         for c in sorted(candles or [], key=lambda x: x.ts):
-            if st.candles.append(c):
+            if series.append(c):
                 added += 1
-                self._emit("bar", s)
+                if alt:
+                    self._emit_alt("bar", s)
+                else:
+                    self._emit("bar", s)
         return added
 
     async def _poll_context(self) -> None:
@@ -360,9 +397,28 @@ class LiveFeed(BaseFeed):
     def healthy(self) -> bool:
         return self.started and self.ws.connected
 
-    async def _on_kline(self, symbol: str, c: Candle) -> None:
+    def _emit_alt(self, kind: str, symbol: str) -> None:
+        try:
+            self.events_alt.put_nowait((kind, symbol))
+        except asyncio.QueueFull:
+            try:  # drop the oldest; harmless while no shadow engine consumes
+                self.events_alt.get_nowait()
+                self.events_alt.put_nowait((kind, symbol))
+            except asyncio.QueueEmpty:
+                pass
+
+    async def _on_kline(self, symbol: str, interval: str, c: Candle) -> None:
         st = self.states.get(symbol)
         if st is None:
+            return
+        if self.alt_interval and interval == self.alt_interval:
+            if st.candles_alt is None:
+                st.candles_alt = CandleSeries(3000)
+            if c.closed:
+                if st.candles_alt.append(c):
+                    self._emit_alt("bar", symbol)
+            else:
+                st.candles_alt.update_partial(c)
             return
         if c.closed:
             if st.candles.append(c):
@@ -378,6 +434,8 @@ class LiveFeed(BaseFeed):
         if self.recorder is not None:   # enqueue only — a writer THREAD does the IO
             self.recorder.record_trade(symbol, t.ts, t.price, t.qty, t.is_buyer_maker)
         self._emit("tick", symbol)
+        if self.alt_interval:           # the shadow engine manages its stops on ticks too
+            self._emit_alt("tick", symbol)
 
     async def _on_book(self, symbol: str, b: BookTop) -> None:
         st = self.states.get(symbol)
@@ -390,6 +448,49 @@ class LiveFeed(BaseFeed):
         st = self.states.get(symbol)
         if st is not None:
             st.on_depth(d)
+
+
+class _AltStateView:
+    """MarketState proxy for the shadow engine: same symbol, same live ticks,
+    book, flow and derivatives context — but `.candles` is the ALT-interval
+    series. Everything else delegates to the real state."""
+
+    __slots__ = ("_st",)
+
+    def __init__(self, st: MarketState):
+        object.__setattr__(self, "_st", st)
+
+    def __getattr__(self, name):
+        return getattr(self._st, name)
+
+    @property
+    def candles(self) -> CandleSeries:
+        return self._st.candles_alt if self._st.candles_alt is not None else self._st.candles
+
+
+class AltClockView:
+    """Read-only feed facade for the SHADOW engine (clock_trial live race):
+    shares the primary LiveFeed's market states — one websocket, one tape —
+    while presenting the alt-interval candle series and the alt event queue.
+    start/stop are no-ops: the REAL feed's lifecycle belongs to the primary
+    engine, and the shadow must never be able to take it down."""
+
+    def __init__(self, feed: LiveFeed, symbols: list[str]):
+        self._feed = feed
+        self.interval = feed.alt_interval or feed.interval
+        self.symbols = [s for s in symbols if s in feed.states]
+        self.states = {s: _AltStateView(feed.states[s]) for s in self.symbols}
+        self.events = feed.events_alt
+        self.started = True
+
+    def healthy(self) -> bool:
+        return self._feed.healthy()
+
+    async def start(self) -> None:
+        pass
+
+    async def stop(self) -> None:
+        pass
 
 
 class SyntheticFeed(BaseFeed):
