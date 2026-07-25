@@ -412,6 +412,7 @@ function renderAutotuner(){
     ["DE generation",at.generation??"—"],
     ["Population",at.population??"—"],
     ["Research cores",at.research_cores??"—"],
+    ["Research duty",at.duty!=null?`${Math.round(at.duty*100)}%`:"—"],
     ["Researching",at.research_symbol||"—"],
     ["Cycles run",at.cycles],
     ["Improvements",at.improvements],
@@ -457,6 +458,8 @@ function renderSettings(){
   $("cfg-adopt").value=c.strategy.adopt_symbols??2;
   $("cfg-clocktrial").checked=!!c.strategy.clock_trial; $("cfg-trialint").value=c.strategy.trial_interval||"5m";
   if(c.tape) $("cfg-tape").checked=!!c.tape.enabled;
+  const duty=c.strategy.research_duty??0.28;
+  $("cfg-duty").value=duty; $("cfg-duty-val").textContent=`${Math.round(duty*100)}%`;
   if(c.carry){ $("cfg-carry").checked=c.carry.enabled; $("cfg-carrymax").value=c.carry.max_positions; }
   $("cfg-keys").textContent=c.has_keys?"configured ✓":"not set (paper/backtest only)"; $("cfg-keys").style.color=c.has_keys?"var(--good)":"";
   $("auto-params").innerHTML=AUTO_PARAMS.map(([k,lab,grp])=>{
@@ -590,13 +593,15 @@ document.querySelectorAll(".tab").forEach(b=>{ b.onclick=()=>{
   if(b.dataset.tab==="record") loadRecord();
 }; });
 document.querySelectorAll('[data-page="settings"] input, [data-page="settings"] select').forEach(el=>el.addEventListener("input",()=>{settingsDirty=true;}));
+$("cfg-duty").addEventListener("input",()=>{ $("cfg-duty-val").textContent=`${Math.round($("cfg-duty").value*100)}%`; });
 $("cfg-save").onclick=async()=>{
   const patch={ symbols:$("cfg-symbols").value.split(",").map(s=>s.trim().toUpperCase()).filter(Boolean),
     radar_extra:$("cfg-radarextra").value.split(",").map(s=>s.trim().toUpperCase()).filter(Boolean),
     feed:$("cfg-feed").value, allow_live:$("cfg-allowlive").checked,
     strategy:{ interval:$("cfg-interval").value, auto_tune:$("cfg-autotune").checked,
       adopt_symbols:parseInt($("cfg-adopt").value,10),
-      clock_trial:$("cfg-clocktrial").checked, trial_interval:$("cfg-trialint").value },
+      clock_trial:$("cfg-clocktrial").checked, trial_interval:$("cfg-trialint").value,
+      research_duty:parseFloat($("cfg-duty").value) },
     tape:{ enabled:$("cfg-tape").checked },
     risk:{ min_leverage:parseInt($("cfg-levmin").value,10), max_leverage:parseInt($("cfg-levmax").value,10),
       max_daily_loss_pct:parseFloat($("cfg-dayloss").value), max_risk_hard_pct:parseFloat($("cfg-hardrisk").value),

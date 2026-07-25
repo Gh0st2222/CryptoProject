@@ -60,6 +60,12 @@ class StrategyConfig:
     # act on the evidence the user switches `interval` deliberately.
     clock_trial: bool = False
     trial_interval: str = "5m"
+    # research duty: the fraction of wall time the auto-tuner may spend
+    # computing (the rest is sleep). User-owned, live-applied — the dashboard
+    # slider re-paces the tuner within seconds, no restart. Clamped 0.10-0.50
+    # at use: below, research crawls; above, the multiple-testing deflator
+    # eats the extra cycles and the machine just runs hot.
+    research_duty: float = 0.28
     trend_align_gate: bool = True   # in trends, only trade with multi-TF alignment
     discipline: bool = True         # regime-appropriate entries (the big anti-bleed fix)
     min_efficiency: float = 0.35    # trend entries need this Kaufman efficiency ratio
@@ -253,7 +259,7 @@ _NESTED_USER_OWNED = {
     # auto_tune is user-owned (Settings toggle) — a migration must not silently
     # re-enable a tuner the user turned off.
     "strategy": {"interval", "warmup_bars", "adopt_symbols", "auto_tune",
-                 "clock_trial", "trial_interval"},
+                 "clock_trial", "trial_interval", "research_duty"},
     "tape": {"enabled", "max_disk_mb", "book_ms"},
     # leverage band and max_open_positions intentionally omitted so migrating an
     # old config picks up the current defaults (2-7x band, 3 concurrent tokens);
