@@ -10,7 +10,6 @@ import os
 import sys
 import time
 import uuid
-from pathlib import Path
 
 from ..config import (ROOT, BotConfig, FEED_SYNTHETIC, MODE_IDLE, MODE_LIVE, MODE_PAPER,
                       config_public_dict, load_config, save_config, update_config)
@@ -176,6 +175,12 @@ class Orchestrator:
         self.autotuner = None       # set lazily to avoid import cycle
         self.specs: dict[str, ContractSpec] = {}
         self.jobs: dict[str, Job] = {}
+        # Strong references to in-flight job tasks. The event loop keeps only a
+        # WEAK reference to a task, so one that is suspended — and these suspend
+        # for minutes inside run_cpu — can be garbage collected mid-execution if
+        # nothing else holds it. The Job object being referenced is not enough;
+        # the task itself has to be.
+        self._job_tasks: set[asyncio.Task] = set()
         self.listeners: set[asyncio.Queue] = set()
         self.mode = MODE_IDLE
         self._switch_lock = asyncio.Lock()
@@ -228,6 +233,13 @@ class Orchestrator:
         except Exception as e:  # noqa: BLE001
             log.warning("process pools unavailable (%s); using threads", e)
             self.pool = self.research_pool = None
+
+    def _spawn_job(self, coro, name: str) -> asyncio.Task:
+        """Start a background job and HOLD a reference until it finishes."""
+        task = asyncio.get_running_loop().create_task(coro, name=name)
+        self._job_tasks.add(task)
+        task.add_done_callback(self._job_tasks.discard)
+        return task
 
     def _pool_for(self, research: bool):
         self._ensure_pools()
@@ -841,7 +853,7 @@ class Orchestrator:
                 job.error = str(e)
             await self._notify("job")
 
-        asyncio.get_running_loop().create_task(runner())
+        self._spawn_job(runner(), name=f"job-{job.kind}")
         return job
 
     def start_optimizer(self, symbol: str, interval: str, days: float,
@@ -872,7 +884,7 @@ class Orchestrator:
                 job.error = str(e)
             await self._notify("job")
 
-        asyncio.get_running_loop().create_task(runner())
+        self._spawn_job(runner(), name=f"job-{job.kind}")
         return job
 
     def start_walkforward(self, symbol: str, interval: str, days: float,
@@ -902,7 +914,7 @@ class Orchestrator:
                 job.error = str(e)
             await self._notify("job")
 
-        asyncio.get_running_loop().create_task(runner())
+        self._spawn_job(runner(), name=f"job-{job.kind}")
         return job
 
     def start_portfolio_backtest(self, symbols: list[str], interval: str, days: float,
@@ -941,7 +953,7 @@ class Orchestrator:
                 job.error = str(e)
             await self._notify("job")
 
-        asyncio.get_running_loop().create_task(runner())
+        self._spawn_job(runner(), name=f"job-{job.kind}")
         return job
 
     def start_carry_lab(self, days: float = 60.0, top_n: int = 6) -> Job:
@@ -999,7 +1011,7 @@ class Orchestrator:
                 job.error = str(e)
             await self._notify("job")
 
-        asyncio.get_running_loop().create_task(runner())
+        self._spawn_job(runner(), name=f"job-{job.kind}")
         return job
 
     def _save_overlays(self) -> None:
