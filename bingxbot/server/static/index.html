@@ -407,6 +407,10 @@
           <label class="check"><input type="checkbox" id="cfg-clocktrial"> clock trial — research an alternate bar clock in parallel</label>
           <div class="ff"><label>Trial clock</label><select class="btn" id="cfg-trialint"><option>1m</option><option>3m</option><option>5m</option><option>15m</option><option>30m</option></select></div>
           <label class="check"><input type="checkbox" id="cfg-tape"> record BingX tape (own tick archive, disk-capped)</label>
+          <label class="check"><input type="checkbox" id="cfg-makerexit"> maker exits — rest the profit target instead of market-closing it</label>
+          <div class="hint">Saves ~0.04% of notional per target exit, but only applies to trades that
+            carry a fixed target. With no target cap set, exits are trail/stop — which cannot rest on the
+            book — so this earns nothing until the strategy uses targets.</div>
           <div class="ff"><label>Research duty — CPU share the tuner may use (live, no restart)</label>
             <div style="display:flex;align-items:center;gap:10px">
               <input type="range" id="cfg-duty" min="0.10" max="0.50" step="0.01" style="flex:1">

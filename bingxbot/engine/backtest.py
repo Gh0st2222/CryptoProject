@@ -231,6 +231,7 @@ class _SymSim:
         self.maker_adv = risk_cfg.maker_adverse_bps / 10_000.0
         self.maker_off = strat.maker_offset_bps / 10_000.0
         self.is_maker = strat.entry_mode == "maker"
+        self.maker_exits = bool(getattr(strat, "maker_exits", False))
         self.fees_rt = taker_fee + (self.maker_fee if self.is_maker else taker_fee)
         self.pending = None
         self.bars_held = 0
@@ -359,20 +360,19 @@ class _SymSim:
                               "stop" if not pos.breakeven_moved else "trail stop", marks,
                               slip_mult=STOP_SLIP_MULT)
             elif tp > 0 and ((h[i] >= tp) if d > 0 else (l[i] <= tp)):
-                # TAKER, like live. The design intended a resting maker target
-                # and this line modelled one — but the engine never places it:
-                # _on_tick watches price and calls broker.close_position(),
-                # which is a MARKET order in paper and live alike. So the
-                # simulator was crediting the profit target with maker fees and
-                # an exact fill while the account pays taker plus slippage.
-                # On the scalp archetype (target ~1.1 ATR) that gap is ~40% of
-                # the gross target in a quiet market — precisely the archetype
-                # whose economics decide whether range trading is viable, so
-                # the flattery was concentrated exactly where it could do the
-                # most damage. Earning the maker side back means posting a real
-                # resting exit order; until the engine does that, the honest
-                # number is the one the account actually pays.
-                self.close_at(i, pf, risk, tp, "target", marks)
+                # The profit target is either a RESTING post-only order that the
+                # engine actually places (maker fee, fills at its own price, but
+                # only once price trades THROUGH it — a touch leaves us in the
+                # queue), or a market close on touch (taker + slippage). The
+                # simulator must model whichever the engine is really doing, so
+                # both branches are gated by the same setting the engine reads.
+                if self.maker_exits:
+                    thru = FILL_THROUGH_BPS / 10_000.0
+                    filled = (h[i] >= tp * (1 + thru)) if d > 0 else (l[i] <= tp * (1 - thru))
+                    if filled:
+                        self.close_at(i, pf, risk, tp, "target", marks, maker=True)
+                else:
+                    self.close_at(i, pf, risk, tp, "target", marks)
             pos = pf.positions.get(sym)
 
         # 3) brain (precomputed alpha scores when the frame is shared)

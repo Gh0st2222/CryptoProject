@@ -22,8 +22,9 @@ from ..strategy.brain import TradingBrain
 from ..strategy.exits import AdaptiveExitManager
 from ..strategy.features import FeatureFrame, mtf_from_row
 from ..util import now_ms
-from .backtest import (ASSUMED_SPREAD_BPS, FUNDING_MS, _entry_signal_ok,
-                       gate_ev, gate_funding, gate_mtf_veto, gate_regime)
+from .backtest import (ASSUMED_SPREAD_BPS, FILL_THROUGH_BPS, FUNDING_MS,
+                       _entry_signal_ok, gate_ev, gate_funding, gate_mtf_veto,
+                       gate_regime)
 from .brokers import Broker, LiveBroker
 from .portfolio import Portfolio
 from .refusals import RefusalLedger, gate_label
@@ -87,6 +88,7 @@ class SymbolCtx:
         self.gates: list[dict] = []   # live entry-gate X-ray [{n, ok, d}] for the UI
         self.busy = False  # guards against overlapping broker calls
         self.pending_task: asyncio.Task | None = None  # resting pullback-limit entry
+        self.maker_exit = False       # a post-only profit target is resting on the book
 
     def set_stage(self, stage: str) -> None:
         self.stage = stage
@@ -521,6 +523,19 @@ class TraderEngine:
         if not res.ok:
             return
         self.settle_risk()
+        # the resting target was sized for the WHOLE position; re-arm it for
+        # what is left, or it would try to close more than we still hold
+        pos_left = self.portfolio.positions.get(symbol)
+        if ctx is not None and ctx.maker_exit:
+            ctx.maker_exit = False
+            if pos_left is not None and pos_left.take_profit > 0:
+                try:
+                    ctx.maker_exit = await self.broker.arm_maker_exit(
+                        symbol, pos_left.side, pos_left.qty, pos_left.take_profit)
+                except Exception:  # noqa: BLE001
+                    log.exception("re-arming maker exit failed for %s", symbol)
+            else:
+                await self.broker.cancel_maker_exit(symbol)
         pos = self.portfolio.positions.get(symbol)   # None => degraded to full close
         trades = self.portfolio.trades
         if trades:
@@ -670,6 +685,18 @@ class TraderEngine:
         if pos is not None:
             pos.style = style
             self.exits.attach(pos, atr, init_risk)
+            # rest the profit target on the book so the exit EARNS the maker
+            # fee instead of paying taker plus the spread. If the exchange
+            # won't take the order we simply don't arm it, and the tick
+            # watcher below market-closes on touch exactly as it always has.
+            ctx.maker_exit = False
+            if self.cfg.strategy.maker_exits and pos.take_profit > 0:
+                try:
+                    ctx.maker_exit = await self.broker.arm_maker_exit(
+                        symbol, side, pos.qty, pos.take_profit)
+                except Exception:  # noqa: BLE001 — never let an exit order kill an entry
+                    log.exception("arming maker exit failed for %s", symbol)
+                    ctx.maker_exit = False
         ctx.entry_ctx = self._entry_context(ctx, ev, row)
         self._push_tape(symbol, "OPEN", side, res.filled_price,
                         {"p_win": round(ev.get("p_win", 0.0), 3), "edge": round(ev.get("edge", 0.0), 3)})
@@ -826,6 +853,28 @@ class TraderEngine:
             finally:
                 ctx.busy = False
         elif pos.take_profit > 0 and (price - pos.take_profit) * d >= 0:
+            # With a resting post-only target the exit is EARNED, not taken:
+            # the tape must trade THROUGH our price (the same margin the entry
+            # side demands) before we may call it filled, and it fills at our
+            # price for the maker fee. A mere touch means we are still sitting
+            # in the queue — the position stays open and the trail owns it.
+            # In LIVE that order is really on the book, so the exchange fills
+            # it and reconcile books the close; here we only simulate.
+            if ctx.maker_exit:
+                if not isinstance(self.broker, LiveBroker):
+                    # FILL_THROUGH_BPS, not the spread constant: this is the
+                    # simulator's resting-limit fill margin and it must stay
+                    # bolted to it, or paper and backtest drift the day either
+                    # number is retuned.
+                    thru = pos.take_profit * (1 + d * FILL_THROUGH_BPS / 10_000.0)
+                    if (price - thru) * d >= 0:
+                        ctx.busy = True
+                        try:
+                            await self._close(symbol, "target (maker exit)",
+                                              maker_price=pos.take_profit)
+                        finally:
+                            ctx.busy = False
+                return
             ctx.busy = True
             try:
                 await self._close(symbol, "take profit")
@@ -874,12 +923,14 @@ class TraderEngine:
         if abs(edge) >= thr:
             ctx.last_entry_block = "signal live — decides at bar close"
 
-    async def _close(self, symbol: str, reason: str) -> None:
+    async def _close(self, symbol: str, reason: str, maker_price: float | None = None) -> None:
         ctx = self.ctx.get(symbol)
         if ctx:
             ctx.set_stage("SETTLE")
-        res = await self.broker.close_position(symbol, reason)
+        res = await self.broker.close_position(symbol, reason, maker_price=maker_price)
         if res.ok:
+            if ctx:
+                ctx.maker_exit = False
             trades = self.portfolio.trades
             if trades:
                 self.settle_risk()   # exactly-once risk accounting for this close

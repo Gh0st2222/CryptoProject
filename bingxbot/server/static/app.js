@@ -469,6 +469,7 @@ function renderSettings(){
   $("cfg-adopt").value=c.strategy.adopt_symbols??2;
   $("cfg-clocktrial").checked=!!c.strategy.clock_trial; $("cfg-trialint").value=c.strategy.trial_interval||"5m";
   if(c.tape) $("cfg-tape").checked=!!c.tape.enabled;
+  $("cfg-makerexit").checked=c.strategy.maker_exits!==false;
   const duty=c.strategy.research_duty??0.28;
   $("cfg-duty").value=duty; $("cfg-duty-val").textContent=`${Math.round(duty*100)}%`;
   if(c.carry){ $("cfg-carry").checked=c.carry.enabled; $("cfg-carrymax").value=c.carry.max_positions; }
@@ -613,7 +614,8 @@ $("cfg-save").onclick=async()=>{
     strategy:{ interval:$("cfg-interval").value, auto_tune:$("cfg-autotune").checked,
       adopt_symbols:parseInt($("cfg-adopt").value,10),
       clock_trial:$("cfg-clocktrial").checked, trial_interval:$("cfg-trialint").value,
-      research_duty:parseFloat($("cfg-duty").value) },
+      research_duty:parseFloat($("cfg-duty").value),
+      maker_exits:$("cfg-makerexit").checked },
     tape:{ enabled:$("cfg-tape").checked },
     risk:{ min_leverage:parseInt($("cfg-levmin").value,10), max_leverage:parseInt($("cfg-levmax").value,10),
       max_daily_loss_pct:parseFloat($("cfg-dayloss").value), max_risk_hard_pct:parseFloat($("cfg-hardrisk").value),

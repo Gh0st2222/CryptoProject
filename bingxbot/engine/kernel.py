@@ -88,7 +88,7 @@ PARAM_NAMES = (
     "scalp_sl_atr", "scalp_time_stop", "scalp_expected_rr", "maker_adverse_bps",
     "max_open_positions", "max_daily_loss_pct", "max_consecutive_losses",
     "cooldown_minutes", "max_spread_bps", "scaleout_rr", "scaleout_frac",
-    "trail_scale_trend", "trail_scale_chop",
+    "trail_scale_trend", "trail_scale_chop", "maker_exits",
 )
 P = {n: i for i, n in enumerate(PARAM_NAMES)}
 
@@ -165,6 +165,8 @@ def run_kernel(feats, amat, regs, p, warmup, taker, maker_fee, slip_bps,
     eta = p[P_ETA]
     floor_w = p[P_FLOOR]
     slip = slip_bps / 10_000.0
+    mk_exit = p[P_MKEXIT] > 0.5          # resting post-only profit target
+    tp_thru = FILL_THROUGH_BPS / 10_000.0
     maker_adv = p[P_MADV] / 10_000.0
     maker_off = p[P_MOFF] / 10_000.0
     is_maker = p[P_ISMAKER] > 0.5
@@ -412,12 +414,22 @@ def run_kernel(feats, amat, regs, p, warmup, taker, maker_fee, slip_bps,
                     killed = True
                 has_pos = False
                 bars_held = 0
-            elif pos_tp > 0 and ((hi >= pos_tp) if pos_long else (lo <= pos_tp)):
-                # TAKER + slippage — mirror of backtest.close_at(maker=False).
-                # The engine market-closes the profit target; crediting it with
-                # maker fees flattered the scalp archetype most of all.
-                px = pos_tp * (1.0 - slip) if pos_long else pos_tp * (1.0 + slip)
-                fee = pos_qty * px * taker
+            # mirror of backtest._SymSim.step's target branch: a RESTING
+            # post-only exit earns the maker fee and fills at its OWN price,
+            # but only once price trades THROUGH it (a touch leaves us in the
+            # queue); otherwise the engine market-closes on touch and pays
+            # taker plus slippage. The trade-through requirement lives in the
+            # branch condition so the accounting body below is shared.
+            elif pos_tp > 0 and (
+                    ((hi >= pos_tp * (1.0 + tp_thru)) if pos_long else (lo <= pos_tp * (1.0 - tp_thru)))
+                    if mk_exit else
+                    ((hi >= pos_tp) if pos_long else (lo <= pos_tp))):
+                if mk_exit:
+                    px = pos_tp
+                    fee = pos_qty * px * maker_fee
+                else:
+                    px = pos_tp * (1.0 - slip) if pos_long else pos_tp * (1.0 + slip)
+                    fee = pos_qty * px * taker
                 gross = (px - pos_entry) * pos_qty * d
                 cash += gross - fee
                 net = gross - (pos_entry_fee + fee)
@@ -971,6 +983,7 @@ P_DAYLOSS = P["max_daily_loss_pct"]; P_MAXLOSS = P["max_consecutive_losses"]
 P_COOL = P["cooldown_minutes"]; P_MAXSPR = P["max_spread_bps"]
 P_SORR = P["scaleout_rr"]; P_SOFRAC = P["scaleout_frac"]
 P_TRSTREND = P["trail_scale_trend"]; P_TRSCHOP = P["trail_scale_chop"]
+P_MKEXIT = P["maker_exits"]
 
 
 def kernel_fitness(ff, strat, risk, spec, taker: float, slip_bps: float,
