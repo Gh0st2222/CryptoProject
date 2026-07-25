@@ -265,12 +265,21 @@ class AutoTuner:
             cycle_s = time.monotonic() - t0
             # duty-cycle pacing: the sleep stretches with how long the cycle
             # actually took, so research never monopolizes a slow host — a 4-min
-            # cycle is followed by a ~7-min breather, while a 10s cycle keeps
-            # the old fast cadence.
-            gap = max(GAP_FAST if promoted else GAP_SLOW,
-                      cycle_s * (1.0 - DUTY_CYCLE) / DUTY_CYCLE)
-            self.next_run_ts = time.time() + gap
-            await asyncio.sleep(gap)
+            # cycle is followed by a breather sized by the LIVE research_duty
+            # setting. The sleep runs in short slices that re-read the setting,
+            # so the dashboard slider re-paces even a gap already in progress:
+            # turning the dial acts within seconds, never after the old gap.
+            slept = time.monotonic()
+            while self.running:
+                duty = clamp(float(getattr(cfg.strategy, "research_duty", DUTY_CYCLE) or DUTY_CYCLE),
+                             0.10, 0.50)
+                gap = max(GAP_FAST if promoted else GAP_SLOW,
+                          cycle_s * (1.0 - duty) / duty)
+                remaining = gap - (time.monotonic() - slept)
+                self.next_run_ts = time.time() + max(0.0, remaining)
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(5.0, remaining))
 
     def _universe(self) -> list[str]:
         """The research universe: the radar's ACTUAL top-10 BingX perps by 24h
@@ -1028,6 +1037,8 @@ class AutoTuner:
             "research_cores": self.orch.research_workers,
             "research_symbol": self.research_symbol,
             "next_run_ts": int(self.next_run_ts * 1000),
+            "duty": round(clamp(float(getattr(self.orch.cfg.strategy, "research_duty",
+                                              DUTY_CYCLE) or DUTY_CYCLE), 0.10, 0.50), 2),
             "last_cycle": self.last_cycle,
             "last_trial": self.last_trial,
             "clock_trial": self.orch.cfg.strategy.clock_trial,
