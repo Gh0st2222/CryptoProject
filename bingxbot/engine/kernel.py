@@ -413,8 +413,11 @@ def run_kernel(feats, amat, regs, p, warmup, taker, maker_fee, slip_bps,
                 has_pos = False
                 bars_held = 0
             elif pos_tp > 0 and ((hi >= pos_tp) if pos_long else (lo <= pos_tp)):
-                px = pos_tp
-                fee = pos_qty * px * maker_fee
+                # TAKER + slippage — mirror of backtest.close_at(maker=False).
+                # The engine market-closes the profit target; crediting it with
+                # maker fees flattered the scalp archetype most of all.
+                px = pos_tp * (1.0 - slip) if pos_long else pos_tp * (1.0 + slip)
+                fee = pos_qty * px * taker
                 gross = (px - pos_entry) * pos_qty * d
                 cash += gross - fee
                 net = gross - (pos_entry_fee + fee)

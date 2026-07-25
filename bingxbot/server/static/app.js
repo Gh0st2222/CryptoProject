@@ -1078,6 +1078,14 @@ function renderProgress(){
          <div class="ai">${ic}</div><div class="an">${nm}</div></div>`).join("");
     _achFresh.clear();   // the pop animation plays once, on first sight
   }
+  const ref=$("refusals"), rf=S?.engine?.refusals;
+  if(ref) ref.innerHTML=!rf?.gates?.length
+    ? `<div class="cr"><span>${rf?.pending?`${rf.pending} pending · ${rf.graded||0} graded`:"no refusals graded yet"}</span><b>—</b></div>`
+    : rf.gates.map(g=>{
+        const m=g.mean_move_atr, cls=m>0.15?"pnl-pos":m<-0.15?"pnl-neg":"";
+        return `<div class="cr" title="${g.refused} refused · ${(g.win_rate*100).toFixed(0)}% went the signal's way">
+          <span>${esc(g.gate)}</span><b class="${cls}">${fmt.signed(m,2)} ATR <span style="color:var(--muted)">×${g.refused}</span></b></div>`;
+      }).join("");
   const car=$("career");
   if(car) car.innerHTML=[
     ["Rank",`${op.title} · L${op.lvl}`],["Total XP",op.xp.toLocaleString()],

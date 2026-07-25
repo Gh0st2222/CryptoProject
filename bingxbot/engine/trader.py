@@ -26,6 +26,7 @@ from .backtest import (ASSUMED_SPREAD_BPS, FUNDING_MS, _entry_signal_ok,
                        gate_ev, gate_funding, gate_mtf_veto, gate_regime)
 from .brokers import Broker, LiveBroker
 from .portfolio import Portfolio
+from .refusals import RefusalLedger, gate_label
 
 log = logging.getLogger("trader")
 
@@ -132,6 +133,10 @@ class TraderEngine:
         # just before it, not whatever the feed rolls to seconds after.
         self._funding_ms = now_ms()
         self._funding_rates: dict[str, float | None] = {}
+        # what the gates turn away, graded on the brain's own horizon — the only
+        # way to tell a gate that saves money from one that starves the account
+        self.refusals = RefusalLedger(horizon=cfg.strategy.horizon_bars)
+        self._bar_idx: dict[str, int] = {}
 
     def _interval_ms(self) -> int:
         from ..util import interval_ms
@@ -463,6 +468,11 @@ class TraderEngine:
         pos = self.portfolio.positions.get(symbol)
         if pos is None:
             self._build_gates(ctx, st, row, ev)
+        # one monotonic bar counter per symbol — the clock the refusal ledger
+        # grades on, matched to the brain's own horizon
+        bidx = self._bar_idx.get(symbol, 0) + 1
+        self._bar_idx[symbol] = bidx
+        self.refusals.mature(symbol, row.get("close", 0.0), bidx)
         ctx.busy = True
         try:
             if pos is not None:
@@ -472,6 +482,14 @@ class TraderEngine:
             else:
                 ctx.bars_held = 0
                 await self._try_enter(ctx, st, row, ev)
+                # the brain wanted this direction and something said no: record
+                # it so the gate can eventually be judged on what it discarded
+                if (self.portfolio.positions.get(symbol) is None
+                        and ctx.pending_task is None
+                        and abs(ev.get("edge", 0.0)) >= ev.get("threshold", 1.0)):
+                    self.refusals.record(symbol, gate_label(ctx.last_entry_block),
+                                         1 if ev["edge"] > 0 else -1,
+                                         row.get("close", 0.0), row.get("atr", 0.0), bidx)
         finally:
             ctx.busy = False
         if self.on_update:
@@ -942,6 +960,7 @@ class TraderEngine:
             "portfolio": self.portfolio.to_dict(marks),
             "risk": self.risk.status(),
             "equity_curve": list(self.portfolio.equity_curve)[-600:],
+            "refusals": self.refusals.snapshot(),
             "trades": [dc_asdict(t) for t in self.portfolio.trades[-80:]],
         }
 

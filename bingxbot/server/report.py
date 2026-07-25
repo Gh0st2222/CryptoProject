@@ -277,6 +277,18 @@ def build_report(orch) -> str:
             "status": getattr(orch, "_shadow_status", ""),
         })
 
+    def refusals():
+        """What the entry gates turned away, graded on the brain's horizon.
+        DIRECTIONAL outcome only — no exits, fees or fills are simulated — so
+        read it as 'was the signal this gate discarded right or wrong?', not
+        as PnL. A mean move near zero means the gate is filtering noise; a
+        clearly positive mean over a real sample means it is filtering edge."""
+        eng = orch.engine
+        if eng is None or not hasattr(eng, "refusals"):
+            return _dump({"available": False})
+        return _dump(eng.refusals.snapshot())
+
+    section("REFUSED SIGNALS (gate opportunity cost)", refusals)
     section("SHADOW CLOCK (trial-interval live paper race)", shadow)
     section("RADAR (universe + board)", radar)
     section("CARRY DESK", carry)
