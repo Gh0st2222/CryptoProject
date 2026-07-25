@@ -149,6 +149,17 @@ class RiskManager:
 
     def _roll_day(self, equity: float) -> None:
         day = time.strftime("%Y-%m-%d", time.gmtime(self.clock()))
+        # Heal a missing anchor. The daily-loss kill is written
+        # `if day_start_equity > 0: dd = -day_realized / day_start_equity`, so a
+        # zero anchor does not fail loudly — it skips the check, and the limit
+        # simply stops existing for the rest of the day. That is reachable
+        # without any corruption: restore a snapshot whose day_key is still
+        # today and the roll below is skipped, so whatever anchor came out of
+        # the file is the one we keep. Re-anchoring on current equity is
+        # approximate; having no daily-loss limit is not an option.
+        if self.state.day_key == day and self.state.day_start_equity <= 0 and equity > 0:
+            self.state.day_start_equity = equity
+            log.warning("daily-loss anchor was missing — re-anchored at %.2f", equity)
         if day != self.state.day_key:
             old = self.state
             self.state = RiskState(day_key=day, day_start_equity=equity)

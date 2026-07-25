@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 from pathlib import Path
 
 from ..config import ROOT
@@ -77,15 +78,32 @@ def load_paper_state(starting_balance: float, path: Path = STATE_PATH) -> dict |
     return d
 
 
+def _num(x, default: float) -> float:
+    """A snapshot number, or `default` if it is not a real one.
+
+    json.dumps writes NaN/Infinity as bare literals and json.loads reads them
+    back, so a single non-finite value that reaches the file survives every
+    restart. The dangerous one is day_start_equity: the daily-loss kill
+    computes `dd = -day_realized / day_start_equity`, and a NaN there makes
+    `dd >= max_daily_loss_pct` False forever — the kill switch quietly stops
+    existing, with nothing in the logs to say so."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return default
+    return v if math.isfinite(v) else default
+
+
 def restore_into(portfolio, risk, snapshot: dict) -> int:
     """Apply a snapshot onto a fresh Portfolio + RiskManager. Returns the number
     of open positions restored."""
-    portfolio.cash = float(snapshot.get("cash", portfolio.cash))
-    portfolio.funding_paid = float(snapshot.get("funding_paid", 0.0))
-    portfolio.peak_equity = float(snapshot.get("peak_equity", 0.0))
-    portfolio.max_dd = float(snapshot.get("max_dd", 0.0))
+    portfolio.cash = _num(snapshot.get("cash"), portfolio.cash)
+    portfolio.funding_paid = _num(snapshot.get("funding_paid"), 0.0)
+    portfolio.peak_equity = _num(snapshot.get("peak_equity"), 0.0)
+    portfolio.max_dd = _num(snapshot.get("max_dd"), 0.0)
     portfolio.trades = [_build(TradeRecord, t) for t in snapshot.get("trades", [])]
-    curve = [(int(ts), float(eq)) for ts, eq in snapshot.get("equity_curve", [])]
+    curve = [(int(ts), float(eq)) for ts, eq in snapshot.get("equity_curve", [])
+             if math.isfinite(_num(eq, math.nan))]
     try:
         portfolio.equity_curve.extend(curve)
     except AttributeError:
@@ -98,10 +116,33 @@ def restore_into(portfolio, risk, snapshot: dict) -> int:
             n += 1
         except (TypeError, ValueError) as e:
             log.warning("could not restore position %s: %s", pd.get("symbol"), e)
+    # Restore risk state by FIELD TYPE, not by blind setattr. This is the
+    # safety state — the kill switch, the daily-loss anchor, the loss-streak
+    # cooldown — and a value the live code could never produce must not be able
+    # to enter through a file. A non-finite day_start_equity in particular
+    # disables the daily-loss kill silently and permanently.
     rs = snapshot.get("risk", {})
-    for k, v in rs.items():
-        if hasattr(risk.state, k):
-            setattr(risk.state, k, v)
+    if isinstance(rs, dict):
+        # Coerce by the DECLARED field type, not by whatever the field happens
+        # to hold right now — an int sitting in a float field would otherwise
+        # make the next restore truncate it. `from __future__ import
+        # annotations` means f.type is the annotation's source text.
+        types = {f.name: str(f.type) for f in dataclasses.fields(risk.state)}
+        for k, v in rs.items():
+            kind = types.get(k)
+            if kind is None:
+                continue
+            try:
+                if kind == "bool":
+                    setattr(risk.state, k, bool(v))
+                elif kind == "int":
+                    setattr(risk.state, k, int(v))
+                elif kind == "float":
+                    setattr(risk.state, k, _num(v, getattr(risk.state, k)))
+                elif kind == "str":
+                    setattr(risk.state, k, str(v))
+            except (TypeError, ValueError):
+                log.warning("ignored unusable risk field %s=%r in snapshot", k, v)
     # restore the throttle's memory FIRST (recent R window + equity peak),
     # then re-anchor on current cash so drawdown math continues from here.
     risk.health.load_state(snapshot.get("health"))
