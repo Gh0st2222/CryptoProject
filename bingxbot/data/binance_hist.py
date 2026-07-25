@@ -22,6 +22,7 @@ from pathlib import Path
 
 from ..config import ROOT
 from ..exchange.models import Candle
+from ..util import atomic_write
 
 log = logging.getLogger("binance_hist")
 
@@ -116,8 +117,11 @@ async def fetch_month(symbol_bx: str, interval: str, ym: str,
         if not candles:
             return None
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text)
+            # Atomic. parse_kline_csv deliberately SKIPS malformed lines, so a
+            # cache torn by a crash does not fail — it silently yields a short
+            # month, and the gauntlet then scores a champion on incomplete
+            # history and reports a verdict nobody can tell is wrong.
+            atomic_write(path, text)
         except OSError:
             pass   # cache is an optimization; the parse already succeeded
         return candles

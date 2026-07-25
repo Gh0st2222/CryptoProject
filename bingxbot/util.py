@@ -77,6 +77,16 @@ class Ewma:
         self.value: float | None = None
 
     def update(self, x: float) -> float:
+        # A non-finite sample is ignored rather than absorbed. An EWMA is
+        # recursive, so one NaN does not pass through — it STICKS:
+        # nan + alpha*(x - nan) is nan for every sample after it, forever.
+        # These carry the live microstructure (book imbalance, spread,
+        # CVD slope, tick rate) into the alphas and the meta model, so a
+        # single bad frame would otherwise silently disable a desk for the
+        # rest of the process's life. Keeping the last good value degrades;
+        # absorbing it does not recover.
+        if not math.isfinite(x):
+            return self.value if self.value is not None else 0.0
         self.value = x if self.value is None else self.value + self.alpha * (x - self.value)
         return self.value
 

@@ -186,7 +186,12 @@ def alpha_flow(row, micro, ctx) -> float:
     """Aggressor trade-flow imbalance + CVD-slope agreement. [live]"""
     flow = micro.get("flow", 0.0)
     slope = micro.get("cvd_slope", 0.0)
-    if abs(flow) < 0.1:
+    # _fin FIRST. A guard written only as `if abs(flow) < 0.1: return 0.0`
+    # fails OPEN on NaN, because every comparison with NaN is False — so a bad
+    # micro sample fell straight through to the return and handed the fusion a
+    # NaN edge. The other 17 alphas all check finiteness explicitly; these two
+    # were the exceptions.
+    if not _fin(flow, slope) or abs(flow) < 0.1:
         return 0.0
     agree = 1.0 if flow * slope > 0 else 0.55
     return clamp(flow * agree * 1.2, -1, 1)
@@ -196,7 +201,9 @@ def alpha_cvd_trend(row, micro, ctx) -> float:
     """Cumulative-volume-delta slope as a standalone momentum-of-flow. [live]"""
     slope = micro.get("cvd_slope", 0.0)
     tps = micro.get("ticks_per_s", 0.0)
-    if abs(slope) < 1e-9 or tps <= 0:
+    # see alpha_flow: neither `abs(slope) < 1e-9` nor `tps <= 0` is True for a
+    # NaN, so both guards failed open together
+    if not _fin(slope, tps) or abs(slope) < 1e-9 or tps <= 0:
         return 0.0
     return clamp(math.tanh(slope * 2.5), -1, 1)
 
@@ -204,7 +211,9 @@ def alpha_cvd_trend(row, micro, ctx) -> float:
 def alpha_spread_pressure(row, micro, ctx) -> float:
     """Tight spread + one-sided flow = clean directional pressure. [live]"""
     spread, flow, obi = micro.get("spread_bps", 99), micro.get("flow", 0), micro.get("obi", 0)
-    if spread > 4.0:
+    # see alpha_flow: `if spread > 4.0` is False for NaN, so an unusable book
+    # read used to reach the return instead of abstaining
+    if not _fin(spread, flow, obi) or spread > 4.0:
         return 0.0
     lean = 0.6 * flow + 0.4 * obi
     if abs(lean) < 0.18:
