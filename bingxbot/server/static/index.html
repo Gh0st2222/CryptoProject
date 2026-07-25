@@ -14,6 +14,16 @@
   <div id="mode-pill" class="pill idle"><span class="dot"></span><span id="mode-text">IDLE</span></div>
   <div class="feed"><span id="feed-dot" class="dot"></span><span id="feed-label">feed</span></div>
   <div class="feed">⏱ <span id="lat">— ms</span></div>
+  <!-- operator rank: real work the machine has done (graded calls, closed
+       trades, promoted champions) expressed as a level + XP bar -->
+  <div class="oprank" id="op-rank" title="Operator rank — earned from graded predictions, closed trades and promoted champions">
+    <div class="op-badge"><span id="op-lvl">1</span></div>
+    <div class="op-meta">
+      <div class="op-title" id="op-title">ROOKIE</div>
+      <div class="op-xp"><i id="op-xp-fill"></i></div>
+    </div>
+    <div class="op-streak" id="op-streak" title="Current winning streak"><span class="fl">🔥</span><span id="op-streak-n">0</span></div>
+  </div>
   <div class="tstats">
     <div class="tstat"><div class="k">Equity</div><div class="v" id="t-eq">—</div></div>
     <div class="tstat"><div class="k">Day PnL</div><div class="v" id="t-day">—</div></div>
@@ -56,7 +66,24 @@
     <div class="col col-b">
       <section class="panel cortex-panel">
         <div class="phead"><h2>Neural cortex — live</h2><span class="right" id="cortex-cap">—</span></div>
-        <div class="cortex-body"><canvas id="cortex"></canvas></div>
+        <!-- three stacked layers, cheapest first: a STATIC canvas (mesh, rings,
+             regime wash — repainted only when the layout or regime changes), the
+             ANIMATED canvas (glow, pulses, arcs), and a DOM text overlay. Text
+             lives in the DOM because rasterizing strokeText/fillText every frame
+             was the single most expensive thing the cortex did; as elements the
+             browser caches and GPU-composites them, and recolouring a firing
+             alpha is a class flip. -->
+        <div class="cortex-body">
+          <canvas id="cortex-bg"></canvas>
+          <canvas id="cortex"></canvas>
+          <div id="cortex-hud" aria-hidden="true">
+            <div id="hud-edge" class="hud-edge">+0.00</div>
+            <div id="hud-sub" class="hud-sub">P —</div>
+            <div id="hud-regime" class="hud-regime">◆ RANGE</div>
+            <div id="hud-armed" class="hud-armed">⚡ ARMED</div>
+            <div id="hud-labels"></div>
+          </div>
+        </div>
       </section>
 
       <section class="panel">
@@ -122,6 +149,7 @@
   <section class="panel" style="margin-top:12px">
     <div class="tabs">
       <button class="tab active" data-tab="positions">Positions</button>
+      <button class="tab" data-tab="progress">Progress</button>
       <button class="tab" data-tab="trades">Trades</button>
       <button class="tab" data-tab="backtest">Backtest</button>
       <button class="tab" data-tab="portfolio">Portfolio</button>
@@ -144,6 +172,25 @@
         <button class="btn sm" id="btn-reset-kill">Reset kill switch</button>
         <button class="btn sm danger" id="btn-paper-reset" title="Wipe the persisted paper session and start the account fresh">Reset paper account</button>
         <button class="btn sm" id="btn-report" title="Download a full diagnostic resume.txt (portfolio, brains, tuner, journal — no secrets) to share for analysis">Report resume</button>
+      </div>
+    </div>
+
+    <!-- PROGRESS: the machine's campaign map. Everything here is derived from
+         real state (journal, vault, tuner, shadow race) — no invented scores. -->
+    <div class="tab-page" data-page="progress">
+      <div class="prog-grid">
+        <div class="prog-col">
+          <div class="prog-head">Active missions <span class="muted-s">— what the machine is working toward</span></div>
+          <div id="missions" class="missions"></div>
+        </div>
+        <div class="prog-col">
+          <div class="prog-head">Achievements <span class="muted-s" id="ach-count"></span></div>
+          <div id="achievements" class="ach-grid"></div>
+        </div>
+        <div class="prog-col">
+          <div class="prog-head">Career record</div>
+          <div id="career" class="career"></div>
+        </div>
       </div>
     </div>
 

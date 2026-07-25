@@ -34,6 +34,23 @@ except Exception:  # noqa: BLE001 — the brain must run without the ML stack
     _get_meta = None
     _meta_features = None
 
+# how far the meta head may move the odds on its own, in log-odds. 1.5 is a
+# ~4.5x odds swing before the skill weight scales it down — enough for a real
+# opinion, bounded so a single confident tree can never gate the account shut.
+META_MAX_SHIFT = 1.5
+
+
+def _logit(p: float) -> float:
+    p = min(max(p, 1e-6), 1.0 - 1e-6)
+    return math.log(p / (1.0 - p))
+
+
+def _sigmoid(z: float) -> float:
+    if z >= 0:
+        return 1.0 / (1.0 + math.exp(-z))
+    e = math.exp(z)
+    return e / (1.0 + e)
+
 
 @dataclass
 class AlphaStat:
@@ -176,8 +193,32 @@ class TradingBrain:
                     else:
                         self.meta_p = m.predict_one(_meta_features(row, micro, ctx, edge, regime))
                         self._meta_key, self._meta_cached = key, self.meta_p
-                    w = m.blend_weight
-                    p_win = clamp(w * self.meta_p + (1 - w) * p_win, 0.05, 0.95)
+                    # ODDS-SPACE combination, not a linear average. The two
+                    # opinions answer DIFFERENT questions with different base
+                    # rates: the calibrator estimates P(direction correct over
+                    # the horizon) — graded that way, base rate ~0.5 — while
+                    # the meta estimates P(barrier win) under a fixed labeling
+                    # geometry whose base rate is ~0.25. Averaging them
+                    # linearly dragged p_win onto the meta's scale EXACTLY
+                    # when a trade was being considered (the meta is only
+                    # consulted near the gate), so min_p_win and the EV floor
+                    # were being asked to clear a bar the number could no
+                    # longer reach — the machine sat flat for days with
+                    # "P 14% < min 52%". Only the model's DEVIATION from its
+                    # own base rate is transferable evidence, and that is
+                    # exactly what its AUC credentials (ranking skill is
+                    # invariant to monotone recalibration). At meta_p equal to
+                    # its base rate the model abstains; above it, it raises the
+                    # odds; below, it lowers them — scaled by measured skill
+                    # and clamped so one confident tree can never veto alone.
+                    # 0.5 is the neutral fallback for a model object that
+                    # carries no base rate (only reachable for non-MetaModel
+                    # stubs — SCHEMA_VER 3 makes the field mandatory on disk).
+                    base = getattr(m, "base_rate", 0.5)
+                    shift = clamp(_logit(self.meta_p) - _logit(base),
+                                  -META_MAX_SHIFT, META_MAX_SHIFT)
+                    p_win = clamp(_sigmoid(_logit(p_win) + m.blend_weight * shift),
+                                  0.05, 0.95)
             except Exception:  # noqa: BLE001 — a broken model must never block trading
                 pass
 

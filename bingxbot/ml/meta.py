@@ -41,7 +41,9 @@ from ..config import ROOT
 log = logging.getLogger("meta")
 
 MODEL_PATH = ROOT / "data_cache" / "meta_model.pkl"
-SCHEMA_VER = 2   # v2: labeler decoupled from the live config (fixed LABEL_THRESHOLD)
+SCHEMA_VER = 3   # v3: model carries its own BASE RATE (the blend combines it as
+                 # evidence in odds space, not as a same-scale probability) and
+                 # the labeler's profit barrier is a fixed constant
 MIN_AUC = 0.53          # below this the model has no measured skill -> no vote
 MIN_SAMPLES = 3000
 LABEL_THRESHOLD = 0.10  # the LABELER's own fixed candidate bar. The dataset must
@@ -55,6 +57,15 @@ LABEL_THRESHOLD = 0.10  # the LABELER's own fixed candidate bar. The dataset mus
 CAND_EDGE_FRAC = 0.8    # candidate = |edge| >= this x LABEL_THRESHOLD
 BARRIER_RISK_ATR = 1.8  # risk unit for labeling, mid of the sl_atr search box
 MAX_HOLD_BARS = 96      # time barrier for labeling
+LABEL_RR = 2.0          # the LABELER's own fixed profit barrier, in risk units.
+                        # It used to be risk.expected_rr — TUNER-OWNED — so every
+                        # champion swap silently redefined what "a win" meant and
+                        # moved the dataset's base rate under the model. Same
+                        # doctrine as LABEL_THRESHOLD: the label is a fixed
+                        # yardstick; what varies is the live geometry that queries
+                        # it. (The blend uses the model as a RELATIVE signal
+                        # against its own base rate, so this constant only has to
+                        # be stable, not equal to any champion's payoff target.)
 
 # Feature vector — one list, used by BOTH the dataset builder and live scoring,
 # so train and trade can never disagree about what a column means. Missing
@@ -162,7 +173,7 @@ def build_samples(candles: list, interval: str, strat, risk) -> tuple[np.ndarray
         if abs(edge) < CAND_EDGE_FRAC * LABEL_THRESHOLD:
             continue
         lab = triple_barrier_label(o, h, l, i, 1 if edge > 0 else -1,
-                                   BARRIER_RISK_ATR * row.get("atr", 0.0), risk.expected_rr)
+                                   BARRIER_RISK_ATR * row.get("atr", 0.0), LABEL_RR)
         if lab is None:
             continue
         X.append(features_from(row, NO_MICRO, {}, edge, ev["regime"]))
@@ -176,12 +187,18 @@ class MetaModel:
     """Persisted GBM + its credentials (held-out AUC, sample count)."""
 
     def __init__(self, model, auc: float, n: int, trained_ts: float,
-                 feature_names: list[str]):
+                 feature_names: list[str], base_rate: float = 0.5):
         self.model = model
         self.auc = auc
         self.n = n
         self.trained_ts = trained_ts
         self.feature_names = feature_names
+        # the training set's win rate — the model's own centre of mass. The
+        # brain needs it because the meta answers a DIFFERENT question than the
+        # online calibrator (barrier win vs directional correctness) with a
+        # different base rate; only the deviation from this reference is
+        # transferable evidence.
+        self.base_rate = float(base_rate) if 0.0 < float(base_rate) < 1.0 else 0.5
 
     @property
     def ready(self) -> bool:
@@ -203,7 +220,8 @@ class MetaModel:
         with tmp.open("wb") as f:
             pickle.dump({"schema": SCHEMA_VER, "model": self.model, "auc": self.auc,
                          "n": self.n, "trained_ts": self.trained_ts,
-                         "feature_names": self.feature_names}, f)
+                         "feature_names": self.feature_names,
+                         "base_rate": self.base_rate}, f)
         tmp.replace(path)
 
     @staticmethod
@@ -216,7 +234,8 @@ class MetaModel:
         if d.get("schema") != SCHEMA_VER or d.get("feature_names") != FEATURE_NAMES:
             return None         # feature vector changed between builds -> retrain
         return MetaModel(d["model"], float(d["auc"]), int(d["n"]),
-                         float(d.get("trained_ts", 0.0)), d["feature_names"])
+                         float(d.get("trained_ts", 0.0)), d["feature_names"],
+                         base_rate=float(d.get("base_rate", 0.5)))
 
 
 def _fill_allnan_cols(X: np.ndarray) -> np.ndarray:
@@ -255,7 +274,8 @@ def train(X: np.ndarray, y: np.ndarray) -> MetaModel | None:
     # refit on everything so live uses all the data; the credential stays the
     # honest walk-forward number, never the refit's in-sample flattery.
     m.fit(_fill_allnan_cols(X), y)
-    return MetaModel(m, auc=auc, n=n, trained_ts=time.time(), feature_names=list(FEATURE_NAMES))
+    return MetaModel(m, auc=auc, n=n, trained_ts=time.time(),
+                     feature_names=list(FEATURE_NAMES), base_rate=float(y.mean()))
 
 
 def train_from_candles(candles_by_symbol: dict, interval: str, strat, risk,
@@ -284,7 +304,7 @@ def train_from_candles(candles_by_symbol: dict, interval: str, strat, risk,
     mm.save(path)
     return {"trained": True, "auc": round(mm.auc, 4), "n": int(len(y)),
             "ready": mm.ready, "weight": round(mm.blend_weight, 3),
-            "base_rate": round(float(y.mean()), 4)}
+            "base_rate": round(mm.base_rate, 4)}
 
 
 # ------------------------------------------------- mtime-cached process loader
