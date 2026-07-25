@@ -161,7 +161,7 @@ input.field { width: 100%; font-family: var(--mono); }
   .grid { grid-template-columns: minmax(0,1.04fr) minmax(0,0.9fr) minmax(0,0.92fr); }
   #chart-main { height: 336px; }
   #chart-equity { height: 96px; }
-  #cortex { height: 640px; }
+  #cortex, #cortex-bg { height: 640px; }
   .tab-page { max-height: 33vh; overflow-y: auto; }
   .col-c .pbody { max-height: 700px; overflow-y: auto; }
 }
@@ -388,5 +388,88 @@ input.field { width: 100%; font-family: var(--mono); }
 .cortex-panel .phead { border-bottom: 1px solid var(--border); }
 .cortex-body { position: relative; padding: 0; contain: layout paint; }
 #cortex { display: block; width: 100%; height: 560px; background: transparent;
-  will-change: transform; transform: translateZ(0); }
+  will-change: transform; transform: translateZ(0); position: relative; z-index: 1; }
+/* the STATIC layer: mesh, rings, regime wash. Painted only when the layout or
+   regime changes, then composited by the GPU for free — it used to be blitted
+   over the whole canvas on every single frame. */
+#cortex-bg { position: absolute; inset: 0; width: 100%; height: 560px; display: block;
+  z-index: 0; pointer-events: none; }
+/* the TEXT layer. Canvas strokeText/fillText was the cortex's most expensive
+   raster work (re-rasterized per frame, up to 19 alpha labels + HUD); as DOM
+   it is cached, GPU-composited, crisper, and a "firing" alpha is a class flip. */
+#cortex-hud { position: absolute; inset: 0; z-index: 2; pointer-events: none;
+  font-family: var(--mono); contain: layout style;
+  opacity: 0; transition: opacity .35s ease; }   /* revealed once laid out, so
+  the readouts never flash un-positioned in the corner on first paint */
+#cortex-hud.ready { opacity: 1; }
+#cortex-hud > div { position: absolute; transform: translate(-50%, -50%); white-space: nowrap; }
+.hud-edge { font-weight: 800; letter-spacing: -.5px; line-height: 1;
+  text-shadow: 0 0 10px currentColor, 0 0 2px rgba(3,5,9,.95), 0 2px 6px rgba(0,0,0,.9); }
+.hud-sub { color: #d5e3f0; font-weight: 700; text-shadow: 0 2px 5px rgba(0,0,0,.9); }
+.hud-regime { font-weight: 700; letter-spacing: .8px; text-shadow: 0 2px 5px rgba(0,0,0,.9); }
+.hud-armed { font-weight: 800; letter-spacing: 1.6px; opacity: 0; transition: opacity .18s ease; }
+.hud-armed.on { opacity: 1; animation: armedPulse 1.15s ease-in-out infinite; }
+@keyframes armedPulse { 0%,100% { filter: brightness(1); } 50% { filter: brightness(1.65); } }
+.hud-lab { position: absolute; transform: translate(-50%, -50%); white-space: nowrap;
+  font-weight: 700; color: #8fa0bb; text-shadow: 0 1px 4px rgba(3,5,9,.95);
+  transition: color .2s ease, text-shadow .2s ease; }
+.hud-lab.fire { text-shadow: 0 0 10px currentColor, 0 1px 4px rgba(3,5,9,.95); }
+.hud-desk { position: absolute; transform: translate(-50%, -50%); white-space: nowrap;
+  font-weight: 800; letter-spacing: .6px; text-shadow: 0 1px 5px rgba(3,5,9,.95); }
 #cortex-cap { font-family: var(--mono); color: var(--muted); font-size: 10px; letter-spacing: .5px; }
+
+/* ---------------------------------------------------- operator rank (topbar) */
+.oprank { display: flex; align-items: center; gap: 8px; padding: 3px 10px 3px 3px;
+  border: 1px solid var(--border); border-radius: 20px; background: rgba(10,14,22,.6); }
+.op-badge { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center;
+  font-family: var(--mono); font-weight: 800; font-size: 11px; color: #041018;
+  background: linear-gradient(140deg, var(--accent), var(--accent-2));
+  box-shadow: 0 0 12px rgba(0,210,255,.45); }
+.op-meta { display: flex; flex-direction: column; gap: 3px; min-width: 74px; }
+.op-title { font-family: var(--mono); font-size: 8.5px; letter-spacing: 1.1px; color: var(--ink2); }
+.op-xp { height: 4px; border-radius: 2px; background: var(--baseline); overflow: hidden; }
+.op-xp i { display: block; height: 100%; width: 0%; border-radius: 2px;
+  background: linear-gradient(90deg, var(--accent), var(--good));
+  transition: width .5s cubic-bezier(.22,.9,.3,1); }
+.op-streak { display: flex; align-items: center; gap: 3px; font-family: var(--mono);
+  font-size: 11px; font-weight: 700; color: var(--muted); }
+.op-streak.hot { color: #ffb03a; text-shadow: 0 0 10px rgba(255,176,58,.55); }
+.op-streak .fl { filter: grayscale(1); opacity: .45; }
+.op-streak.hot .fl { filter: none; opacity: 1; animation: flame 1.5s ease-in-out infinite; }
+@keyframes flame { 0%,100% { transform: scale(1) } 50% { transform: scale(1.22) } }
+
+/* ---------------------------------------------------- progress / gamification */
+.prog-grid { display: grid; grid-template-columns: 1.15fr 1.35fr .9fr; gap: 14px; }
+@media (max-width: 1200px) { .prog-grid { grid-template-columns: 1fr; } }
+.prog-head { font-family: var(--mono); font-size: 10px; letter-spacing: 1.2px;
+  text-transform: uppercase; color: var(--accent-2); margin-bottom: 8px; }
+.muted-s { color: var(--muted); text-transform: none; letter-spacing: 0; }
+.missions { display: flex; flex-direction: column; gap: 7px; }
+.mission { border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px;
+  background: rgba(12,16,26,.55); }
+.mission.done { border-color: rgba(0,224,160,.35); background: rgba(0,224,160,.06); }
+.mission .mt { display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
+  font-size: 11.5px; color: var(--ink); }
+.mission .mv { font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
+.mission .mbar { height: 5px; margin-top: 6px; border-radius: 3px; background: var(--baseline); overflow: hidden; }
+.mission .mbar i { display: block; height: 100%; border-radius: 3px; background: var(--accent);
+  transition: width .6s cubic-bezier(.22,.9,.3,1); }
+.mission.done .mbar i { background: var(--good); }
+.mission .mw { margin-top: 5px; font-size: 10px; color: var(--muted); }
+.ach-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); gap: 7px; }
+.ach { border: 1px solid var(--border); border-radius: 8px; padding: 8px 5px; text-align: center;
+  background: rgba(12,16,26,.5); opacity: .38; filter: grayscale(1);
+  transition: opacity .25s ease, filter .25s ease, transform .18s ease, border-color .25s ease; }
+.ach .ai { font-size: 19px; line-height: 1.15; }
+.ach .an { font-family: var(--mono); font-size: 8.5px; letter-spacing: .4px; color: var(--ink2); margin-top: 3px; }
+.ach.got { opacity: 1; filter: none; border-color: rgba(0,210,255,.4);
+  box-shadow: 0 0 16px rgba(0,210,255,.12) inset; }
+.ach.got:hover { transform: translateY(-2px); border-color: var(--accent); }
+.ach.fresh { animation: achPop .7s cubic-bezier(.2,1.5,.4,1); }
+@keyframes achPop { 0% { transform: scale(.4) rotate(-12deg); opacity: 0 }
+  60% { transform: scale(1.14) rotate(3deg); opacity: 1 } 100% { transform: scale(1) } }
+.career { display: flex; flex-direction: column; gap: 6px; font-family: var(--mono); font-size: 11px; }
+.career .cr { display: flex; justify-content: space-between; gap: 10px;
+  padding: 5px 8px; border-radius: 5px; background: rgba(12,16,26,.5); }
+.career .cr b { color: var(--ink); font-weight: 700; }
+.career .cr span { color: var(--muted); }

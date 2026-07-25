@@ -108,13 +108,19 @@ def test_build_samples_decoupled_from_live_threshold():
 
 def test_brain_blends_meta_when_ready(monkeypatch, tmp_path):
     """With a ready model on disk the brain's P(win) must move toward the
-    model's opinion near the gate zone; use_meta=False must bypass it."""
+    model's opinion near the gate zone; use_meta=False must bypass it.
+
+    The model's opinion is now read RELATIVE to its own base rate (see
+    test_meta_blend.py): 0.92 against a 0.25 base rate is strong evidence FOR
+    the trade, so P(win) must rise well above the calibrator's own number —
+    what it must NOT do is import the labeler's 0.25-centred scale."""
     from bingxbot.ml import meta as meta_mod
     from bingxbot.strategy.brain import TradingBrain
 
     class _Fake:
         ready = True
         blend_weight = 0.8
+        base_rate = 0.25        # every real MetaModel carries this (schema v3)
 
         def predict_one(self, x):
             return 0.92

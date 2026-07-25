@@ -109,10 +109,20 @@ function renderTop(){
 }
 let autoFollow=true;   // the chart follows whatever symbol the machine is looking at
 function engineSymbols(){ const es=S?.engine?.symbols; return es?Object.keys(es):symbols(); }
+/* Auto-follow with HYSTERESIS. focus_symbol is "whichever symbol is closest to
+   firing", which can flip between two near-threshold symbols on consecutive
+   0.4s pushes — and every flip used to reload 500 candles + all markers into
+   the chart, the most expensive single operation in the UI. A new focus must
+   now hold for FOCUS_HOLD_MS before the chart follows it. */
+const FOCUS_HOLD_MS=4000;
+let _focusCand=null,_focusSince=0;
 function followFocus(){
   if(!autoFollow) return;
   const f=S?.engine?.focus;
-  if(f&&f!==curSymbol&&S?.engine?.symbols?.[f]) setSymbol(f);
+  if(!f||!S?.engine?.symbols?.[f]||f===curSymbol){ _focusCand=null; return; }
+  const now=performance.now();
+  if(_focusCand!==f){ _focusCand=f; _focusSince=now; return; }
+  if(now-_focusSince>=FOCUS_HOLD_MS){ _focusCand=null; setSymbol(f); }
 }
 function renderSymTabs(){
   const wrap=$("sym-tabs"), syms=engineSymbols();
@@ -477,13 +487,14 @@ function renderBottomTab(page){
   if(!S) return;
   if(page==="positions"){ if(S.engine) renderPositions(); }
   else if(page==="trades"){ if(S.engine) renderTrades(); }
+  else if(page==="progress"){ renderProgress(); }
   else if(page==="autotuner"){ renderAutotuner(); renderChampions(); }
   else if(page==="radar"){ renderRadar(); }
   else if(page==="settings"){ renderSettings(); }
 }
 function renderAll(){
   if(!S) return;
-  renderTop(); renderSymTabs(); renderTape();
+  renderTop(); renderRank(); pollAchievements(); renderSymTabs(); renderTape();
   if(S.engine){ renderPipeline(); renderBrain(); renderEquity();
     cortexFeed();
     const tc=S.engine.portfolio.stats.trades; refreshCandles(false).then(()=>{lastTradeCount=tc;}); }
@@ -945,6 +956,148 @@ function renderAnalytics(d){
   $("an-hour").innerHTML=anRows(s.by_hour); $("an-side").innerHTML=anRows(s.by_side);
 }
 
+/* ==================== OPERATOR PROGRESSION ====================================
+   A game layer over REAL work — nothing here is invented or cosmetic-only:
+   every point, badge and mission reads state the engine already publishes
+   (graded predictions, closed trades, vault champions, tuner generations,
+   gauntlet verdicts, the shadow race). The point is to make "is this thing
+   actually getting better?" legible at a glance. */
+const RANKS=[[0,"ROOKIE"],[500,"ANALYST"],[1500,"TRADER"],[3500,"SPECIALIST"],
+             [7000,"STRATEGIST"],[13000,"PORTFOLIO MGR"],[22000,"QUANT"],
+             [36000,"MARKET MAKER"],[60000,"ALPHA"],[95000,"LEGEND"]];
+function xpBreakdown(){
+  const eng=S?.engine, at=S?.autotuner, st=eng?.portfolio?.stats;
+  let graded=0; for(const s of Object.values(eng?.symbols||{})) graded+=s?.brain?.graded||0;
+  const trades=st?.trades||0;
+  const wins=Math.round((st?.win_rate||0)*trades);
+  const champs=(S?.champions||[]).length;
+  const gens=at?.generation||0;
+  // weights: learning is the grind, a WIN is the payoff, a champion is a
+  // milestone. Deliberately not PnL-scaled — a $100 account shouldn't rank
+  // lower than the same machine on $10k for identical work.
+  return [["graded predictions",graded,2],["closed trades",trades,25],
+          ["winning trades",wins,60],["vault champions",champs,180],
+          ["DE generations",gens,4]];
+}
+function operator(){
+  const parts=xpBreakdown();
+  const xp=parts.reduce((a,[,n,w])=>a+n*w,0);
+  let i=0; while(i+1<RANKS.length&&xp>=RANKS[i+1][0]) i++;
+  const base=RANKS[i][0], next=i+1<RANKS.length?RANKS[i+1][0]:null;
+  return {xp,lvl:i+1,title:RANKS[i][1],base,next,parts,
+          pct:next?clamp((xp-base)/(next-base),0,1):1};
+}
+function streaks(){
+  const tr=S?.engine?.trades||[];
+  let cur=0,best=0,run=0;
+  for(const t of tr){ if(t.pnl>0){ run++; best=Math.max(best,run); } else run=0; }
+  cur=run;
+  return {cur,best};
+}
+/* achievements: [id, icon, name, unlocked?, hint] */
+function achievements(){
+  const eng=S?.engine, st=eng?.portfolio?.stats, at=S?.autotuner;
+  const ch=S?.champions||[], sk=streaks();
+  let graded=0; for(const s of Object.values(eng?.symbols||{})) graded+=s?.brain?.graded||0;
+  const meta=at?.meta?.model, up=(Date.now()-(eng?.started_ts||Date.now()))/3600000;
+  const gaunt=ch.find(c=>c.gauntlet&&!c.gauntlet_weak);
+  const funded=Math.abs(st?.funding_paid||0)>1e-9;
+  return [
+    ["first_blood","🩸","FIRST BLOOD",(st?.trades||0)>=1,"Close your first trade"],
+    ["ten","🎯","TEN DOWN",(st?.trades||0)>=10,"Close 10 trades"],
+    ["fifty","💯","FIFTY",(st?.trades||0)>=50,"Close 50 trades"],
+    ["green","📈","IN THE GREEN",(st?.total_pnl||0)>0,"Finish net positive"],
+    ["pf","⚖️","EDGE PROVEN",(st?.trades||0)>=20&&(st?.profit_factor||0)>=1.2,"PF ≥ 1.2 over 20+ trades"],
+    ["streak3","🔥","HAT-TRICK",sk.best>=3,"Win 3 trades in a row"],
+    ["streak5","🌋","ON FIRE",sk.best>=5,"Win 5 trades in a row"],
+    ["champ","👑","FIRST CHAMPION",ch.length>=1,"The tuner promotes a champion"],
+    ["vault","🏛️","VAULT KEEPER",ch.length>=5,"Bank 5 champions"],
+    ["gauntlet","🛡️","BATTLE TESTED",!!gaunt,"A champion survives the regime gauntlet"],
+    ["brain","🧠","SELF-TAUGHT",graded>=500,"500 graded predictions"],
+    ["ml","🤖","ML ONLINE",!!(meta&&meta.ready),"Meta-model earns its credentials"],
+    ["gen","🧬","EVOLVER",(at?.generation||0)>=100,"100 DE generations"],
+    ["uptime","⏱️","MARATHON",up>=24,"24h of continuous operation"],
+    ["funding","💰","CARRY COLLECTED",funded,"Settle perp funding"],
+    ["shadow","👻","THE RACE",!!(S?.shadow&&S.shadow.equity!=null),"Start the shadow-clock race"],
+  ].filter(Boolean);
+}
+function missions(){
+  const eng=S?.engine, st=eng?.portfolio?.stats, at=S?.autotuner;
+  const ch=S?.champions||[], out=[];
+  const active=ch.find(c=>c.active);
+  const push=(t,have,need,note)=>out.push({t,have,need,note,
+    pct:need>0?clamp(have/need,0,1):1,done:have>=need});
+  // probation: the real gate on full-size risk
+  if(active){
+    const need=active.gauntlet_weak?16:8, have=(active.live?.trades)||0;
+    push(`Clear probation — ${esc(active.id)}`,have,need,
+      active.gauntlet_weak?"weak gauntlet → double proof required, trading at ½ size"
+                          :"trading at ½ size until proven live");
+  }
+  const warm=Object.values(eng?.symbols||{});
+  if(warm.length){
+    const b=Math.min(...warm.map(s=>s.bars||0)), need=warm[0]?.warmup_bars||350;
+    if(b<need) push("Warm up the brains",b,need,"bars of history before the gates arm");
+  }
+  const meta=at?.meta;
+  if(meta&&!meta.model?.ready) push("Credential the meta-model",meta?.last_training?.n||0,3000,
+      `needs AUC ≥ 0.53 · last ${meta?.last_training?.auc??"—"}`);
+  push("Bank champions",ch.length,5,"a deeper vault means a better fallback");
+  if(S?.autotuner?.clock_trial) push("Shadow race",(S?.shadow&&S.shadow.equity!=null)?1:0,1,
+      S?.shadow?.status||"waiting for the first trial-clock champion");
+  push("Prove the edge",st?.trades||0,20,"20 closed trades makes the stats mean something");
+  return out;
+}
+let _achSeen=null,_achFresh=new Set();
+/* Unlock detection runs on every full push, not only while the Progress tab is
+   open — an achievement earned at 3am should still announce itself. */
+function pollAchievements(){
+  const ac=achievements();
+  const got=new Set(ac.filter(a=>a[3]).map(a=>a[0]));
+  if(_achSeen===null){ _achSeen=got; return; }   // first sight: no retro-toasts
+  for(const a of ac) if(a[3]&&!_achSeen.has(a[0])){
+    _achFresh.add(a[0]); toast(`🏆 Achievement unlocked — ${a[2]}`,"good");
+  }
+  _achSeen=got;
+}
+function renderProgress(){
+  const op=operator(), sk=streaks(), ms=missions(), ac=achievements();
+  const mEl=$("missions");
+  if(mEl) mEl.innerHTML=ms.map(m=>`<div class="mission${m.done?" done":""}">
+      <div class="mt"><span>${m.t}</span><span class="mv">${m.have} / ${m.need}${m.done?" ✓":""}</span></div>
+      <div class="mbar"><i style="width:${(m.pct*100).toFixed(1)}%"></i></div>
+      ${m.note?`<div class="mw">${esc(m.note)}</div>`:""}</div>`).join("");
+  const got=ac.filter(a=>a[3]).length;
+  const cEl=$("ach-count"); if(cEl) cEl.textContent=`— ${got}/${ac.length} unlocked`;
+  const aEl=$("achievements");
+  if(aEl){
+    aEl.innerHTML=ac.map(([id,ic,nm,ok,hint])=>
+      `<div class="ach${ok?" got":""}${_achFresh.has(id)?" fresh":""}" title="${esc(ok?nm:hint)}">
+         <div class="ai">${ic}</div><div class="an">${nm}</div></div>`).join("");
+    _achFresh.clear();   // the pop animation plays once, on first sight
+  }
+  const car=$("career");
+  if(car) car.innerHTML=[
+    ["Rank",`${op.title} · L${op.lvl}`],["Total XP",op.xp.toLocaleString()],
+    ["Next rank",op.next?`${(op.next-op.xp).toLocaleString()} XP`:"MAXED"],
+    ...op.parts.map(([k,n,w])=>[k,`${n.toLocaleString()} × ${w}`]),
+    ["Best streak",`${sk.best} wins`],["Current streak",`${sk.cur} wins`],
+  ].map(([k,v])=>`<div class="cr"><span>${k}</span><b>${v}</b></div>`).join("");
+}
+function renderRank(){
+  const op=operator(), sk=streaks();
+  const l=$("op-lvl"), t=$("op-title"), f=$("op-xp-fill"), s=$("op-streak"), n=$("op-streak-n");
+  if(!l) return;
+  if(l._v!==op.lvl){ l._v=op.lvl; l.textContent=op.lvl; }
+  if(t._v!==op.title){ t._v=op.title; t.textContent=op.title; }
+  const w=(op.pct*100).toFixed(1)+"%"; if(f._v!==w){ f._v=w; f.style.width=w; }
+  if(n._v!==sk.cur){ n._v=sk.cur; n.textContent=sk.cur; s.classList.toggle("hot",sk.cur>=2); }
+  const rk=$("op-rank");
+  if(rk) rk.title=`${op.title} · level ${op.lvl} · ${op.xp.toLocaleString()} XP`
+    +(op.next?` · ${(op.next-op.xp).toLocaleString()} to next rank`:"")
+    +`\n${op.parts.map(([k,nn,ww])=>`${nn} ${k} × ${ww}`).join("\n")}`;
+}
+
 /* ================= NEURAL CORTEX — the brain, visibly firing =================
    A 60fps canvas of the focused symbol's actual wiring: 19 alpha neurons on an
    outer ring, clustered around their 5 desk hubs, all feeding the fused-edge
@@ -964,6 +1117,8 @@ const REGIME_TINT={TREND_UP:"#00e0a0",TREND_DOWN:"#ff3d7f",RANGE:"#9d6bff",VOLAT
 const cortex=(()=>{
   const cv=$("cortex"); if(!cv) return {data(){}};
   const g=cv.getContext("2d");
+  const bg=$("cortex-bg"), bgx=bg&&bg.getContext("2d");   // STATIC layer, own element
+  const hud=$("cortex-hud"), hudLabels=$("hud-labels");   // TEXT layer, DOM
   const DPR=Math.min(window.devicePixelRatio||1,1.5);
   let W=0,H=0,cx=0,cy=0,R=0;
   let nodes=[],hubs={},layoutSig="",bgDirty=true,bgRegime="";
@@ -971,8 +1126,7 @@ const cortex=(()=>{
   const ex={edge:0,p_win:0.5,regime:"RANGE",sym:"",stage:"SCAN",block:"",held:false};
   const e={edge:0,p_win:0.5,charge:0};           // eased display values
   const deskAcc={},pulses=[],ripples=[],motes=[],ekg=[];
-  let spin=0,lastT=0,capT=0;
-  const bg=document.createElement("canvas");     // static layer: mesh + labels + wash
+  let spin=0,lastT=0,capT=0,hudT=0;
   const SPR={};
   const lerp=(a,b,k)=>a+(b-a)*k;
   const dirCol=(v)=>v>=0?C.up:C.dn;
@@ -1001,11 +1155,14 @@ const cortex=(()=>{
     // soft radial sprites don't need bilinear filtering — and the Firefox
     // profiler showed every filtered blit being rasterized on the CPU
     g.imageSmoothingEnabled=false;
+    if(bg){ bg.width=Math.round(w*RS); bg.height=Math.round(h*RS); }
     W=w; H=h; cx=W*0.5; cy=H*0.52;
     R=Math.min(W*0.335,(cy-24)/1.16);
     if(!motes.length) for(let i=0;i<26;i++) motes.push({x:Math.random()*w,y:Math.random()*h,
       vx:(Math.random()-0.5)*5,vy:-3-Math.random()*5,ph:Math.random()*TAU});
     layout(); bgDirty=true;
+    start();   // self-heal: a canvas that was zero-sized at load (hidden panel)
+               // stopped the loop; any resize revives it
   }
   function layout(){
     if(!tgt) return;
@@ -1032,43 +1189,61 @@ const cortex=(()=>{
         const cpx=mx-dy/dl*dl*side, cpy=my+dx/dl*dl*side;
         const p=old[nm]||{sc:0,tsc:0,wt:0.2,twt:0.2,acc:Math.random(),ph:Math.random()*TAU};
         nodes.push({nm,short:ALPHA_SHORT[nm]||nm.slice(0,4).toUpperCase(),d,col:hub.col,hub,
-          x,y,ang,cpx,cpy,sc:p.sc,tsc:p.tsc,wt:p.wt,twt:p.twt,acc:p.acc,ph:p.ph});
+          x,y,ang,cpx,cpy,sc:p.sc,tsc:p.tsc,wt:p.wt,twt:p.twt,acc:p.acc,ph:p.ph,fire:false});
       });
     }
     bgDirty=true;
+    buildLabels();
   }
   const fscale=()=>Math.max(0.85,Math.min(2.0,R/165));
+  /* The static layer. Repainted ONLY when the layout or the regime changes —
+     it used to be re-blitted over the full canvas 30 times a second. Text is
+     no longer drawn here at all; it lives in the DOM overlay below. */
   function drawBg(){
-    bg.width=Math.round(W*RS); bg.height=Math.round(H*RS);
-    const b=bg.getContext("2d"); b.setTransform(RS,0,0,RS,0,0);
-    const F=fscale();
-    // regime wash — a deep tinted atmosphere behind everything
+    if(!bgx) { bgDirty=false; return; }
+    bgx.setTransform(RS,0,0,RS,0,0);
+    bgx.clearRect(0,0,W,H);
     const tint=REGIME_TINT[bgRegime]||REGIME_TINT.RANGE;
-    const wash=b.createRadialGradient(cx,cy,R*0.1,cx,cy,Math.max(W,H)*0.75);
-    wash.addColorStop(0,tint+"16"); wash.addColorStop(0.55,tint+"08"); wash.addColorStop(1,"#00000000");
-    b.fillStyle=wash; b.fillRect(0,0,W,H);
-    // guide rings + desk sector spokes
-    b.strokeStyle="rgba(0,210,255,0.05)"; b.lineWidth=1;
-    for(const rr of [0.46,0.97]){ b.beginPath(); b.arc(cx,cy,R*rr,0,TAU); b.stroke(); }
-    b.setLineDash([2,7]);
-    b.strokeStyle="rgba(0,210,255,0.06)";
+    const wash=bgx.createRadialGradient(cx,cy,R*0.1,cx,cy,Math.max(W,H)*0.75);
+    wash.addColorStop(0,tint+"1c"); wash.addColorStop(0.55,tint+"0a"); wash.addColorStop(1,"#00000000");
+    bgx.fillStyle=wash; bgx.fillRect(0,0,W,H);
+    bgx.strokeStyle="rgba(0,210,255,0.05)"; bgx.lineWidth=1;
+    for(const rr of [0.46,0.97]){ bgx.beginPath(); bgx.arc(cx,cy,R*rr,0,TAU); bgx.stroke(); }
+    bgx.setLineDash([2,7]);
+    bgx.strokeStyle="rgba(0,210,255,0.06)";
     for(const d of DESK_ORDER){ const h=hubs[d]; if(!h) continue;
-      b.beginPath(); b.moveTo(cx+Math.cos(h.ang)*R*0.18,cy+Math.sin(h.ang)*R*0.18);
-      b.lineTo(cx+Math.cos(h.ang)*R*1.06,cy+Math.sin(h.ang)*R*1.06); b.stroke(); }
-    b.setLineDash([]);
-    // HUD text — dark-outlined so it reads over any glow
-    const btxt=(s,x,y,fill,font)=>{ b.font=font; b.lineWidth=3;
-      b.strokeStyle="rgba(3,5,9,0.9)"; b.strokeText(s,x,y); b.fillStyle=fill; b.fillText(s,x,y); };
-    b.textAlign="center";
-    for(const nd of nodes){   // alpha names on the outer ring
-      btxt(nd.short,cx+Math.cos(nd.ang)*R*1.115,cy+Math.sin(nd.ang)*R*1.115+3*F,
-           "rgba(150,165,190,0.95)",`700 ${Math.round(9*F)}px ui-monospace,monospace`);
-    }
-    for(const d of DESK_ORDER){ const h=hubs[d]; if(!h) continue;   // desk names
-      btxt(DESK_LABEL[d],cx+Math.cos(h.ang)*R*0.71,cy+Math.sin(h.ang)*R*0.71+3.5*F,
-           h.col,`700 ${Math.round(11*F)}px ui-monospace,monospace`); }
+      bgx.beginPath(); bgx.moveTo(cx+Math.cos(h.ang)*R*0.18,cy+Math.sin(h.ang)*R*0.18);
+      bgx.lineTo(cx+Math.cos(h.ang)*R*1.06,cy+Math.sin(h.ang)*R*1.06); bgx.stroke(); }
+    bgx.setLineDash([]);
     bgDirty=false;
   }
+  /* Text layer: one DOM node per alpha + per desk, positioned once per layout.
+     Per frame we only ever touch a colour class on the few that are firing. */
+  function buildLabels(){
+    if(!hudLabels) return;
+    const F=fscale();
+    let html="";
+    for(const nd of nodes){
+      const x=cx+Math.cos(nd.ang)*R*1.115, y=cy+Math.sin(nd.ang)*R*1.115;
+      html+=`<div class="hud-lab" data-nm="${nd.nm}" style="left:${x.toFixed(1)}px;top:${y.toFixed(1)}px;`
+           +`font-size:${(9*F).toFixed(1)}px">${nd.short}</div>`;
+    }
+    for(const d of DESK_ORDER){ const h=hubs[d]; if(!h) continue;
+      const x=cx+Math.cos(h.ang)*R*0.71, y=cy+Math.sin(h.ang)*R*0.71;
+      html+=`<div class="hud-desk" style="left:${x.toFixed(1)}px;top:${y.toFixed(1)}px;`
+           +`color:${h.col};font-size:${(11*F).toFixed(1)}px">${DESK_LABEL[d]}</div>`;
+    }
+    hudLabels.innerHTML=html;
+    for(const el of hudLabels.querySelectorAll(".hud-lab")) labEl[el.dataset.nm]=el;
+    const F2=fscale();
+    const he=$("hud-edge"), hs=$("hud-sub"), hr=$("hud-regime"), ha=$("hud-armed");
+    if(he){ he.style.left=cx+"px"; he.style.top=(cy-6*F2)+"px"; he.style.fontSize=(26*F2)+"px"; }
+    if(hs){ hs.style.left=cx+"px"; hs.style.top=(cy+15*F2)+"px"; hs.style.fontSize=(11*F2)+"px"; }
+    if(hr){ hr.style.left=cx+"px"; hr.style.top=(cy+31*F2)+"px"; hr.style.fontSize=(10.5*F2)+"px"; }
+    if(ha){ ha.style.left=cx+"px"; ha.style.top=(cy-R*0.285-12*F2)+"px"; ha.style.fontSize=(11*F2)+"px"; }
+    if(hud) hud.classList.add("ready");
+  }
+  const labEl={};
   function data(viz,extra){
     tgt=viz; Object.assign(ex,extra||{});
     const sig=viz.a.map(x=>x[0]).join(",");
@@ -1090,27 +1265,31 @@ const cortex=(()=>{
     pulses.push({x0:h.x,y0:h.y,cx:(h.x+cx)/2,cy:(h.y+cy)/2,x1:cx,y1:cy,
                  p:0,spd:1.1+1.4*s,col:dirCol(h.sig),size:2.6+3.2*s,core:true});
   }
-  // ~30fps via setTimeout->rAF chaining: registering rAF every frame (even to
-  // skip) kept Firefox's refresh driver ticking at 60Hz forever. This way the
-  // browser genuinely idles between our frames.
-  function schedule(ms){ setTimeout(()=>requestAnimationFrame(frame),ms); }
+  /* One rAF per display refresh — motion is now locked to vsync. The old
+     setTimeout(17)->rAF chain fired between refreshes, so frames landed at
+     irregular 17-34ms intervals and the eye read it as judder even though
+     each frame was cheap. Running every refresh costs ~0.5% CPU (measured)
+     because the expensive parts (static layer, all text) no longer repaint. */
+  let running=false;
+  // ADAPTIVE limiter: we measure our OWN draw cost (EWMA) and halve the paint
+  // rate if a frame is consistently expensive — so a capable machine gets the
+  // full vsync-locked 60fps while a weak one (or a software-rendered browser)
+  // degrades to 30 instead of dropping frames raggedly.
+  let costMs=0,skip=false;
+  const COST_BUDGET=5.0;
+  function start(){ if(!running){ running=true; requestAnimationFrame(frame); } }
   function frame(t){
-    if(document.hidden||!W){ lastT=t; schedule(250); return; }
-    schedule(17);
+    if(document.hidden||!W){ running=false; return; }   // idle completely when hidden
+    requestAnimationFrame(frame);
+    if(costMs>COST_BUDGET){ skip=!skip; if(skip) return; }   // paint every other refresh
+    const t0=performance.now();
     const dt=Math.min(0.08,Math.max(0.001,(t-lastT)/1000)); lastT=t;
     const k=Math.min(1,dt*5);
-    // trail fade, then blit the static layer 1:1 (a SCALED blit was being
-    // bilinear-filtered on the CPU every frame)
+    // trail fade only — the static mesh is its own GPU-composited element now
     g.globalCompositeOperation="source-over";
-    g.fillStyle="rgba(5,7,12,0.42)"; g.fillRect(0,0,W,H);
+    g.fillStyle="rgba(5,7,12,0.30)"; g.fillRect(0,0,W,H);
     if(bgDirty) drawBg();
-    g.save(); g.setTransform(1,0,0,1,0,0); g.globalAlpha=0.6; g.drawImage(bg,0,0); g.restore();
-    g.globalAlpha=1;
-    if(!tgt||!nodes.length){
-      g.fillStyle="#59637a"; g.font="10px ui-monospace,monospace"; g.textAlign="center";
-      g.fillText("cortex warming up — waiting for the first evaluation…",cx,cy);
-      return;
-    }
+    if(!tgt||!nodes.length) return;
     const thr=tgt.thr||0.3;
     e.edge=lerp(e.edge,ex.edge,k); e.p_win=lerp(e.p_win,ex.p_win,k);
     e.charge=lerp(e.charge,clamp(Math.abs(e.edge)/Math.max(thr,0.01),0,1.35),k);
@@ -1219,24 +1398,6 @@ const cortex=(()=>{
       g.beginPath(); g.arc(cx,cy,cr+14,0,TAU); g.stroke();
       g.setLineDash([]);
     }
-    // HUD text — dark-outlined, scaled with the canvas, readable over glow
-    const txt=(s,x,y,fill,font)=>{ g.font=font; g.lineWidth=4;
-      g.strokeStyle="rgba(3,5,9,0.9)"; g.strokeText(s,x,y); g.fillStyle=fill; g.fillText(s,x,y); };
-    g.textAlign="center";
-    txt((e.edge>=0?"+":"−")+Math.abs(e.edge).toFixed(2),cx,cy-4*F,coreCol,
-        `700 ${Math.round(24*F)}px ui-monospace,monospace`);
-    txt(`P ${Math.round(e.p_win*100)}%${tgt.meta_p!=null?`  ·  ML ${Math.round(tgt.meta_p*100)}%`:""}`,
-        cx,cy+15*F,"#d5e3f0",`700 ${Math.round(11*F)}px ui-monospace,monospace`);
-    const rm=REGIME_META[ex.regime]||REGIME_META.RANGE;
-    txt(`${rm.g} ${ex.regime.replace("_"," ")}`,cx,cy+30*F,
-        REGIME_TINT[ex.regime]||"#8a97ad",`700 ${Math.round(10.5*F)}px ui-monospace,monospace`);
-    if(e.charge>=1) txt("⚡ ARMED",cx,cy-cr-10*F,coreCol,`700 ${Math.round(11*F)}px ui-monospace,monospace`);
-    // firing alphas light their names up in direction color
-    for(const nd of nodes){
-      const s=Math.abs(nd.sc);
-      if(s>0.35) txt(nd.short,cx+Math.cos(nd.ang)*R*1.115,cy+Math.sin(nd.ang)*R*1.115+3*F,
-                     dirCol(nd.sc),`700 ${Math.round(9.5*F)}px ui-monospace,monospace`);
-    }
     // edge EKG — the last minute of conviction, breathing along the bottom
     if(ekg.length>2){
       const eh=15, ey=H-10, x0=10, x1=W-10;
@@ -1248,19 +1409,38 @@ const cortex=(()=>{
         i?g.lineTo(x,y):g.moveTo(x,y);
       }
       g.strokeStyle=dirCol(ekg[ekg.length-1])+"bb"; g.lineWidth=1.5; g.stroke();
-      g.textAlign="left";
-      txt("edge · last 60s",x0,ey-eh-6,"rgba(120,135,160,0.9)",
-          `700 ${Math.round(8.5*F)}px ui-monospace,monospace`);
-      g.textAlign="center";
     }
-    // caption (DOM text, 2 Hz is plenty)
-    if(t-capT>500){ capT=t;
+    // ---- TEXT: DOM, ~12Hz. Canvas text was re-rasterized every frame (up to
+    // 19 alpha labels + 4 HUD lines); as elements the browser keeps a cached
+    // layer and this loop only writes strings that actually changed.
+    if(t-hudT>80){ hudT=t;
+      const he=$("hud-edge"), hs=$("hud-sub"), hr=$("hud-regime"), ha=$("hud-armed");
+      const ev=(e.edge>=0?"+":"−")+Math.abs(e.edge).toFixed(2);
+      if(he&&he._v!==ev){ he._v=ev; he.textContent=ev; }
+      if(he&&he._c!==coreCol){ he._c=coreCol; he.style.color=coreCol; }
+      const sv=`P ${Math.round(e.p_win*100)}%${tgt.meta_p!=null?`  ·  ML ${Math.round(tgt.meta_p*100)}%`:""}`;
+      if(hs&&hs._v!==sv){ hs._v=sv; hs.textContent=sv; }
+      const rm=REGIME_META[ex.regime]||REGIME_META.RANGE;
+      const rv=`${rm.g} ${ex.regime.replace("_"," ")}`;
+      if(hr&&hr._v!==rv){ hr._v=rv; hr.textContent=rv; hr.style.color=REGIME_TINT[ex.regime]||"#8a97ad"; }
+      const armed=e.charge>=1;
+      if(ha&&ha._on!==armed){ ha._on=armed; ha.classList.toggle("on",armed); ha.style.color=coreCol; }
+      for(const nd of nodes){    // a firing alpha lights its own name
+        const fire=Math.abs(nd.sc)>0.35, el=labEl[nd.nm];
+        if(el&&nd.fire!==fire){ nd.fire=fire;
+          el.classList.toggle("fire",fire); el.style.color=fire?dirCol(nd.sc):""; }
+      }
       const cap=$("cortex-cap");
-      if(cap) cap.textContent=`${ex.sym||"—"} · ${ex.held?"IN POSITION":(e.charge>=1?"⚡ ARMED":ex.stage||"SCAN")}${ex.block&&!ex.held?` · ${ex.block}`:""}`;
+      if(cap&&t-capT>400){ capT=t;
+        const cv2=`${ex.sym||"—"} · ${ex.held?"IN POSITION":(armed?"⚡ ARMED":ex.stage||"SCAN")}${ex.block&&!ex.held?` · ${ex.block}`:""}`;
+        if(cap._v!==cv2){ cap._v=cv2; cap.textContent=cv2; }
+      }
     }
+    costMs=costMs*0.9+(performance.now()-t0)*0.1;   // EWMA of our own draw cost
   }
   new ResizeObserver(resize).observe(cv);
-  resize(); schedule(0);
+  document.addEventListener("visibilitychange",()=>{ if(!document.hidden){ lastT=performance.now(); start(); } });
+  resize(); start();
   return {data};
 })();
 
