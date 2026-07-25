@@ -188,8 +188,31 @@ class TradingBrain:
             num += w * desk_sig[desk]
             den += w
         edge = clamp(num / den if den > 0 else 0.0, -1, 1)
+        # A non-finite edge is the quietest way this system can die. clamp() is
+        # `lo if x < lo else hi if x > hi else x`, so NaN passes straight
+        # through, and `abs(nan) >= threshold` is False — the bot then sits
+        # there looking healthy and never takes another trade, with nothing in
+        # the log and nothing a restart would fix.
+        #
+        # This is not hypothetical input: at a 1m or 3m interval (both offered
+        # as the trial clock) the 24h-context window is longer than the warmup,
+        # so seven features in `row` really are NaN. The fused edge survives
+        # today only because no current alpha happens to read one of them —
+        # a property of today's roster, not a guarantee. Refuse to act, and say
+        # WHICH feature did it so the cause is one log line away.
+        if not math.isfinite(edge):
+            bad = sorted(k for k, v in row.items()
+                         if isinstance(v, float) and not math.isfinite(v))
+            log.error("non-finite edge (%r) — refusing to trade this bar; "
+                      "non-finite features: %s", edge, bad[:8] or "none")
+            edge = 0.0
         atr_pctile = row.get("atr_pctile", 0.5)
+        if not math.isfinite(atr_pctile):
+            atr_pctile = 0.5
         p_win = self.calibrator.predict(edge, regime, atr_pctile)
+        if not math.isfinite(p_win):
+            log.error("non-finite p_win from the calibrator — treating as no-edge")
+            edge, p_win = 0.0, 0.5
         # meta-labeling second opinion: a walk-forward-credentialed GBM over the
         # FULL feature row (interactions the linear fusion can't represent).
         # Consulted only near the gate zone (where P(win) can change a decision

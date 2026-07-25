@@ -24,7 +24,7 @@ from ..exchange.errors import BingXError
 from ..exchange.models import ContractSpec
 from ..exchange.rest import BingXRest
 from ..risk.manager import RiskManager
-from ..util import interval_ms, now_ms
+from ..util import atomic_write, interval_ms, now_ms
 
 log = logging.getLogger("orchestrator")
 
@@ -423,8 +423,7 @@ class Orchestrator:
 
     def save_champions(self) -> None:
         try:
-            CHAMPIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
-            CHAMPIONS_PATH.write_text(json.dumps(self.champions, indent=2))
+            atomic_write(CHAMPIONS_PATH, json.dumps(self.champions, indent=2))
         except OSError as e:
             log.warning("could not save champions: %s", e)
 
@@ -1016,8 +1015,7 @@ class Orchestrator:
 
     def _save_overlays(self) -> None:
         try:
-            OVERLAYS_PATH.parent.mkdir(parents=True, exist_ok=True)
-            OVERLAYS_PATH.write_text(json.dumps(self.symbol_overlays, indent=2))
+            atomic_write(OVERLAYS_PATH, json.dumps(self.symbol_overlays, indent=2))
         except OSError as e:
             log.warning("could not save overlays: %s", e)
 

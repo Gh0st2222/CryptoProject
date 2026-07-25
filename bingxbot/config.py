@@ -16,6 +16,8 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from .util import atomic_write
+
 load_dotenv()
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -348,7 +350,7 @@ def load_config(path: Path = CONFIG_PATH) -> BotConfig:
 
 def save_config(cfg: BotConfig, path: Path = CONFIG_PATH) -> None:
     with _lock:
-        path.write_text(json.dumps(asdict(cfg), indent=2))
+        atomic_write(path, json.dumps(asdict(cfg), indent=2))
 
 
 def update_config(cfg: BotConfig, patch: dict) -> BotConfig:
