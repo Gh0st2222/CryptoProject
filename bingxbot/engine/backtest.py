@@ -133,6 +133,13 @@ def gate_ev(risk_cfg, payoff_b: float, p_win: float, row: dict, fees_rt: float,
     atr_pct = row.get("atr_pct", 0.0)
     if not (isinstance(atr_pct, float) and math.isfinite(atr_pct)) or atr_pct <= 0:
         return False, "no volatility estimate"
+    # ...and the same for everything else this verdict is computed from. The
+    # comparison below is `p_win < need`, which is False when either side is
+    # NaN — so the gate documented as "refuses coin-flip entries" used to
+    # PERMIT a trade whose win probability it could not evaluate at all.
+    if not all(isinstance(v, (int, float)) and math.isfinite(v)
+               for v in (payoff_b, p_win, fees_rt, spread_bps, slippage_bps)):
+        return False, "non-finite inputs — refusing to judge EV"
     # the style's OWN stop defines the risk unit: scalps run tighter stops, so
     # the same absolute cost is a BIGGER fraction of their R — judging them by
     # the trend stop understated their true cost load

@@ -393,6 +393,14 @@ class TradingBrain:
 
     def entry_ok(self, edge: float, p_win: float, row: dict, fees_roundtrip: float,
                  spread_bps: float, slippage_bps: float) -> tuple[bool, str]:
+        # A gate's job is to REFUSE, so the one direction it must never fail is
+        # OPEN. `abs(nan) < threshold`, `nan < min_p_win` and `predicted < cost`
+        # are all False for NaN, so three of the four checks below used to wave
+        # through a trade whose conviction and win probability were unknown.
+        # (atr_pct was already guarded properly — these were the gaps.)
+        if not all(math.isfinite(v) for v in (edge, p_win, fees_roundtrip,
+                                              spread_bps, slippage_bps)):
+            return False, "non-finite inputs — refusing to judge this entry"
         if abs(edge) < self.threshold:
             return False, f"edge {edge:+.2f} < threshold {self.threshold:.2f}"
         if p_win < self.min_p_win:
@@ -410,6 +418,15 @@ class TradingBrain:
                      spread_bps: float, slippage_bps: float) -> list[dict]:
         """Itemized version of entry_ok — every quality gate with its live numbers,
         pass or fail, for the UI's entry-gate X-ray. Same math, no early exit."""
+        # Must agree with entry_ok's verdict. These comparisons are written as
+        # `>= ok` rather than `< reject`, so NaN correctly shows as a failure —
+        # but +inf sails through all three and the X-ray showed every gate GREEN
+        # while entry_ok was refusing. A dashboard that disagrees with the
+        # engine about why nothing is trading is worse than no dashboard.
+        if not all(math.isfinite(v) for v in (edge, p_win, fees_roundtrip,
+                                              spread_bps, slippage_bps)):
+            return [{"n": "inputs", "ok": False,
+                     "d": "non-finite — entry refused before any gate"}]
         out = [{"n": "edge", "ok": abs(edge) >= self.threshold,
                 "d": f"{edge:+.2f} vs thr {self.threshold:.2f}"},
                {"n": "p(win)", "ok": p_win >= self.min_p_win,
@@ -428,6 +445,10 @@ class TradingBrain:
         """Fractional-Kelly multiplier on the base risk budget, from calibrated
         P(win) and the trade's reward:risk. Clamped so a hot streak can't run
         risk away; returns 0 for a negative-edge bet."""
+        # `max(nan, 0.1)` is nan, and `f <= 0` is False for nan, so this
+        # returned a NaN multiplier straight into position sizing.
+        if not math.isfinite(p_win) or not math.isfinite(payoff_ratio):
+            return 0.0
         b = max(payoff_ratio, 0.1)
         f = p_win - (1 - p_win) / b
         if f <= 0:
