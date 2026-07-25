@@ -523,6 +523,18 @@ input.field { width: 100%; font-family: var(--mono); }
 @media (max-width: 1080px) { .viz-grid { grid-template-columns: minmax(0, 1fr); } }
 .viz-tall { height: 300px; }
 .viz-mid  { height: 220px; }
+/* a viz that already lives inside a .panel: the panel owns the frame, so the
+   view drops its own border and surface and just draws. */
+.viz-bare { border: 0; background: none; }
+.pbody.tight { padding: 4px 6px 6px; }
+/* A grid column is exactly as tall as the tallest column beside it, so whichever
+   column is shorter ends with dead space — and which one that is changes with
+   the watchlist size. Rather than tune fixed heights for one symbol count, the
+   last canvas panel in a column absorbs whatever is left: the canvases are the
+   only children that get better with more room. */
+.panel.grow { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.panel.grow > .pbody { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.panel.grow .viz-grow { flex: 1 1 auto; height: auto; min-height: 150px; }
 
 /* legend chips */
 .viz-key { display: flex; gap: 10px; flex-wrap: wrap; padding: 4px 10px 8px; }

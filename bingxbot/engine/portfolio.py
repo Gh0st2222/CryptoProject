@@ -196,6 +196,11 @@ class Portfolio:
                 s: {
                     "side": p.side, "qty": p.qty, "entry": p.entry_price,
                     "stop": p.stop_price, "tp": p.take_profit,
+                    # the trade's 1R, fixed at entry. The current stop is NOT a
+                    # substitute: once the trail ratchets past entry,
+                    # |entry - stop| shrinks to nothing and every R computed
+                    # from it runs away to infinity.
+                    "init_risk": p.init_risk,
                     "opened_ts": p.opened_ts, "leverage": p.leverage,
                     "upnl": round(p.unrealized(marks.get(s, 0.0)), 6) if marks and marks.get(s) else 0.0,
                     "reason": p.entry_reason,

@@ -501,6 +501,7 @@ function renderAll(){
   if(S.engine){ renderPipeline(); renderBrain(); renderEquity();
     cortexFeed();
     const tc=S.engine.portfolio.stats.trades; refreshCandles(false).then(()=>{lastTradeCount=tc;}); }
+  renderLiveViews();
   renderBottomTab(activePage());
 }
 
@@ -518,6 +519,7 @@ function applyHot(h){
     const s=S.engine.symbols?.[sym]; if(!s) continue;
     s.price=hs.price; s.stage=hs.stage; s.eval_ms=hs.eval_ms; s.entry_block=hs.entry_block; s.bars_held=hs.bars_held;
     if(hs.hi24){ s.hi24=hs.hi24; s.lo24=hs.lo24; s.rpos24=hs.rpos24; }
+    if(hs.micro){ s.micro=hs.micro; flowPush(sym,hs.micro); }
     if(hs.mtf) s.mtf=hs.mtf;
     if(hs.gates) s.gates=hs.gates;
     if(hs.candle) s.candle=hs.candle;
@@ -546,6 +548,7 @@ function renderHot(){
   if(activePage()==="positions") renderPositions();
   renderSymTabs();   // adopted set + auto-follow react at hot cadence
   const es=engSym(); if(es&&es.brain){ renderEdgeGauge(es.brain, es); renderMTF(es); renderGates(es); }
+  renderLiveViews();
   // live-forming candle straight off the hot channel — the chart moves at tick
   // cadence now instead of waiting for the next REST poll.
   if(es?.candle&&candleSeries){
@@ -1899,5 +1902,533 @@ function renderConstellation(alphas){
       renderRDist(_exTrades, _exDist);
       renderGhostBook(S?.engine?.refusals);
     }
+    renderLiveViews();   // the main-grid views are never behind a tab
   }).observe(host);
+})();
+
+/* ==========================================================================
+   MAIN-GRID LIVE VIEWS — the lower-right of the terminal
+
+   Four canvases that live in the always-visible grid rather than behind a tab,
+   so unlike the analytics views they repaint on the HOT channel (up to 4/s).
+   Each one draws something the dashboard already knew but only ever printed:
+
+     · symbol board  — the whole watchlist at once (everything else follows one
+                       focused symbol, so the other markets were invisible)
+     · trade runway  — open positions on a stop -> target axis
+     · order flow    — OBI/flow as a moving ribbon instead of one line of text
+     · risk budget   — distance to the kill switch, exposure cap and slot cap
+
+   Same three rules as the analytics views: no view owns a timer, every draw is
+   a pure function of the current snapshot, and hover repaints only its own
+   view. They are cheap by construction — a few dozen rects and two polylines —
+   because at 4 Hz on the main screen they share a frame with the cortex.
+   ========================================================================== */
+
+/** Blank a live view and report why, so a warming-up panel never looks broken. */
+function _liveEmpty(host, msg){ vizEmpty(host, msg); return null; }
+
+/** Common setup: fetch the context, mark the view empty when there is no
+ *  engine yet. Returns null when there is nothing to draw. */
+function _liveCtx(id, emptyMsg){
+  const host = $(id); if(!host) return null;
+  const cv = host.querySelector("canvas"); const g = vizCtx(cv);
+  if(!g) return null;
+  if(!S?.engine){ _liveEmpty(host, emptyMsg); return null; }
+  vizEmpty(host, "");
+  return { host, cv, g, W: g.__w, H: g.__h };
+}
+
+const shortSym = (s) => String(s || "").replace("-USDT", "").replace("-USD", "");
+
+/* ------------------------------------------------------------ 1. SYMBOL BOARD
+   Every market the machine watches, on one line each: regime, price, where the
+   price sits in its own 24h range, how close the edge is to the threshold, and
+   the calibrated P(win). The chart, cortex and brain all show ONE symbol; this
+   is the only place the other four are visible at all. Click focuses. */
+let _boardGeom = null, _boardHit = -1;
+function renderBoard(){
+  const c = _liveCtx("viz-board", "Engine idle — start paper or live mode."); if(!c) return;
+  const { host, g, W, H } = c;
+  const syms = engineSymbols(), es = S.engine.symbols || {};
+  if(!syms.length){ _liveEmpty(host, "No symbols"); _boardGeom = null; return; }
+
+  const posns = S.engine.portfolio?.open_positions || {};
+  const adopted = new Set(S.engine.adopted || []);
+  const narrow = W < 430;
+  const HEAD = 15, TOP = HEAD + 5;
+  // rows take the room they are given: a three-symbol watchlist should breathe,
+  // an eight-symbol one should still fit without a scrollbar. Past the cap the
+  // block is centred rather than left hanging from the header.
+  const rh = clamp((H - TOP - 2) / syms.length, 19, 70);
+  const yTop = TOP + Math.max(0, (H - TOP - 2 - rh * syms.length) / 2);
+  // right-hand columns are fixed width; the 24h range takes whatever is left
+  const edgeR = W - (narrow ? 6 : 58), edgeL = edgeR - (narrow ? 62 : 86);
+  const rngL = 116, rngR = edgeL - 12, rngW = rngR - rngL;
+  const showRange = !narrow && rngW > 60;
+  _boardGeom = { TOP: yTop, rh, syms };
+
+  const mono = cssVar("--mono"), muted = cssVar("--muted");
+  g.fillStyle = muted; g.font = "8.5px " + mono; g.textAlign = "center";
+  if(showRange) g.fillText("24H RANGE", (rngL + rngR) / 2, HEAD - 3);
+  g.fillText("EDGE vs THRESHOLD", (edgeL + edgeR) / 2, HEAD - 3);
+  if(!narrow){ g.textAlign = "right"; g.fillText("P(WIN)", W - 6, HEAD - 3); }
+
+  syms.forEach((sym, i) => {
+    const s = es[sym]; if(!s) return;
+    const y0 = yTop + i * rh, y = y0 + rh / 2;
+    const b = s.brain || {}, held = posns[sym];
+    if(i){ g.fillStyle = "rgba(255,255,255,.035)"; g.fillRect(8, y0 - 0.5, W - 16, 1); }
+    if(sym === curSymbol){
+      g.fillStyle = "rgba(0,210,255,.055)"; g.fillRect(0, y0, W, rh - 1);
+      g.fillStyle = cssVar("--accent"); g.fillRect(0, y0, 2, rh - 1);
+    } else if(i === _boardHit){
+      g.fillStyle = "rgba(255,255,255,.035)"; g.fillRect(0, y0, W, rh - 1);
+    }
+    // regime dot
+    const rc = REGIME_TINT[b.regime] || muted;
+    g.fillStyle = rc; g.beginPath(); g.arc(9, y, 3, 0, 6.2832); g.fill();
+
+    g.textAlign = "left";
+    g.fillStyle = held ? cssVar("--ink") : cssVar("--ink-2");
+    g.font = (held ? "700 " : "") + "11px " + mono;
+    g.fillText(shortSym(sym) + (adopted.has(sym) ? " ◈" : ""), 18, y - 3);
+    g.fillStyle = muted; g.font = "9.5px " + mono;
+    g.fillText(fmt.px(s.price), 18, y + 9);
+    if(held){   // side chip, so an open market is unmistakable in the list
+      const up = held.side === "LONG";
+      const col = up ? cssVar("--good") : cssVar("--bad");
+      g.fillStyle = col + "26"; g.fillRect(78, y - 11, 15, 11);
+      g.fillStyle = col; g.font = "700 8.5px " + mono; g.textAlign = "center";
+      g.fillText(up ? "L" : "S", 85.5, y - 2.5);
+    }
+
+    if(showRange && Number.isFinite(s.hi24) && Number.isFinite(s.lo24) && s.hi24 > s.lo24){
+      const rp = clamp(Number.isFinite(s.rpos24) ? s.rpos24
+        : (s.price - s.lo24) / (s.hi24 - s.lo24), 0, 1);
+      g.fillStyle = cssVar("--surface-3"); g.fillRect(rngL, y - 1.5, rngW, 3);
+      // the low/high thirds are where mean-reversion and breakout live, so tint
+      // the marker by which third the price is actually in
+      const mc = rp > 0.72 ? cssVar("--good") : rp < 0.28 ? cssVar("--bad") : cssVar("--accent");
+      const mx = rngL + rp * rngW;
+      g.fillStyle = mc + "55"; g.fillRect(rngL, y - 1.5, rp * rngW, 3);
+      g.fillStyle = mc; g.fillRect(mx - 1.5, y - 6, 3, 12);
+      g.fillStyle = muted; g.font = "8px " + mono;
+      g.textAlign = "left";  g.fillText(fmt.px(s.lo24), rngL, y + 14);
+      g.textAlign = "right"; g.fillText(fmt.px(s.hi24), rngR, y + 14);
+    }
+
+    // Edge vs threshold, drawn in units of the threshold rather than in raw
+    // edge: thresholds are ~0.3 and live edges spend their time inside that, so
+    // an absolute -1..+1 bar rendered every symbol as a 4px stub. Pinning the
+    // threshold tick at a fixed 62% makes "how close is this to firing" the
+    // thing the bar is actually about, and an armed signal visibly crosses it.
+    const thr = clamp(b.threshold || 0.3, 0.02, 1), edge = clamp(b.edge || 0, -1, 1);
+    const cxE = (edgeL + edgeR) / 2, halfW = (edgeR - edgeL) / 2, TK = 0.62;
+    g.fillStyle = cssVar("--surface-3"); g.fillRect(edgeL, y - 4, edgeR - edgeL, 8);
+    g.fillStyle = cssVar("--baseline");
+    g.fillRect(cxE - TK * halfW, y - 7, 1, 14);
+    g.fillRect(cxE + TK * halfW, y - 7, 1, 14);
+    g.fillRect(cxE, y - 5, 1, 10);
+    const armed = Math.abs(edge) >= thr;
+    const ew = Math.min(1, (Math.abs(edge) / thr) * TK) * halfW;
+    const ec = edge >= 0 ? cssVar("--accent") : cssVar("--bad");
+    if(armed){ g.fillStyle = ec + "33"; g.fillRect(edge >= 0 ? cxE : cxE - ew, y - 7, ew, 14); }
+    g.fillStyle = armed ? ec : ec + "77";
+    g.fillRect(edge >= 0 ? cxE : cxE - ew, y - 3, ew, 6);
+
+    if(!narrow){
+      const p = b.p_win;
+      g.textAlign = "right"; g.font = "10.5px " + mono;
+      g.fillStyle = p == null ? muted : p >= 0.55 ? cssVar("--good") : p >= 0.5 ? cssVar("--ink-2") : cssVar("--bad");
+      g.fillText(p == null ? "—" : Math.round(p * 100) + "%", W - 6, y - 3);
+      // The block reason is a full sentence ("edge -0.11 < thr 0.30") and only
+      // its subject fits — the rung that refused. "edge" is suppressed because
+      // the bar immediately to the left already draws exactly that distance,
+      // and six rows all reading "edge" looks like a stuck render.
+      const blk = String(s.entry_block || "").split(/[ :]/)[0].slice(0, 10);
+      const st = held ? `${s.bars_held || 0} bars`
+        : armed ? "armed" : (blk && blk !== "edge" ? blk : "scanning");
+      g.fillStyle = held ? cssVar("--accent-2") : armed ? cssVar("--good") : muted;
+      g.font = "8.5px " + mono;
+      g.fillText(st, W - 6, y + 9);
+    }
+  });
+}
+function boardHover(ev){
+  const host = $("viz-board"), tip = host.querySelector(".viz-tip");
+  if(!_boardGeom){ tip.classList.remove("on"); return; }
+  const r = ev.currentTarget.getBoundingClientRect();
+  const i = Math.floor((ev.clientY - r.top - _boardGeom.TOP) / _boardGeom.rh);
+  const sym = (i >= 0 && i < _boardGeom.syms.length) ? _boardGeom.syms[i] : null;
+  if(i !== _boardHit){ _boardHit = sym ? i : -1; renderBoard(); }
+  if(!sym){ tip.classList.remove("on"); return; }
+  const s = S?.engine?.symbols?.[sym] || {}, b = s.brain || {};
+  const held = S?.engine?.portfolio?.open_positions?.[sym];
+  const rp = Number.isFinite(s.rpos24) ? Math.round(s.rpos24 * 100) + "% of 24h range" : "24h range unknown";
+  tip.innerHTML = `<b>${esc(sym)}</b> ${fmt.px(s.price)}<br>${esc(b.regime || "—")} · ${rp}<br>`
+    + `edge ${fmt.signed(b.edge || 0, 2)} vs thr ${(b.threshold || 0).toFixed(2)} · P ${fmt.pct(b.p_win, 0)}<br>`
+    + (held ? `<b>${held.side}</b> ${held.leverage}x from ${fmt.px(held.entry)} · ${fmt.signed(held.upnl, 2)}`
+            : esc(s.entry_block || "scanning"));
+  tip.classList.add("on");
+  tip.style.left = Math.min(r.width - tip.offsetWidth - 6, Math.max(4, ev.clientX - r.left + 12)) + "px";
+  tip.style.top = Math.min(r.height - tip.offsetHeight - 4, ev.clientY - r.top + 12) + "px";
+}
+
+/* ------------------------------------------------------------ 2. TRADE RUNWAY
+   Each open position drawn on the axis it actually lives on: stop on the left,
+   target on the right, entry and the live mark in between. The positions table
+   has all four numbers; only a picture tells you at a glance that price has
+   given back two thirds of the way to the stop.
+   When flat, the same canvas shows which symbol is closest to firing — the
+   panel is then answering "why is nothing open?" instead of being blank. */
+function renderRunway(){
+  const c = _liveCtx("viz-runway", "Engine idle."); if(!c) return;
+  const { g, W, H } = c;
+  const pf = S.engine.portfolio, posns = pf?.open_positions || {};
+  const list = Object.entries(posns);
+  const mono = cssVar("--mono"), muted = cssVar("--muted");
+  const cap = $("runway-cap");
+
+  if(!list.length){
+    if(cap) cap.textContent = "flat";
+    // charging ladder: |edge| as a fraction of each symbol's own threshold
+    const rows = engineSymbols().map(sym => {
+      const b = S.engine.symbols?.[sym]?.brain || {};
+      const thr = clamp(b.threshold || 0.3, 0.02, 1);
+      return { sym, frac: Math.min(1.35, Math.abs(b.edge || 0) / thr), dir: (b.edge || 0) >= 0 };
+    }).sort((a, b2) => b2.frac - a.frac).slice(0, 4);
+    g.fillStyle = muted; g.font = "9.5px " + mono; g.textAlign = "left";
+    g.fillText("no capital at risk — closest to firing:", 8, 14);
+    const rh = Math.min(30, (H - 26) / Math.max(1, rows.length));
+    rows.forEach((r, i) => {
+      const y = 24 + i * rh + rh / 2, bx = 92, bw = W - bx - 46;
+      g.fillStyle = cssVar("--ink-2"); g.font = "10.5px " + mono; g.textAlign = "left";
+      g.fillText(shortSym(r.sym), 8, y + 3.5);
+      g.fillStyle = cssVar("--surface-3"); g.fillRect(bx, y - 4, bw, 8);
+      const full = bx + bw / 1.35;                 // where frac == 1.0 lands
+      const col = r.frac >= 1 ? cssVar("--good") : r.dir ? cssVar("--accent") : cssVar("--bad");
+      g.fillStyle = col + (r.frac >= 1 ? "" : "aa");
+      g.fillRect(bx, y - 4, (r.frac / 1.35) * bw, 8);
+      g.fillStyle = cssVar("--baseline"); g.fillRect(full, y - 7, 1, 14);
+      g.fillStyle = r.frac >= 1 ? cssVar("--good") : muted; g.font = "9.5px " + mono;
+      g.textAlign = "right"; g.fillText(Math.round(r.frac * 100) + "%", W - 6, y + 3.5);
+    });
+    g.fillStyle = muted; g.font = "8.5px " + mono; g.textAlign = "left";
+    if(rows.length) g.fillText("100% = threshold", 92, H - 2);
+    return;
+  }
+
+  if(cap) cap.textContent = `${list.length} open`;
+  // one position must not sit in the top third of an otherwise empty panel:
+  // rows take a sane height and the BLOCK is centred in whatever is left
+  const rh = clamp(H / list.length, 44, 72);
+  const y00 = Math.max(0, (H - rh * list.length) / 2);
+  list.forEach(([sym, p], i) => {
+    const y0 = y00 + i * rh, mark = S.engine.symbols?.[sym]?.price || p.entry;
+    const up = p.side === "LONG", sgn = up ? 1 : -1;
+    // 1R is the stop distance AT ENTRY, not the current one. A trailing stop
+    // ratchets toward and then past entry, so |entry - current stop| collapses
+    // and the R printed off it climbs on its own with price standing still.
+    const risk = p.init_risk > 0 ? p.init_risk : Math.abs(p.entry - p.stop);
+    const r = risk > 1e-12 ? ((mark - p.entry) * sgn) / risk : 0;
+    // the stop has moved through entry: the trade can no longer lose
+    const locked = risk > 1e-12 && (p.stop - p.entry) * sgn > 0;
+    // no fixed target means the exit is a trail — there is no price to draw, so
+    // the right edge becomes "3R and still running" and is marked as open.
+    const trailing = !(p.tp > 0);
+    const target = trailing ? p.entry + sgn * risk * 3 : p.tp;
+    const span = target - p.stop;
+    const fr = (v) => span === 0 ? 0 : (v - p.stop) / span;
+    const padL = 10, padR = 10, tw = W - padL - padR;
+    const X = (v) => padL + clamp(fr(v), -0.02, 1.02) * tw;
+    const ty = y0 + rh - 16;
+
+    g.textAlign = "left"; g.font = "700 10.5px " + mono;
+    g.fillStyle = up ? cssVar("--good") : cssVar("--bad");
+    g.fillText(`${shortSym(sym)} ${p.side} ${p.leverage}x`, padL, y0 + 13);
+    g.font = "9.5px " + mono; g.fillStyle = muted;
+    g.fillText(`from ${fmt.px(p.entry)}`, padL + 108, y0 + 13);
+    g.textAlign = "right"; g.font = "10.5px " + mono;
+    g.fillStyle = r >= 0 ? cssVar("--good") : cssVar("--bad");
+    g.fillText(`${fmt.signed(r, 2)}R  ${fmt.signed(p.upnl || 0, 2)}`, W - padR, y0 + 13);
+
+    g.fillStyle = cssVar("--surface-3"); g.fillRect(padL, ty - 3, tw, 6);
+    // the travelled part: entry -> mark, coloured by which way it went
+    const xe = X(p.entry), xm = X(mark);
+    g.fillStyle = (r >= 0 ? cssVar("--good") : cssVar("--bad")) + "cc";
+    g.fillRect(Math.min(xe, xm), ty - 3, Math.abs(xm - xe), 6);
+    g.fillStyle = locked ? cssVar("--good") : cssVar("--bad");
+    g.fillRect(padL, ty - 7, 2, 14);                                         // stop
+    g.fillStyle = cssVar("--baseline"); g.fillRect(xe - 0.5, ty - 6, 1, 12); // entry
+    if(trailing){                                                            // open end
+      g.fillStyle = cssVar("--good") + "66";
+      for(let x = W - padR - 8; x < W - padR; x += 4) g.fillRect(x, ty - 5, 2, 10);
+    } else { g.fillStyle = cssVar("--good"); g.fillRect(W - padR - 2, ty - 7, 2, 14); }
+    g.fillStyle = cssVar("--ink"); g.beginPath(); g.arc(xm, ty, 3.6, 0, 6.2832); g.fill();
+
+    // only two labels under the track. A third (the entry price, centred on its
+    // tick) collided with "stop ..." the moment a trailing stop pushed the
+    // entry tick to the left edge — which is exactly when a winner is running.
+    g.font = "8.5px " + mono;
+    g.textAlign = "left";
+    g.fillStyle = locked ? cssVar("--good") + "cc" : muted;
+    g.fillText("stop " + fmt.px(p.stop) + (locked ? " · locked in" : ""), padL, ty + 15);
+    g.textAlign = "right"; g.fillStyle = muted;
+    g.fillText(trailing ? "trailing · no fixed target" : "tp " + fmt.px(p.tp), W - padR, ty + 15);
+  });
+}
+
+/* -------------------------------------------------------------- 3. ORDER FLOW
+   Book imbalance and trade-flow imbalance are the fastest-moving real numbers
+   the system has, and the dashboard showed them as one line of text. Here they
+   are a rolling ribbon of the last ~50 seconds, plus a per-symbol strip so the
+   watchlist's pressure is comparable at a glance.
+   The history is client-side by construction: the server ships the CURRENT
+   reading, and the ribbon is just what we have been shown since page load. */
+const FLOW_CAP = 220;
+const _flowHist = new Map();
+function flowPush(sym, m){
+  if(!m) return;
+  let h = _flowHist.get(sym);
+  if(!h){ h = { obi: [], flow: [] }; _flowHist.set(sym, h); }
+  const o = Number(m.obi), f = Number(m.flow);
+  h.obi.push(Number.isFinite(o) ? clamp(o, -1, 1) : 0);
+  h.flow.push(Number.isFinite(f) ? clamp(f, -1, 1) : 0);
+  if(h.obi.length > FLOW_CAP){ h.obi.shift(); h.flow.shift(); }
+}
+function renderFlow(){
+  const c = _liveCtx("viz-flow", "Engine idle."); if(!c) return;
+  const { host, g, W, H } = c;
+  const sym = curSymbol, s = S.engine.symbols?.[sym];
+  const m = s?.micro || {};
+  const mono = cssVar("--mono"), muted = cssVar("--muted");
+  const cap = $("flow-cap");
+  if(cap) cap.textContent = sym ? shortSym(sym) : "—";
+
+  // readout strip
+  const rd = [
+    ["OBI", fmt.signed(m.obi ?? 0, 2), (m.obi ?? 0) >= 0],
+    ["FLOW", fmt.signed(m.flow ?? 0, 2), (m.flow ?? 0) >= 0],
+    ["CVD", fmt.signed(m.cvd_slope ?? 0, 2), (m.cvd_slope ?? 0) >= 0],
+    ["SPRD", (m.spread_bps ?? 0).toFixed(1) + "bp", null],
+    ["TICKS", (m.ticks_per_s ?? 0).toFixed(1) + "/s", null],
+  ];
+  const cw = W / rd.length;
+  rd.forEach(([k, v, good], i) => {
+    const x = i * cw + cw / 2;
+    g.textAlign = "center"; g.font = "8px " + mono; g.fillStyle = muted;
+    g.fillText(k, x, 9);
+    g.font = "11px " + mono;
+    g.fillStyle = good == null ? cssVar("--ink-2") : good ? cssVar("--good") : cssVar("--bad");
+    g.fillText(v, x, 22);
+  });
+
+  const h = _flowHist.get(sym);
+  const n = h ? h.obi.length : 0;
+  const top = 32, botStrip = 52, bot = H - botStrip;
+  const midY = (top + bot) / 2, half = (bot - top) / 2 - 2;
+  // AUTO-SCALED. Both series are bounded at +/-1 but live around +/-0.2, so a
+  // fixed +/-1 axis drew a flat line through the middle of an empty box and the
+  // shape of the pressure — the entire point of the view — was invisible. The
+  // axis follows the window's own peak and is labelled, so nothing is hidden.
+  let peak = 0.12;
+  for(let i = 0; i < n; i++) peak = Math.max(peak, Math.abs(h.obi[i]), Math.abs(h.flow[i]));
+  peak = Math.min(1, peak * 1.15);
+  const amp = half / peak;
+
+  g.strokeStyle = "rgba(255,255,255,.045)"; g.lineWidth = 1;
+  for(const f of [-0.5, 0.5]){
+    const y = Math.round(midY - f * half) + .5;
+    g.beginPath(); g.moveTo(0, y); g.lineTo(W, y); g.stroke();
+  }
+  g.strokeStyle = cssVar("--baseline");
+  g.beginPath(); g.moveTo(0, Math.round(midY) + .5); g.lineTo(W, Math.round(midY) + .5); g.stroke();
+  g.fillStyle = muted; g.font = "8px " + mono; g.textAlign = "right";
+  g.fillText("±" + peak.toFixed(2), W - 4, top + 8);
+  if(n < 2){
+    g.fillStyle = muted; g.font = "10px " + mono; g.textAlign = "center";
+    g.fillText("listening to the tape…", W / 2, midY + 3);
+  } else {
+    // The window is "everything we have been shown", drawn across the full
+    // width — anchoring x to the 220-sample capacity instead left a fresh page
+    // with its ribbon crushed into the right eighth of the panel, which reads
+    // as a broken chart rather than as a young one. The axis is labelled with
+    // the real elapsed span so the compression stays honest.
+    const X = (i) => n < 2 ? 0 : (i / (n - 1)) * W;
+    const area = (col, positive) => {
+      g.beginPath(); g.moveTo(X(0), midY);
+      for(let i = 0; i < n; i++){
+        const v = h.obi[i];
+        g.lineTo(X(i), midY - (positive ? Math.max(0, v) : Math.min(0, v)) * amp);
+      }
+      g.lineTo(X(n - 1), midY); g.closePath();
+      g.fillStyle = col; g.fill();
+    };
+    area(cssVar("--good") + "3a", true);
+    area(cssVar("--bad") + "3a", false);
+    const line = (arr, col, lw) => {
+      g.strokeStyle = col; g.lineWidth = lw; g.beginPath();
+      for(let i = 0; i < n; i++){
+        const x = X(i), y = midY - arr[i] * amp;
+        i ? g.lineTo(x, y) : g.moveTo(x, y);
+      }
+      g.stroke();
+    };
+    line(h.obi, cssVar("--accent"), 1.4);
+    line(h.flow, cssVar("--warn") + "99", 1);
+    const ly = clamp(midY - h.obi[n - 1] * amp, top, bot);
+    g.fillStyle = cssVar("--accent"); g.beginPath(); g.arc(W - 3, ly, 3, 0, 6.2832); g.fill();
+    // legend and the bid/ask sense, both anchored to the zero line so they
+    // annotate the axis instead of floating in whatever half is empty
+    g.font = "8px " + mono; g.textAlign = "left";
+    g.fillStyle = cssVar("--accent"); g.fillText("book imbalance", 4, top + 8);
+    g.fillStyle = cssVar("--warn") + "99"; g.fillText("trade flow", 82, top + 8);
+    g.fillStyle = cssVar("--good") + "99"; g.fillText("bid", 4, midY - 4);
+    g.fillStyle = cssVar("--bad") + "99";  g.fillText("ask", 4, midY + 11);
+    g.textAlign = "right"; g.fillStyle = muted;
+    g.fillText(`last ${fmt.dur(Math.round(n * 0.25))}`, W - 4, bot - 2);
+  }
+
+  // per-symbol pressure strip: same reading, every market, comparable
+  const syms = engineSymbols(), sw = W / Math.max(1, syms.length);
+  const sy = H - botStrip + 22;
+  g.fillStyle = muted; g.font = "8px " + mono; g.textAlign = "left";
+  g.fillText("BOOK PRESSURE — ALL MARKETS", 4, H - botStrip + 12);
+  syms.forEach((sm, i) => {
+    const o = clamp(S.engine.symbols?.[sm]?.micro?.obi ?? 0, -1, 1);
+    const x0 = i * sw + 6, bw = sw - 12, cx = x0 + bw / 2;
+    g.fillStyle = cssVar("--surface-3"); g.fillRect(x0, sy, bw, 6);
+    g.fillStyle = (o >= 0 ? cssVar("--good") : cssVar("--bad")) + (sm === curSymbol ? "" : "88");
+    g.fillRect(o >= 0 ? cx : cx + (o * bw) / 2, sy, Math.abs(o) * bw / 2, 6);
+    g.fillStyle = cssVar("--baseline"); g.fillRect(cx, sy - 2, 1, 10);
+    g.fillStyle = sm === curSymbol ? cssVar("--accent-2") : muted;
+    g.font = "8.5px " + mono; g.textAlign = "center";
+    g.fillText(shortSym(sm), cx, sy + 16);
+  });
+}
+
+/* ------------------------------------------------------------- 4. RISK BUDGET
+   How much room is left before the machine stops itself. The kill switch, the
+   exposure cap and the slot cap are all real limits that end trading for the
+   day, and nothing on screen showed the distance to any of them. */
+function _arc(g, cx, cy, r, frac, col, big, sub, label){
+  const A0 = Math.PI * 0.75, A1 = Math.PI * 2.25;
+  const mono = cssVar("--mono");
+  g.lineWidth = 9; g.lineCap = "butt";
+  g.strokeStyle = cssVar("--surface-3");
+  g.beginPath(); g.arc(cx, cy, r, A0, A1); g.stroke();
+  if(frac > 0){
+    g.strokeStyle = col;
+    g.beginPath(); g.arc(cx, cy, r, A0, A0 + (A1 - A0) * clamp(frac, 0, 1)); g.stroke();
+  }
+  g.textAlign = "center";
+  g.fillStyle = col; g.font = "700 16px " + mono; g.fillText(big, cx, cy + 2);
+  g.fillStyle = cssVar("--muted"); g.font = "8.5px " + mono;
+  g.fillText(sub, cx, cy + 15);
+  g.fillStyle = cssVar("--ink-2"); g.font = "9px " + mono;
+  g.fillText(label, cx, cy + r + 15);
+}
+function renderBudget(){
+  const c = _liveCtx("viz-budget", "Engine idle."); if(!c) return;
+  const { g, W, H } = c;
+  const risk = S.engine.risk || {}, pf = S.engine.portfolio || {};
+  const rc = S.config?.risk || {};
+  const mono = cssVar("--mono"), muted = cssVar("--muted");
+  const eq = pf.equity || 0;
+
+  // Day-loss budget, measured the way the kill switch measures it: REALIZED
+  // PnL against the day's opening equity (manager.py `dd = -day_realized /
+  // day_start_equity`). Driving this off live equity instead would have been
+  // smoother and wrong — an open winner would show headroom the switch does
+  // not credit, and an open loser would show a halt that is not coming.
+  const dayStart = risk.day_start_equity > 0 ? risk.day_start_equity : (pf.starting_balance || eq);
+  const budget = (rc.max_daily_loss_pct || 0.05) * dayStart;
+  const usedAbs = Math.max(0, -(risk.day_realized || 0));
+  const usedFrac = budget > 0 ? clamp(usedAbs / budget, 0, 1) : 0;
+  const leftFrac = 1 - usedFrac;
+
+  const posns = Object.entries(pf.open_positions || {});
+  let notional = 0;
+  for(const [sym, p] of posns) notional += Math.abs((p.qty || 0) * (S.engine.symbols?.[sym]?.price || p.entry || 0));
+  const lev = eq > 0 ? notional / eq : 0;
+  const levCap = rc.max_net_exposure || 2.5;
+  const slots = rc.max_open_positions || 3;
+
+  const cap = $("budget-cap");
+  if(cap) cap.textContent = risk.killed ? "HALTED" : `${fmt.signed(risk.day_realized || 0, 2)} today`;
+
+  const r = Math.min(38, (H - 78) / 2), cy = 8 + r + 4, cw = W / 3;
+  // the arc shows what is LEFT, not what is spent — a healthy day then reads as
+  // a full ring draining toward the halt, which is the question being asked
+  const dayCol = leftFrac <= 0.2 ? cssVar("--bad") : leftFrac <= 0.5 ? cssVar("--warn") : cssVar("--good");
+  _arc(g, cw * 0.5, cy, r, leftFrac, dayCol, fmt.usd(budget - usedAbs, 0),
+       Math.round(leftFrac * 100) + "% of " + fmt.usd(budget, 0), "day-loss headroom");
+  const levCol = lev >= levCap * 0.9 ? cssVar("--bad") : lev > 0 ? cssVar("--accent") : muted;
+  _arc(g, cw * 1.5, cy, r, levCap > 0 ? lev / levCap : 0, levCol, lev.toFixed(2) + "x",
+       "cap " + levCap.toFixed(1) + "x", "net exposure");
+  const slotCol = posns.length >= slots ? cssVar("--warn") : posns.length ? cssVar("--accent") : muted;
+  _arc(g, cw * 2.5, cy, r, slots > 0 ? posns.length / slots : 0, slotCol,
+       `${posns.length}/${slots}`, fmt.usd(notional, 0), "position slots");
+
+  // bottom row: the two limits that pause trading rather than end the day
+  const by = H - 26;
+  g.strokeStyle = cssVar("--grid"); g.lineWidth = 1;
+  g.beginPath(); g.moveTo(6, by - 12.5); g.lineTo(W - 6, by - 12.5); g.stroke();
+  g.textAlign = "left"; g.font = "8.5px " + mono; g.fillStyle = muted;
+  g.fillText("LOSS STREAK", 6, by);
+  const maxL = Math.max(1, rc.max_consecutive_losses || 8), lost = risk.consecutive_losses || 0;
+  const pw = Math.min(9, (W * 0.34 - 76) / maxL);
+  for(let i = 0; i < maxL; i++){
+    g.fillStyle = i < lost ? (lost >= maxL - 2 ? cssVar("--bad") : cssVar("--warn")) : cssVar("--surface-3");
+    g.fillRect(74 + i * (pw + 2), by - 7, pw, 7);
+  }
+  g.textAlign = "right"; g.font = "9px " + mono;
+  const cool = risk.cooldown_s || 0;
+  g.fillStyle = cool > 0 ? cssVar("--warn") : muted;
+  g.fillText(cool > 0 ? "cooldown " + fmt.dur(cool) : `${risk.trades_today || 0} trades today`, W - 6, by);
+  g.fillStyle = muted; g.font = "8.5px " + mono;
+  g.fillText("dd " + fmt.pct(risk.health?.drawdown || 0, 1)
+    + " · risk " + Math.round((risk.health?.scalar ?? 1) * 100) + "%", W - 6, by + 11);
+  if(risk.killed){
+    g.fillStyle = "rgba(255,45,120,.12)"; g.fillRect(0, 0, W, H);
+    g.fillStyle = cssVar("--bad"); g.font = "700 13px " + mono; g.textAlign = "center";
+    g.fillText("KILL SWITCH ENGAGED", W / 2, H / 2 + 4);
+  }
+}
+
+/* one entry point for the four, called from both render paths */
+function renderLiveViews(){
+  if(!S) return;
+  renderBoard(); renderRunway(); renderFlow(); renderBudget();
+}
+
+/* board interaction — bound once */
+(() => {
+  const host = $("viz-board"); if(!host) return;
+  const cv = host.querySelector("canvas");
+  cv.style.cursor = "pointer";
+  cv.addEventListener("pointermove", boardHover);
+  cv.addEventListener("pointerleave", () => {
+    host.querySelector(".viz-tip").classList.remove("on");
+    if(_boardHit !== -1){ _boardHit = -1; renderBoard(); }
+  });
+  cv.addEventListener("click", (ev) => {
+    if(!_boardGeom) return;
+    const r = cv.getBoundingClientRect();
+    const i = Math.floor((ev.clientY - r.top - _boardGeom.TOP) / _boardGeom.rh);
+    const sym = (i >= 0 && i < _boardGeom.syms.length) ? _boardGeom.syms[i] : null;
+    if(!sym) return;
+    autoFollow = false; $("auto-follow-btn")?.classList.remove("on");
+    setSymbol(sym); renderLiveViews();
+  });
+  // the four live views share one observer; any of them resizing means the
+  // column resized, so invalidate and redraw the set
+  const ro = new ResizeObserver(() => {
+    document.querySelectorAll(".viz canvas").forEach(vizInvalidate);
+    renderLiveViews();
+  });
+  for(const id of ["viz-board", "viz-runway", "viz-flow", "viz-budget"]){
+    const el = $(id); if(el) ro.observe(el);
+  }
 })();
