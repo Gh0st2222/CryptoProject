@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -16,6 +17,42 @@ from ..util import now_ms
 from .orchestrator import Orchestrator
 
 log = logging.getLogger("server")
+
+
+def _strip_nonfinite(o):
+    """Replace NaN / Infinity with None, recursively."""
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    if isinstance(o, dict):
+        return {k: _strip_nonfinite(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_strip_nonfinite(v) for v in o]
+    return o
+
+
+def _dumps(payload: dict) -> str:
+    """Serialize a frame that the BROWSER can actually parse.
+
+    Python writes NaN and Infinity as bare literals, which are not valid JSON —
+    `JSON.parse` throws on them. The dashboard parses every frame in
+    `ws.onmessage`, so ONE non-finite number anywhere in the snapshot aborts the
+    handler and the whole dashboard silently stops updating, with nothing wrong
+    on the server and nothing in its log. That is the "data stopped updating"
+    failure, and the previous fix patched only the four 24h-range fields that
+    happened to cause it at the time.
+
+    allow_nan=False makes the fast path cost nothing and turns the problem into
+    an exception we can see, catch and repair — instead of shipping a frame that
+    quietly breaks the client."""
+    try:
+        return json.dumps(payload, allow_nan=False)
+    except ValueError:
+        log.error("non-finite value in a %s frame — sending it as null; "
+                  "this would otherwise freeze the dashboard",
+                  payload.get("type", "?"))
+        return json.dumps(_strip_nonfinite(payload), allow_nan=False)
+
+
 STATIC = Path(__file__).parent / "static"
 
 orch = Orchestrator()
@@ -243,7 +280,7 @@ async def ws_endpoint(ws: WebSocket):
     q = orch.subscribe()
     reader = asyncio.create_task(_client_reader(ws))
     try:
-        await ws.send_text(json.dumps({"type": "state", "data": orch.status()}))
+        await ws.send_text(_dumps({"type": "state", "data": orch.status()}))
         last_full = last_hot = 0.0
         while not reader.done():
             try:
@@ -263,10 +300,10 @@ async def ws_endpoint(ws: WebSocket):
                 break
             now = now_ms() / 1000.0
             if want_full and now - last_full > FULL_MIN_GAP:
-                await ws.send_text(json.dumps({"type": "state", "data": orch.status()}))
+                await ws.send_text(_dumps({"type": "state", "data": orch.status()}))
                 last_full = last_hot = now
             elif now - last_hot > HOT_MIN_GAP:
-                await ws.send_text(json.dumps({"type": "hot", "data": orch.hot()}))
+                await ws.send_text(_dumps({"type": "hot", "data": orch.hot()}))
                 last_hot = now
     except Exception:  # noqa: BLE001 — a dying socket must never take the server down
         pass
