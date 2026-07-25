@@ -30,6 +30,20 @@ from ..strategy.features import FeatureFrame
 
 STATE_PATH = ROOT / "data_cache" / "tuner_state.json"
 
+# Worker-side cache of kernel-prepared folds (feature matrix, alpha matrix,
+# regime codes — ~0.5MB per 1k-bar fold). The research pool's processes are
+# persistent and the tuner re-scores the SAME data windows for ~30 minutes at
+# a time; without this every cycle rebuilt identical frames, 19 alpha series
+# and per-bar regime codes just to hand the kernel the same matrices.
+_PREP_CACHE: dict[tuple, tuple] = {}
+_PREP_MAX = 16
+
+
+def _fold_key(fold_candles, interval: str) -> tuple:
+    c0, cn = fold_candles[0], fold_candles[-1]
+    return (interval, len(fold_candles), int(c0.ts), int(cn.ts),
+            round(float(c0.open), 8), round(float(cn.close), 8))
+
 
 # --------------------------------------------------- parallel fold scoring
 
@@ -48,19 +62,28 @@ def score_fold(fold_candles, symbol, interval, spec, taker, slip,
     judge stays full-fidelity. Set BOT_NO_KERNEL=1 to force the Python path."""
     if len(fold_candles) < 360:
         return [-1.0] * len(param_list)
-    ff = FeatureFrame(candles_to_arrays(fold_candles), interval=interval)
     import os
     if os.getenv("BOT_NO_KERNEL", "") != "1":
         try:
-            from .kernel import kernel_fitness
+            from .kernel import kernel_fitness_prepped, prep_fold
+            key = _fold_key(fold_candles, interval)
+            prep = _PREP_CACHE.get(key)
+            if prep is None:
+                # transient frame: only the compact matrices are kept
+                prep = prep_fold(FeatureFrame(candles_to_arrays(fold_candles),
+                                              interval=interval))
+                if len(_PREP_CACHE) >= _PREP_MAX:
+                    _PREP_CACHE.pop(next(iter(_PREP_CACHE)))
+                _PREP_CACHE[key] = prep
             out = []
             for p in param_list:
                 s, r = _apply_params(base_strat, base_risk, p)
-                st = kernel_fitness(ff, s, r, spec, taker, slip, interval)["stats"]
+                st = kernel_fitness_prepped(prep, s, r, spec, taker, slip, interval)["stats"]
                 out.append(_fitness(st))
             return out
         except Exception:  # noqa: BLE001 — the kernel is an optimization, never a dependency
             pass
+    ff = FeatureFrame(candles_to_arrays(fold_candles), interval=interval)
     out = []
     for p in param_list:
         s, r = _apply_params(base_strat, base_risk, p)

@@ -975,10 +975,21 @@ def kernel_fitness(ff, strat, risk, spec, taker: float, slip_bps: float,
                    starting_balance: float = 10_000.0) -> dict:
     """Run the kernel over a prepared FeatureFrame and return _fitness-compatible
     stats. Raises if numba is unavailable — callers fall back to Python."""
+    return kernel_fitness_prepped(prep_fold(ff), strat, risk, spec, taker,
+                                  slip_bps, interval, warmup, starting_balance)
+
+
+def kernel_fitness_prepped(prep, strat, risk, spec, taker: float, slip_bps: float,
+                           interval: str, warmup: int = 300,
+                           starting_balance: float = 10_000.0) -> dict:
+    """kernel_fitness for an already-PREPARED fold (feats, amat, regs). The
+    matrices depend on price only, so the tuner's worker-side cache builds
+    them once per data window and reuses them for every candidate of every
+    cycle — instead of rebuilding frame + alphas + regimes each cycle."""
     if not HAVE_NUMBA:
         raise RuntimeError("numba unavailable")
     from ..util import interval_ms
-    feats, amat, regs = prep_fold(ff)
+    feats, amat, regs = prep
     pv = pack_params(strat, risk)
     pv[P_BPH] = 3_600_000 / interval_ms(interval)
     n_tr, tr_ts, tr_open, tr_pnl, tr_qty, tr_dist, eq, dd, gw, gl, funding, dbg_edge, dbg_pwin, dbg_thr = run_kernel(

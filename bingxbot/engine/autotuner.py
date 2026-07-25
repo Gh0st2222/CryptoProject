@@ -206,8 +206,12 @@ class AutoTuner:
         # own candle cache — never mixed with the primary clock's)
         self.trial_de: DEOptimizer | None = None
         self._trial_cache: dict[str, tuple[list, float]] = {}
+        self._trial_scored_ts = -1.0
         self._turn = 0
         self.last_trial: dict | None = None
+        self._meta_task: asyncio.Task | None = None   # meta training runs in the
+        # background: awaiting a 35-70s pool task inline stalled every 12th
+        # cycle, and duty pacing then amplified the stall ~2.6x into the gap
         # regime gauntlet: (params-sig, interval, window) -> result. Windows
         # are immutable history, so entries never expire.
         self._gauntlet_cache: dict[tuple, dict] = {}
@@ -219,13 +223,14 @@ class AutoTuner:
 
     async def stop(self) -> None:
         self.running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._task = None
+        for t in (self._task, self._meta_task):
+            if t:
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self._task = self._meta_task = None
 
     async def _loop(self) -> None:
         await asyncio.sleep(20)
@@ -729,9 +734,9 @@ class AutoTuner:
         # meta-labeling research: retrain the P(win) model on the basket's full
         # history every so often (walk-forward credentialed; persists only if
         # it beats the incumbent's held-out AUC). Runs on the research pool.
-        if self.cycles % META_TRAIN_EVERY == 0:
+        if self.cycles % META_TRAIN_EVERY == 0 and (self._meta_task is None
+                                                    or self._meta_task.done()):
             try:
-                from ..ml.meta import train_from_candles
                 # train on a WIDER basket than we trade: the traded symbols
                 # plus top-volume universe perps, up to 8 — the meta model's
                 # features are all symbol-relative (ATR units, percentiles),
@@ -755,15 +760,17 @@ class AutoTuner:
                     self.last_meta = {"trained": False, "reason": "no cached history >= MIN_BARS",
                                       "ts": int(time.time() * 1000)}
                 else:
-                    try:
-                        res = (await self.orch.map_cpu(train_from_candles,
-                                                       [(cbs, interval, strat, risk)],
-                                                       research=True))[0]
-                    except Exception as e:  # noqa: BLE001 — a pool hiccup must not cost the model
-                        log.warning("meta training on the research pool failed (%s) — in-process retry", e)
-                        res = await asyncio.to_thread(train_from_candles, cbs, interval, strat, risk)
-                    self.last_meta = {**res, "ts": int(time.time() * 1000)}
-                    log.info("meta-model training: %s", res)
+                    # BACKGROUND: the training occupies one research worker for
+                    # 35-70s. Awaiting it inline froze every 12th cycle — and
+                    # the duty-cycle governor then stretched the following gap
+                    # by the same stall again. The cycle moves on; the result
+                    # lands in last_meta when the task finishes; a still-
+                    # running task simply skips the next due slot.
+                    import copy
+                    self._meta_task = asyncio.create_task(
+                        self._meta_train(cbs, interval, copy.deepcopy(strat),
+                                         copy.deepcopy(risk)),
+                        name="meta-train")
             except Exception as e:  # noqa: BLE001 — ML must never break tuning
                 # ALWAYS leave a trace: a silent null in the snapshot hid five
                 # straight failed trainings from an entire live session's resume.
@@ -796,6 +803,28 @@ class AutoTuner:
         if self.orch._notify:
             await self.orch._notify("autotune")
         return promoted
+
+    async def _meta_train(self, cbs: dict, interval: str, strat, risk) -> None:
+        """The meta-model retrain, off the cycle's critical path. Snapshot
+        configs travel with the task so a mid-training promotion can't mutate
+        the labeler's inputs under it."""
+        try:
+            from ..ml.meta import train_from_candles
+            try:
+                res = (await self.orch.map_cpu(train_from_candles,
+                                               [(cbs, interval, strat, risk)],
+                                               research=True))[0]
+            except Exception as e:  # noqa: BLE001 — a pool hiccup must not cost the model
+                log.warning("meta training on the research pool failed (%s) — in-process retry", e)
+                res = await asyncio.to_thread(train_from_candles, cbs, interval, strat, risk)
+            self.last_meta = {**res, "ts": int(time.time() * 1000)}
+            log.info("meta-model training: %s", res)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            self.last_meta = {"trained": False, "error": f"{type(e).__name__}: {e}",
+                              "ts": int(time.time() * 1000)}
+            log.warning("meta training failed: %s", e)
 
     async def _gauntlet(self, params: dict, interval: str, taker: float, slip: float,
                         strat, risk) -> dict | None:
@@ -880,7 +909,12 @@ class AutoTuner:
         nf = int(clamp(min(self.orch.research_workers, max_folds_by_data), 1, 8))
         folds = _make_folds(train, nf)
         trials = de.trials()
-        candidates = list(de.pop) + trials
+        # same steady-state economy as the primary clock: members keep their
+        # fitness on unchanged folds — only trials are scored, halving the work
+        data_ts = self._trial_cache.get(symbol, (None, 0.0))[1]
+        need_members = (self._trial_scored_ts != data_ts) or any(f <= -1e8 for f in de.fitness)
+        self._trial_scored_ts = data_ts
+        candidates = (list(de.pop) + trials) if need_members else list(trials)
         args = [(fold, symbol, interval, spec, taker, slip, strat, risk, candidates) for fold in folds]
         fold_fits = await self.orch.map_cpu(score_fold, args, research=True)
         fold_fits = [ff for ff in fold_fits if ff and len(ff) == len(candidates)]
@@ -889,7 +923,11 @@ class AutoTuner:
         w = recency_weights(len(fold_fits))
         robust = [robust_aggregate(list(fc), w) for fc in zip(*fold_fits)]
         p = len(de.pop)
-        de.select(trials, robust[p:p + len(trials)], robust[:p])
+        if need_members:
+            member_fit, trial_fit = robust[:p], robust[p:p + len(trials)]
+        else:
+            member_fit, trial_fit = list(de.fitness), robust[:len(trials)]
+        de.select(trials, trial_fit, member_fit)
         de.save()
 
         # OOS judging on the trial clock's own basket folds — same standards

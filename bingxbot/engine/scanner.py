@@ -206,7 +206,9 @@ KEEP_ER = 0.30       # an ADOPTED symbol holds its seat down to here
 
 
 def plan_adoption(rows: list[dict], adopted: set[str], user: set[str],
-                  has_pos, cap: int, miss: dict[str, int]) -> tuple[list[str], list[str]]:
+                  has_pos, cap: int, miss: dict[str, int],
+                  blocked: set[str] | None = None,
+                  cooled: set[str] | None = None) -> tuple[list[str], list[str]]:
     """Pure seat plan for radar adoption -> (drops, adds).
 
     Seats have HYSTERESIS, mirroring the specialist bench: an incumbent is
@@ -218,12 +220,24 @@ def plan_adoption(rows: list[dict], adopted: set[str], user: set[str],
     consecutive scans tracked in `miss` (mutated in place, caller owns it),
     or to trim seats after the cap shrank. Never with an open position.
     New symbols only fill FREE seats and must clear the full adopt bar;
-    `rows` arrive ranked, so the strongest candidates are taken first."""
+    `rows` arrive ranked, so the strongest candidates are taken first.
+
+    `blocked`: symbols whose MEASURED book spread exceeds the entry gate —
+    the radar's volume floor can't see spread, so SUI/FIL-style seats sat
+    scanning forever without ever being able to fire. A blocked seat fails
+    the keep standard like any other degradation (two consecutive scans to
+    drop, so one thin-book blip doesn't evict).
+    `cooled`: recently dropped symbols the adds must skip — without a
+    cooldown a spread-trap re-qualifies on trend instantly and bounces back
+    into the seat it just lost."""
+    blocked = blocked or set()
+    cooled = cooled or set()
     by_sym = {r["symbol"]: r for r in rows}
 
     def keeps_seat(sym: str) -> bool:
         r = by_sym.get(sym)
-        return (r is not None and r.get("dir_4h", 0) != 0
+        return (sym not in blocked
+                and r is not None and r.get("dir_4h", 0) != 0
                 and r.get("er_4h", 0.0) >= KEEP_ER
                 and r.get("quote_volume", 0.0) >= TREND_MIN_QVOL)
 
@@ -244,6 +258,7 @@ def plan_adoption(rows: list[dict], adopted: set[str], user: set[str],
     free = max(0, cap - len(keep))
     adds = [r["symbol"] for r in rows
             if r["symbol"] not in user and r["symbol"] not in adopted
+            and r["symbol"] not in cooled
             and r.get("kind") == "trend" and r.get("dir_4h", 0) != 0
             and r.get("er_4h", 0.0) >= ADOPT_ER and not has_pos(r["symbol"])][:free]
     return drops, adds

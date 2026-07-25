@@ -36,6 +36,9 @@ OVERLAYS_PATH = ROOT / "data_cache" / "overlays.json"
 # it must never be able to overwrite the real session's snapshot or journal
 SHADOW_STATE_PATH = ROOT / "data_cache" / "paper_state_shadow.json"
 SHADOW_JOURNAL_PATH = ROOT / "data_cache" / "journal_shadow.jsonl"
+SEAT_COOLDOWN_S = 3600   # a dropped adopted seat sits out this long — without it a
+                         # spread-trap re-qualifies on trend instantly and bounces
+                         # straight back into the seat it just lost
 LIVE_FLAG_TTL_MS = 48 * 3600 * 1000   # a live-evidence flag expires after 2 days
 CHAMPIONS_KEEP = 100         # vault capacity
 CHAMPIONS_PROTECT_USED = 15  # the most-used champions are never pruned (proven, not just high-scoring)
@@ -196,6 +199,7 @@ class Orchestrator:
         self.shadow = None          # TraderEngine | None — the trial clock's live paper race
         self._shadow_status = ""
         self._adopt_miss: dict[str, int] = {}   # consecutive radar misses per adopted symbol
+        self._adopt_cooldown: dict[str, float] = {}   # dropped seats sit out until this ts
         try:
             self.symbol_overlays: dict[str, dict] = json.loads(OVERLAYS_PATH.read_text())
         except (OSError, json.JSONDecodeError):
@@ -1045,13 +1049,29 @@ class Orchestrator:
             return
         from ..engine.scanner import plan_adoption
         cap = max(0, int(getattr(self.cfg.strategy, "adopt_symbols", 0)))
+        now = time.time()
+        self._adopt_cooldown = {s: t for s, t in self._adopt_cooldown.items() if t > now}
+        # spread-trap detection: a seat whose MEASURED book spread exceeds the
+        # entry gate can scan forever but never fire (SUI, then FIL) — the
+        # radar's volume floor cannot see spread, only the live book can.
+        blocked: set[str] = set()
+        for s in list(eng.adopted):
+            st = eng.feed.states.get(s)
+            sp = st.spread_bps.get(0.0) if st is not None and hasattr(st, "spread_bps") else 0.0
+            if sp > self.cfg.risk.max_spread_bps:
+                blocked.add(s)
         drops, adds = plan_adoption(
             self.scanner.rows, set(eng.adopted), set(self.cfg.symbols),
             lambda s: eng.portfolio.positions.get(s) is not None,
-            cap, self._adopt_miss)
+            cap, self._adopt_miss,
+            blocked=blocked, cooled=set(self._adopt_cooldown))
         for sym in drops:
             if await eng.drop_symbol(sym):
                 self._adopt_miss.pop(sym, None)
+                self._adopt_cooldown[sym] = now + SEAT_COOLDOWN_S
+                if sym in blocked:
+                    log.info("seat vacated: %s spread stayed above %.1fbp — cooled %d min",
+                             sym, self.cfg.risk.max_spread_bps, SEAT_COOLDOWN_S // 60)
         for sym in adds:
             if len(eng.adopted) >= cap:
                 break
