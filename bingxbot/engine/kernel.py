@@ -89,6 +89,7 @@ PARAM_NAMES = (
     "max_open_positions", "max_daily_loss_pct", "max_consecutive_losses",
     "cooldown_minutes", "max_spread_bps", "scaleout_rr", "scaleout_frac",
     "trail_scale_trend", "trail_scale_chop", "maker_exits",
+    "max_position_notional_pct",
 )
 P = {n: i for i, n in enumerate(PARAM_NAMES)}
 
@@ -332,6 +333,11 @@ def run_kernel(feats, amat, regs, p, warmup, taker, maker_fee, slip_bps,
                         lev = min(min(implied, p[P_LEVMAX]), liq_cap)
                         if lev > 0:
                             qty = lev * eqs / eff
+                            # per-position notional cap, applied BEFORE the hard
+                            # risk cap exactly as risk/manager.py orders them
+                            max_notional = p[P_MAXNOT] * eqs * p[P_LEVMAX]
+                            if max_notional > 0.0 and qty * eff > max_notional:
+                                qty = max_notional / eff
                             max_risk = eqs * p[P_HARD]
                             if qty * dist > max_risk:
                                 qty = max_risk / dist
@@ -972,6 +978,7 @@ P_TRANGE = P["trade_range"]; P_RBAND = P["range_band_edge"]; P_TVOL = P["trade_v
 P_DISC = P["discipline"]; P_ALIGNG = P["trend_align_gate"]; P_ISMAKER = P["is_maker"]
 P_MOFF = P["maker_offset_bps"]; P_MWAIT = P["maker_wait_bars"]; P_PULL = P["entry_pullback_atr"]
 P_RPT = P["risk_per_trade"]; P_LEVMIN = P["min_leverage"]; P_LEVMAX = P["max_leverage"]
+P_MAXNOT = P["max_position_notional_pct"]
 P_HARD = P["max_risk_hard_pct"]; P_SLMIN = P["sl_atr_min"]; P_SLMAX = P["sl_atr_max"]
 P_TPCAP = P["tp_atr_cap"]; P_TRMIN = P["trail_atr_min"]; P_TRMAX = P["trail_atr_max"]
 P_TTIGHT = P["trail_tighten"]; P_BERR = P["be_rr"]; P_BEOFF = P["be_offset_atr"]

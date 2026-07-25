@@ -252,6 +252,20 @@ class RiskManager:
             return None
         qty = lev * equity / price
 
+        # PER-POSITION NOTIONAL CAP. This limit was declared in RiskConfig and
+        # never read by anything — a risk knob a user could set in config.json
+        # believing it protected them, that did nothing at all.
+        #
+        # Wiring it is behaviourally neutral in normal conditions: measured at
+        # the shipped defaults, risk sizing tops out near 1.6x equity at a 0.5%
+        # stop while the cap sits at 2.45x. It binds only in the tail it exists
+        # for — a very tight stop drives implied leverage into the band ceiling
+        # and the position to ~7x equity, which is exactly when a per-position
+        # ceiling should be the thing that says no.
+        max_notional = self.cfg.max_position_notional_pct * equity * lev_max
+        if max_notional > 0 and qty * price > max_notional:
+            qty = max_notional / price
+
         # hard safety cap: no single trade may risk more than max_risk_hard_pct
         max_risk = equity * self.cfg.max_risk_hard_pct
         if qty * stop_dist > max_risk:

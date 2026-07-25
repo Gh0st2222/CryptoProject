@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+from collections import deque
 from pathlib import Path
 
 from ..config import ROOT
@@ -59,7 +60,13 @@ class TradeJournal:
         self.rows: list[dict] = self._load()
 
     def _load(self) -> list[dict]:
-        rows: list[dict] = []
+        # Bounded while reading, not after. The file deliberately keeps every
+        # trade forever (the meta-model trains on that history), so parsing it
+        # all into a list and slicing to MAX_MEM afterwards made peak memory at
+        # startup grow with the age of the account — years of rows, each
+        # carrying its full decision context, materialized at once just to
+        # throw all but the last 4000 away. A deque holds the tail directly.
+        rows: deque[dict] = deque(maxlen=MAX_MEM)
         try:
             with self.path.open() as f:
                 for line in f:
@@ -69,10 +76,10 @@ class TradeJournal:
                     try:
                         rows.append(json.loads(line))
                     except json.JSONDecodeError:
-                        pass
+                        pass    # a torn final line after a crash: skip, don't die
         except OSError:
             pass
-        return rows[-MAX_MEM:]
+        return list(rows)
 
     def record(self, row: dict) -> None:
         self.rows.append(row)

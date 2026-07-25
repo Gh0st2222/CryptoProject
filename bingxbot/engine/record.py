@@ -74,6 +74,14 @@ class TrackRecord:
         if today == self._day:
             return False
         prev, self._day = self._day, today
+        # A restart re-detects the SAME turn. `_day` is restored from the last
+        # written row, and that row is the day that was CLOSED, not the day in
+        # progress — so after rolling Monday and restarting on Tuesday, `_day`
+        # reads back as Monday and the turn fires again. The monthly table sums
+        # these rows (`g.pnl += r.pnl`), so each duplicate inflated the month by
+        # a whole day's P&L and trade count, every restart.
+        if any(r.get("d") == prev and r.get("mode") == mode for r in self.rows[-4:]):
+            return False
         row = self._summary(portfolio, prev, mode)
         self.rows.append(row)
         self.rows = self.rows[-1000:]
