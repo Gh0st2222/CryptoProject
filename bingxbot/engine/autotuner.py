@@ -30,7 +30,7 @@ import time
 from ..config import MODE_IDLE
 from ..exchange.models import ContractSpec
 from ..util import clamp
-from .backtest import TUNABLES
+from .backtest import TUNABLES, _coerce
 from .search import (STATE_PATH, DEOptimizer, portfolio_folds, recency_weights,
                      robust_aggregate, score_fold, validate_params,
                      validate_params_portfolio)
@@ -52,7 +52,17 @@ MIN_ABS_FITNESS = 0.15      # ...and be clearly profitable (positive risk-adjust
                             # compressed every fitness number, and a floor tuned
                             # to the old flattering scale would have quietly
                             # made promotion stricter than anyone decided.
-TOP_K_VALIDATE = 5          # validate this many training-best members OOS, keep the best generalizer
+TOP_K_VALIDATE = 10         # DE members sent to the REAL (full-python, portfolio,
+                            # meta-aware) judge each cycle. Was 5 of a 56-member
+                            # population: the funnel, not the search, was the
+                            # bottleneck on champion quality. Widening it costs
+                            # ~1s of wall time per cycle on the research pool and
+                            # keeps the judge unbiased — the alternative (a
+                            # cheap kernel pre-screen) would have filtered
+                            # candidates with a brain that has no meta head.
+MIN_VETO_TRADES = 5         # the newest fold must show at least this many trades
+                            # before its profit factor is allowed to mean
+                            # anything — the same evidence floor _fitness uses          # validate this many training-best members OOS, keep the best generalizer
 OOS_FOLDS = 4               # purged sequential portfolio folds a champion must earn
                             # across — 4 gives the median+worst composite a real
                             # median (undersized folds self-drop in portfolio_folds)
@@ -92,6 +102,20 @@ def _current_params(cfg) -> dict:
         src = cfg.strategy if grp == "strategy" else cfg.risk
         p[name] = getattr(src, name)
     return p
+
+
+def _centroid(param_sets: list[dict]) -> dict:
+    """Parameter-space centre of several sets, coerced back onto each tunable's
+    own type (an averaged bool is a vote, an averaged int is a rounded int)."""
+    if not param_sets:
+        return {}
+    keys = set().union(*(set(p) for p in param_sets))
+    out = {}
+    for k in keys:
+        vals = [float(p[k]) for p in param_sets if k in p]
+        if vals and k in TUNABLES:
+            out[k] = _coerce(k, sum(vals) / len(vals))
+    return out
 
 
 def _oos_composite(fits: list[float]) -> float:
@@ -463,12 +487,44 @@ class AutoTuner:
         self._scored_ts = self._data_ts
         candidates = (list(self.de.pop) + trials) if need_members else list(trials)
         args = [(fold, symbol, interval, spec, taker, slip, strat, risk, candidates) for fold in folds]
-        fold_fits = await self.orch.map_cpu(score_fold, args, research=True)
-        fold_fits = [ff for ff in fold_fits if ff and len(ff) == len(candidates)]
+        # CO-TRAINING. The DE used to rank candidates on ONE rotating symbol
+        # while promotion judged them on the traded PORTFOLIO — two different
+        # objectives, so most of the search's progress never survived contact
+        # with the judge and the top-k it nominated was close to arbitrary.
+        # A second traded symbol in the training objective costs one more
+        # kernel pass (the compiled path makes this nearly free) and makes
+        # "best in training" mean something much closer to "best for the
+        # account". Symbol-specific quirks now have to be paid for twice.
+        co_sym, co_folds = "", []
+        for tsym in self._traded_symbols():
+            if tsym == symbol:
+                continue
+            hit = self._cache.get(tsym)
+            if hit and len(hit[0]) >= MIN_BARS:
+                cf = _make_folds(hit[0][:int(len(hit[0]) * 0.75)], nf)
+                # a fold below the backtester's floor scores -1.0 for EVERY
+                # candidate: harmless to the ordering but pure wasted CPU, so
+                # only co-train when the second symbol can carry the same
+                # fold count the primary is using.
+                if cf and min(len(f) for f in cf) >= MIN_FOLD_BARS:
+                    co_sym, co_folds = tsym, cf
+                break
+        if co_folds:
+            co_spec = self.orch.specs.get(co_sym, ContractSpec(co_sym))
+            args += [(fold, co_sym, interval, co_spec, co_spec.taker_fee, slip,
+                      strat, risk, candidates) for fold in co_folds]
+        raw_fits = await self.orch.map_cpu(score_fold, args, research=True)
+        ok = lambda ff: bool(ff) and len(ff) == len(candidates)   # noqa: E731
+        fold_fits = [ff for ff in raw_fits[:len(folds)] if ok(ff)]
+        co_fits = [ff for ff in raw_fits[len(folds):] if ok(ff)]
         if not fold_fits:
             return False
-        w = recency_weights(len(fold_fits))
-        robust = [robust_aggregate(list(fc), w) for fc in zip(*fold_fits)]
+        robust = [robust_aggregate(list(fc), recency_weights(len(fold_fits)))
+                  for fc in zip(*fold_fits)]
+        if co_fits:   # equal say to each symbol, so neither can carry a set alone
+            robust_co = [robust_aggregate(list(fc), recency_weights(len(co_fits)))
+                         for fc in zip(*co_fits)]
+            robust = [0.5 * (a + b) for a, b in zip(robust, robust_co)]
         p = len(self.de.pop)
         if need_members:
             member_fit, trial_fit = robust[:p], robust[p:p + len(trials)]
@@ -496,6 +552,17 @@ class AutoTuner:
                              for p, tfit in topk]
         cands += [{"source": "vault", "params": c.get("params", {}), "train_fit": None, "cid": c.get("id")}
                   for c in vault]
+        # CONSENSUS candidate: the centroid of the population's best members.
+        # Picking the single highest-scoring set is picking the luckiest draw
+        # from a noisy landscape; the centre of a good REGION is usually the
+        # sturdier choice, which is exactly the property that survives contact
+        # with a moving market. It earns nothing for being the average — it
+        # faces the same OOS folds, the same PF and evidence vetoes and the
+        # same deflated margin as everyone else.
+        if len(topk) >= 3:
+            mid = _centroid([p for p, _ in topk[:5]])
+            if mid and not any(self.orch._params_match(mid, c["params"]) for c in cands):
+                cands.append({"source": "consensus", "params": mid, "train_fit": None, "cid": None})
         # dedupe identical parameter sets (a converged population's top-k are
         # often clones, and a vault champion may equal a DE member): validating
         # duplicates wastes basket runs and double-counts the multiple-testing
@@ -555,6 +622,7 @@ class AutoTuner:
         best, best_i, best_adj, best_stats = None, -1, -1e18, {}
         best_folds: list[float] = []
         pf_passed = 0    # candidates whose newest-fold PF cleared 1.0 (promotable pool)
+        thin_rejected = 0  # ...and those refused for judging on too few trades
         for i, c in enumerate(cands):
             oos, stats0, fold_fits_oos = cand_fit(i)
             # NO in-sample-vs-OOS value penalty anymore: training fitness is a
@@ -570,8 +638,18 @@ class AutoTuner:
                 self.orch.set_champion_current(c["cid"], oos, stats0)  # keep its CURRENT eval fresh
             # absolute-profit veto: whatever the fitness composite says, a set
             # whose validation on the MOST RECENT window loses money gross
-            # (PF < 1) cannot take the seat. PF 999 (no losing trades) passes;
-            # PF 0 (no trades) fails — an unverifiable candidate isn't promotable.
+            # (PF < 1) cannot take the seat.
+            #
+            # ...but PF is meaningless on a handful of fills, and that hole was
+            # being walked through: champion 89b19991 was promoted off a newest
+            # fold with THREE trades and no losers — PF 999, which sailed past
+            # this veto, while _fitness scored that very fold -1.4 because it
+            # considers anything under 5 trades unjudgeable. The veto now uses
+            # the same evidence floor as the objective: too thin to judge is
+            # too thin to promote.
+            if int(stats0.get("trades", 0) or 0) < MIN_VETO_TRADES:
+                thin_rejected += 1
+                continue
             if float(stats0.get("profit_factor", 0.0) or 0.0) < 1.0:
                 continue
             pf_passed += 1
@@ -798,6 +876,7 @@ class AutoTuner:
             "best_fitness": round(best_adj, 3) if best is not None else None,
             # promotion transparency: how close is anything to taking the seat?
             "pf_passed": pf_passed, "cands_judged": len(cands),
+            "thin_rejected": thin_rejected, "co_symbol": co_sym or None,
             "bar": round(max(champ_fit * margin, MIN_ABS_FITNESS), 3),
             "promoted": promoted, "candidates": len(candidates),
             "vault_candidates": len(vault), "de_candidates": len(topk),
