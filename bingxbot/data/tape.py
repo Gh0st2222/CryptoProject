@@ -216,13 +216,24 @@ def read_day(root: Path, symbol: str, kind: str, day: str) -> list[list[float]]:
     """Tolerant reader for audits and tests: skips '#' session markers and any
     torn/malformed line (a power cut mid-write leaves at most one)."""
     base = Path(root) / symbol / f"{kind}-{day}.csv"
-    if base.exists():
-        text = base.read_text(encoding="utf-8", errors="replace")
-    else:
-        gz = base.with_suffix(".csv.gz")
-        if not gz.exists():
-            return []
-        text = gzip.open(gz, "rt", encoding="utf-8", errors="replace").read()
+    try:
+        if base.exists():
+            text = base.read_text(encoding="utf-8", errors="replace")
+        else:
+            gz = base.with_suffix(".csv.gz")
+            if not gz.exists():
+                return []
+            # A day killed part-way through gzipping leaves a truncated archive,
+            # and reading one raises EOFError — not an OSError. This reader is
+            # documented as tolerant of a torn LINE; it has to be equally
+            # tolerant of a torn FILE, since rotation is exactly when a power
+            # cut produces one. (Also closed properly: the old form leaked the
+            # handle on every call.)
+            with gzip.open(gz, "rt", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+    except (OSError, EOFError) as e:
+        log.warning("tape %s %s %s unreadable: %s", symbol, kind, day, e)
+        return []
     want = 4 if kind == "trades" else 3
     out: list[list[float]] = []
     for line in text.splitlines():
