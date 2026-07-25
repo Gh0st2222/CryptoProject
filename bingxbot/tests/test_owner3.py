@@ -201,3 +201,80 @@ def test_adoption_seat_hysteresis():
     drops, adds = plan_adoption([row("BTC-USDT", 0.9), row("SOL-USDT", 0.8)],
                                 set(), {"BTC-USDT"}, lambda s: s == "SOL-USDT", 2, {})
     assert adds == []
+
+
+def test_spread_trap_seats_vacate_and_cool_down():
+    """The SUI/FIL failure: a seat whose measured book spread exceeds the
+    entry gate scans forever but can never fire. Blocked seats fail the keep
+    standard (two consecutive scans, so one thin-book blip doesn't evict) and
+    the freed seat must not bounce straight back in while cooled."""
+    from bingxbot.engine.scanner import plan_adoption
+
+    def row(sym, er, qv=30e6, kind="trend", d=1):
+        return {"symbol": sym, "er_4h": er, "dir_4h": d, "quote_volume": qv, "kind": kind}
+    no_pos = lambda s: False   # noqa: E731
+    rows = [row("FIL-USDT", 0.6), row("SOL-USDT", 0.5)]
+
+    miss = {}
+    drops, adds = plan_adoption(rows, {"FIL-USDT"}, set(), no_pos, 1, miss,
+                                blocked={"FIL-USDT"})
+    assert drops == [] and miss == {"FIL-USDT": 1}, "first blocked scan only counts"
+    drops, adds = plan_adoption(rows, {"FIL-USDT"}, set(), no_pos, 1, miss,
+                                blocked={"FIL-USDT"})
+    assert drops == ["FIL-USDT"], "two blocked scans vacate the seat"
+    assert adds == ["SOL-USDT"], "the freed seat goes to a tradeable trend"
+
+    # cooled: the trap still ranks #1 on trend but may not re-enter yet
+    drops, adds = plan_adoption(rows, set(), set(), no_pos, 1, {},
+                                cooled={"FIL-USDT"})
+    assert adds == ["SOL-USDT"]
+
+    # a healthy unblocked seat with the same numbers keeps its chair
+    miss = {}
+    drops, _ = plan_adoption(rows, {"FIL-USDT"}, set(), no_pos, 1, miss)
+    assert drops == [] and miss == {}
+
+
+def test_partition_quantile_matches_sorted():
+    """_adapt_threshold's np.partition k-th statistic must return the exact
+    value the old full sort produced — this was a speed change, never a
+    behavior change (kernel parity depends on that)."""
+    import numpy as np
+
+    from bingxbot.strategy.brain import TradingBrain
+    b = TradingBrain(base_threshold=0.2, threshold_adapt=True,
+                     target_trades_per_hour=1.0, bars_per_hour=4.0)
+    vals = [((i * 37) % 100) / 100 - 0.3 for i in range(240)]
+    b._score_hist.extend(vals)
+    b._adapt_threshold()
+    rate = min(b.target_rate, 0.5 * b.bars_per_hour)
+    p = max(0.5, min(1.0 - rate / b.bars_per_hour, 0.995))
+    hist = sorted(b._score_hist)
+    q = hist[min(int(p * len(hist)), len(hist) - 1)]
+    want = min(max(0.5 * q + 0.5 * b.base_threshold, b.base_threshold), 0.92)
+    assert abs(b.threshold - want) < 1e-12
+    assert np.isfinite(b.threshold)
+
+
+def test_prep_cache_returns_identical_scores():
+    """The worker-side kernel-prep cache is a pure speedup: a cached fold must
+    score every candidate exactly as a fresh build does."""
+    import pytest
+
+    from bingxbot.data.history import synthetic_candles
+    from bingxbot.engine import search as se
+    from bingxbot.exchange.models import ContractSpec
+    pytest.importorskip("numba")
+    cfg = BotConfig()
+    candles = synthetic_candles("BTC-USDT", "15m", 800, seed=3)
+    spec = ContractSpec("BTC-USDT")
+    params = [{"base_threshold": 0.14, "risk_per_trade": 0.008},
+              {"base_threshold": 0.30, "risk_per_trade": 0.004}]
+    se._PREP_CACHE.clear()
+    first = se.score_fold(candles, "BTC-USDT", "15m", spec, 5e-4, 1.0,
+                          cfg.strategy, cfg.risk, params)
+    assert len(se._PREP_CACHE) == 1, "the fold's matrices are cached after one build"
+    second = se.score_fold(candles, "BTC-USDT", "15m", spec, 5e-4, 1.0,
+                           cfg.strategy, cfg.risk, params)
+    assert first == second
+    assert len(se._PREP_CACHE) == 1, "same fold, same entry — no duplicate"

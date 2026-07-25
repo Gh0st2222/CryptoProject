@@ -19,6 +19,8 @@ import math
 from collections import deque
 from dataclasses import dataclass
 
+import numpy as np
+
 from ..util import clamp
 from .alphas import ALPHA_META, ALPHAS, DESK_ORDER, DESKS, EVENT, MICRO_ALPHAS
 from .allocator import MetaAllocator
@@ -285,8 +287,14 @@ class TradingBrain:
         # pin the gate open)
         rate = min(self.target_rate, 0.5 * self.bars_per_hour)
         p = clamp(1.0 - rate / self.bars_per_hour, 0.5, 0.995)
-        hist = sorted(self._score_hist)
-        q = hist[min(int(p * len(hist)), len(hist) - 1)]
+        # k-th order statistic via np.partition — the IDENTICAL value
+        # sorted(hist)[k] returns, without sorting all 720 entries on every
+        # bar. Profiling showed that full sort was ~12% of an entire python
+        # backtest run (it executes once per graded bar, in every tuner
+        # validation, specialist pass, gauntlet era and meta labeling run).
+        arr = np.asarray(self._score_hist, dtype=np.float64)
+        k = min(int(p * arr.size), arr.size - 1)
+        q = float(np.partition(arr, k)[k])
         # the adaptive part may only TIGHTEN the gate above the OOS-validated
         # base_threshold — when edges run hot, the bar rises so we keep taking
         # only the fattest part of the distribution. It must never loosen BELOW
