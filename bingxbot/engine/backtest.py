@@ -231,6 +231,7 @@ class _SymSim:
         self.maker_adv = risk_cfg.maker_adverse_bps / 10_000.0
         self.maker_off = strat.maker_offset_bps / 10_000.0
         self.is_maker = strat.entry_mode == "maker"
+        self.maker_exits = bool(getattr(strat, "maker_exits", False))
         self.fees_rt = taker_fee + (self.maker_fee if self.is_maker else taker_fee)
         self.pending = None
         self.bars_held = 0
@@ -359,7 +360,19 @@ class _SymSim:
                               "stop" if not pos.breakeven_moved else "trail stop", marks,
                               slip_mult=STOP_SLIP_MULT)
             elif tp > 0 and ((h[i] >= tp) if d > 0 else (l[i] <= tp)):
-                self.close_at(i, pf, risk, tp, "target", marks, maker=True)
+                # The profit target is either a RESTING post-only order that the
+                # engine actually places (maker fee, fills at its own price, but
+                # only once price trades THROUGH it — a touch leaves us in the
+                # queue), or a market close on touch (taker + slippage). The
+                # simulator must model whichever the engine is really doing, so
+                # both branches are gated by the same setting the engine reads.
+                if self.maker_exits:
+                    thru = FILL_THROUGH_BPS / 10_000.0
+                    filled = (h[i] >= tp * (1 + thru)) if d > 0 else (l[i] <= tp * (1 - thru))
+                    if filled:
+                        self.close_at(i, pf, risk, tp, "target", marks, maker=True)
+                else:
+                    self.close_at(i, pf, risk, tp, "target", marks)
             pos = pf.positions.get(sym)
 
         # 3) brain (precomputed alpha scores when the frame is shared)
@@ -725,12 +738,22 @@ TUNABLES: dict[str, tuple] = {
     # ceiling raised after the speaking-desks fusion fix: backtest edges now
     # sit on the same (undiluted) scale live always had, so the search must be
     # able to reach genuinely tight gates on that scale.
-    "base_threshold":         (0.12, 0.55, "strategy", "float"),
+    # FLOOR LOWERED after measuring where champions actually land: five of the
+    # six promoted sets sat at 0-2% of this box, i.e. flat against the old 0.12
+    # floor. The optimizer had been asking for a lower conviction bar for its
+    # entire life and the box was answering for it — the same pinned-parameter
+    # signature that exposed the leverage loophole, pointing the other way.
+    # A lower threshold is not a looser system: the ECONOMICS gates (EV floor,
+    # cost multiple, min_p_win) are independent and unchanged, the adaptive
+    # threshold can still only tighten ABOVE this number, and OOS validation
+    # decides whether the extra frequency pays. Frequency is not the enemy —
+    # a positive expectancy needs trades to compound through.
+    "base_threshold":         (0.06, 0.55, "strategy", "float"),
     "target_trades_per_hour": (0.2, 6.0, "strategy", "float"),
     "cost_multiple":          (1.2, 3.2, "strategy", "float"),
     "hedge_eta":              (0.15, 0.60, "strategy", "float"),
     "horizon_bars":           (5, 16, "strategy", "int"),
-    "min_efficiency":         (0.10, 0.50, "strategy", "float"),
+    "min_efficiency":         (0.06, 0.50, "strategy", "float"),
     "min_p_win":              (0.40, 0.60, "strategy", "float"),
     "kelly_fraction":         (0.15, 0.60, "strategy", "float"),
     "maker_offset_bps":       (0.0, 3.0, "strategy", "float"),

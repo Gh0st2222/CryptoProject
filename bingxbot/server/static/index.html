@@ -190,6 +190,13 @@
         <div class="prog-col">
           <div class="prog-head">Career record</div>
           <div id="career" class="career"></div>
+          <div class="prog-head" style="margin-top:12px">Refused signals <span class="muted-s">— gate opportunity cost</span></div>
+          <div id="refusals" class="career"></div>
+          <div class="mw" style="color:var(--muted);font-size:9.5px;margin-top:5px;line-height:1.5">
+            Mean forward move (ATR) of signals each gate turned away, on the brain's horizon.
+            Near zero = filtering noise. Clearly positive over a real sample = filtering edge.
+            Directional only — no exits, fees or fills.
+          </div>
         </div>
       </div>
     </div>
@@ -400,6 +407,10 @@
           <label class="check"><input type="checkbox" id="cfg-clocktrial"> clock trial — research an alternate bar clock in parallel</label>
           <div class="ff"><label>Trial clock</label><select class="btn" id="cfg-trialint"><option>1m</option><option>3m</option><option>5m</option><option>15m</option><option>30m</option></select></div>
           <label class="check"><input type="checkbox" id="cfg-tape"> record BingX tape (own tick archive, disk-capped)</label>
+          <label class="check"><input type="checkbox" id="cfg-makerexit"> maker exits — rest the profit target instead of market-closing it</label>
+          <div class="hint">Saves ~0.04% of notional per target exit, but only applies to trades that
+            carry a fixed target. With no target cap set, exits are trail/stop — which cannot rest on the
+            book — so this earns nothing until the strategy uses targets.</div>
           <div class="ff"><label>Research duty — CPU share the tuner may use (live, no restart)</label>
             <div style="display:flex;align-items:center;gap:10px">
               <input type="range" id="cfg-duty" min="0.10" max="0.50" step="0.01" style="flex:1">

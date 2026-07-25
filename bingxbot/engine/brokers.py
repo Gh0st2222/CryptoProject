@@ -28,8 +28,15 @@ class Broker:
                             reason: str, bar_ts: int) -> OrderResult:
         raise NotImplementedError
 
-    async def close_position(self, symbol: str, reason: str, frac: float | None = None) -> OrderResult:
+    async def close_position(self, symbol: str, reason: str, frac: float | None = None,
+                             maker_price: float | None = None) -> OrderResult:
         raise NotImplementedError
+
+    async def arm_maker_exit(self, symbol: str, side: str, qty: float, price: float) -> bool:
+        return False
+
+    async def cancel_maker_exit(self, symbol: str) -> None:
+        return None
 
     async def flatten_all(self, reason: str) -> None:
         raise NotImplementedError
@@ -48,6 +55,7 @@ class PaperBroker(Broker):
         self.entry_mode = entry_mode
         self.slip = slippage_bps / 10_000.0
         self.maker_adverse = maker_adverse_bps / 10_000.0
+        self._exit_orders: dict[str, tuple[str, float]] = {}   # symbol -> (side, resting price)
 
     def _fill_price(self, symbol: str, is_buy: bool, maker: bool = False) -> float:
         st = self.states.get(symbol)
@@ -123,14 +131,70 @@ class PaperBroker(Broker):
                  side, symbol, lim)
         return OrderResult(ok=False, error="pullback limit unfilled")
 
-    async def close_position(self, symbol: str, reason: str, frac: float | None = None) -> OrderResult:
+    async def arm_maker_exit(self, symbol: str, side: str, qty: float, price: float) -> bool:
+        """Paper must simulate the resting exit, not skip it. The base class
+        returns False, and inheriting that silently would make paper the ONLY
+        engine still taking its targets: the simulator and the compiled kernel
+        both price a maker exit when the setting is on, so a paper account that
+        market-closes on touch would pay taker where the champion was measured
+        paying maker — the champion is then judged on an execution model the
+        account never uses. Same failure the whole parity doctrine exists to
+        prevent, just on the cheaper side of the fee.
+
+        Post-only is modelled honestly: an order that would already cross the
+        current mark is REJECTED, exactly as the exchange rejects it, and the
+        caller falls back to market-close-on-touch."""
+        if price <= 0 or qty <= 0:
+            return False
+        spec = self.specs.get(symbol, ContractSpec(symbol))
+        if round_step(qty, spec.qty_precision) < spec.min_qty:
+            return False
+        px = round_step(price, spec.price_precision)
+        # the touch this order would cross INTO: closing a LONG is a SELL, which
+        # crosses against the bid; closing a SHORT is a BUY, against the ask.
+        # (`maker=True` asks _fill_price for the raw touch with no slippage.)
+        touch = self._fill_price(symbol, is_buy=(side == LONG), maker=True)
+        d = 1 if side == LONG else -1
+        if touch > 0 and (touch - px) * d >= 0:
+            # the target is already at/through the mark: a post-only order there
+            # would be an immediate taker, so the exchange refuses it.
+            log.debug("[paper] maker exit %s @ %.6g would cross touch %.6g — rejected",
+                      symbol, px, touch)
+            return False
+        self._exit_orders[symbol] = (side, px)
+        log.info("[paper] maker exit armed %s %s qty=%.6g @ %.6g", side, symbol, qty, px)
+        return True
+
+    async def cancel_maker_exit(self, symbol: str) -> None:
+        self._exit_orders.pop(symbol, None)
+
+    def maker_exit_price(self, symbol: str) -> float:
+        rec = self._exit_orders.get(symbol)
+        return rec[1] if rec else 0.0
+
+    async def close_position(self, symbol: str, reason: str, frac: float | None = None,
+                             maker_price: float | None = None) -> OrderResult:
+        """`maker_price` closes the position as a RESTING order that the tape
+        traded through: it fills at exactly that price and pays the maker fee,
+        because we were the passive side. Everything else crosses the spread
+        and pays taker, like a market order."""
         pos = self.portfolio.positions.get(symbol)
         if pos is None:
             return OrderResult(ok=False, error="no position")
-        px = self._fill_price(symbol, is_buy=(pos.side == SHORT))
+        maker = maker_price is not None and maker_price > 0
+        px = float(maker_price) if maker else self._fill_price(symbol, is_buy=(pos.side == SHORT))
         if px <= 0:
             return OrderResult(ok=False, error="no market price")
         spec = self.specs.get(symbol, ContractSpec(symbol))
+        if maker:
+            fee = pos.qty * px * self.maker_fee
+            planned_risk = abs(pos.entry_price - pos.stop_price) * pos.qty if pos.stop_price > 0 else 0.0
+            tr = self.portfolio.close_position(symbol, px, now_ms(), fee, reason, planned_risk)
+            self._exit_orders.pop(symbol, None)   # the order that just filled
+            if tr:
+                log.info("[paper] MAKER EXIT %s %s @ %.6g pnl=%.4f (%s)",
+                         pos.side, symbol, px, tr.pnl, reason)
+            return OrderResult(ok=True, filled_price=px, filled_qty=pos.qty, fee=fee)
         if frac is not None and 0.0 < frac < 1.0:
             qty_out = pos.qty * frac
             # dust guard: if either leg would violate exchange minimums, the
@@ -145,6 +209,7 @@ class PaperBroker(Broker):
         fee = pos.qty * px * self.taker_fee
         planned_risk = abs(pos.entry_price - pos.stop_price) * pos.qty if pos.stop_price > 0 else 0.0
         tr = self.portfolio.close_position(symbol, px, now_ms(), fee, reason, planned_risk)
+        self._exit_orders.pop(symbol, None)   # position gone: the target is moot
         if tr:
             log.info("[paper] CLOSE %s %s @ %.6g pnl=%.4f (%s)", pos.side, symbol, px, tr.pnl, reason)
         return OrderResult(ok=True, filled_price=px, filled_qty=pos.qty, fee=fee)
@@ -163,6 +228,7 @@ class LiveBroker(Broker):
         self.cfg = cfg
         self._prepared: set[str] = set()
         self._lev_set: dict[tuple[str, str], int] = {}
+        self._exit_orders: dict[str, tuple[str, float]] = {}   # symbol -> (order id, price)
 
     async def prepare_symbol(self, symbol: str) -> None:
         """Set isolated/cross margin mode once per symbol. Never fatal."""
@@ -237,9 +303,71 @@ class LiveBroker(Broker):
     def _sl_tp(self, sized: SizedOrder) -> tuple[dict, dict | None]:
         wt = "MARK_PRICE"
         sl = {"type": "STOP_MARKET", "stopPrice": sized.stop_price, "workingType": wt}
+        # The protective STOP is ALWAYS a market order and always attached to
+        # the entry — a stop that fails to fill is the one loss you cannot
+        # iterate on. Only the profit target is ever allowed to rest passively.
+        if self.cfg.strategy.maker_exits:
+            return sl, None
         tp = ({"type": "TAKE_PROFIT_MARKET", "stopPrice": sized.take_profit, "workingType": wt}
               if sized.take_profit > 0 else None)
         return sl, tp
+
+    async def arm_maker_exit(self, symbol: str, side: str, qty: float, price: float) -> bool:
+        """Rest the profit target on the book as a post-only, REDUCE-ONLY limit
+        so the exit earns the maker fee instead of paying taker + slippage.
+
+        Two exchange-enforced properties make this safe to leave sitting there:
+        `reduceOnly` means the order can only ever SHRINK an existing position —
+        it can never open a reverse one if the position is already gone — and
+        `PostOnly` means it is rejected rather than filled if it would cross,
+        so it can never turn into the taker order we are trying to avoid.
+
+        Returns False on any failure, and the caller then keeps the engine's
+        existing market-close-on-touch behaviour: a position is never left
+        without a way out."""
+        spec = self.specs.get(symbol, ContractSpec(symbol))
+        px = round_step(price, spec.price_precision)
+        q = round_step(qty, spec.qty_precision)
+        if px <= 0 or q < spec.min_qty:
+            return False
+        await self.cancel_maker_exit(symbol)     # never stack two resting exits
+        try:
+            resp = await self.rest.place_order(
+                symbol=symbol,
+                side=SELL if side == LONG else BUY,   # the closing side
+                position_side=side,                   # ...of THIS position (hedge mode)
+                order_type="LIMIT", quantity=q, price=px,
+                time_in_force="PostOnly", reduce_only=True,
+                client_order_id=f"bxx{uuid.uuid4().hex[:11]}",
+            )
+        except (BingXAPIError, BingXError) as e:
+            log.warning("maker exit %s @ %.6g rejected (%s) — falling back to market close",
+                        symbol, px, e)
+            return False
+        oid = str(resp.get("orderId", "")) if isinstance(resp, dict) else ""
+        if not oid:
+            return False
+        self._exit_orders[symbol] = (oid, px)
+        log.info("[LIVE] maker exit armed %s %s qty=%.6g @ %.6g id=%s", side, symbol, q, px, oid)
+        return True
+
+    async def cancel_maker_exit(self, symbol: str) -> None:
+        """Take the resting exit off the book. Must run whenever the position
+        changes size or goes away, or the order outlives what it was sized for."""
+        rec = self._exit_orders.pop(symbol, None)
+        if not rec:
+            return
+        try:
+            await self.rest.cancel_order(symbol, rec[0])
+        except BingXError as e:
+            log.debug("cancel maker exit %s: %s", symbol, e)
+
+    def maker_exit_price(self, symbol: str) -> float:
+        """The price of the resting exit, if one is armed — so a position that
+        vanished from the exchange between polls is booked at the price it
+        actually filled at, not at a guess."""
+        rec = self._exit_orders.get(symbol)
+        return rec[1] if rec else 0.0
 
     async def _open_taker(self, symbol: str, side: str, sized: SizedOrder,
                           reason: str, bar_ts: int, spec: ContractSpec) -> OrderResult:
@@ -357,10 +485,15 @@ class LiveBroker(Broker):
             pass
         return 0.0, 0.0, 0.0
 
-    async def close_position(self, symbol: str, reason: str, frac: float | None = None) -> OrderResult:
+    async def close_position(self, symbol: str, reason: str, frac: float | None = None,
+                             maker_price: float | None = None) -> OrderResult:
+        # `maker_price` is a paper-simulation concept: live maker exits are a
+        # real resting order on the book, so a live close here is always the
+        # deliberate market exit (stop, edge flip, time stop, flatten).
         pos = self.portfolio.positions.get(symbol)
         if pos is None:
             return OrderResult(ok=False, error="no position")
+        await self.cancel_maker_exit(symbol)   # the target is moot now
         spec = self.specs.get(symbol, ContractSpec(symbol))
         partial = frac is not None and 0.0 < frac < 1.0
         close_qty = round_step(pos.qty * frac, spec.qty_precision) if partial else \
@@ -413,13 +546,22 @@ class LiveBroker(Broker):
         if pos is None:
             return
         px = price
+        maker = False
         if px <= 0:
-            # best effort: assume the protective level that was armed
-            px = pos.stop_price if pos.stop_price > 0 else pos.entry_price
+            # A resting maker exit is the MOST likely reason a position
+            # disappeared between polls, and it fills at a known price — book
+            # it there (and at the maker fee it actually paid) instead of
+            # guessing the stop level and recording a loss that never happened.
+            mx = self.maker_exit_price(symbol)
+            if mx > 0:
+                px, maker, reason = mx, True, "target (maker exit)"
+            else:
+                px = pos.stop_price if pos.stop_price > 0 else pos.entry_price
         spec = self.specs.get(symbol, ContractSpec(symbol))
-        fee = pos.qty * px * spec.taker_fee
+        fee = pos.qty * px * (spec.maker_fee if maker else spec.taker_fee)
         planned_risk = abs(pos.entry_price - pos.stop_price) * pos.qty if pos.stop_price > 0 else 0.0
         self.portfolio.close_position(symbol, px, now_ms(), fee, reason, planned_risk)
+        self._exit_orders.pop(symbol, None)   # it filled (or died with the position)
 
     async def reconcile(self, symbols: list[str]) -> None:
         """Compare exchange truth with local state; adopt or record differences."""

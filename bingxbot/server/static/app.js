@@ -469,6 +469,7 @@ function renderSettings(){
   $("cfg-adopt").value=c.strategy.adopt_symbols??2;
   $("cfg-clocktrial").checked=!!c.strategy.clock_trial; $("cfg-trialint").value=c.strategy.trial_interval||"5m";
   if(c.tape) $("cfg-tape").checked=!!c.tape.enabled;
+  $("cfg-makerexit").checked=c.strategy.maker_exits!==false;
   const duty=c.strategy.research_duty??0.28;
   $("cfg-duty").value=duty; $("cfg-duty-val").textContent=`${Math.round(duty*100)}%`;
   if(c.carry){ $("cfg-carry").checked=c.carry.enabled; $("cfg-carrymax").value=c.carry.max_positions; }
@@ -613,7 +614,8 @@ $("cfg-save").onclick=async()=>{
     strategy:{ interval:$("cfg-interval").value, auto_tune:$("cfg-autotune").checked,
       adopt_symbols:parseInt($("cfg-adopt").value,10),
       clock_trial:$("cfg-clocktrial").checked, trial_interval:$("cfg-trialint").value,
-      research_duty:parseFloat($("cfg-duty").value) },
+      research_duty:parseFloat($("cfg-duty").value),
+      maker_exits:$("cfg-makerexit").checked },
     tape:{ enabled:$("cfg-tape").checked },
     risk:{ min_leverage:parseInt($("cfg-levmin").value,10), max_leverage:parseInt($("cfg-levmax").value,10),
       max_daily_loss_pct:parseFloat($("cfg-dayloss").value), max_risk_hard_pct:parseFloat($("cfg-hardrisk").value),
@@ -1078,6 +1080,14 @@ function renderProgress(){
          <div class="ai">${ic}</div><div class="an">${nm}</div></div>`).join("");
     _achFresh.clear();   // the pop animation plays once, on first sight
   }
+  const ref=$("refusals"), rf=S?.engine?.refusals;
+  if(ref) ref.innerHTML=!rf?.gates?.length
+    ? `<div class="cr"><span>${rf?.pending?`${rf.pending} pending · ${rf.graded||0} graded`:"no refusals graded yet"}</span><b>—</b></div>`
+    : rf.gates.map(g=>{
+        const m=g.mean_move_atr, cls=m>0.15?"pnl-pos":m<-0.15?"pnl-neg":"";
+        return `<div class="cr" title="${g.refused} refused · ${(g.win_rate*100).toFixed(0)}% went the signal's way">
+          <span>${esc(g.gate)}</span><b class="${cls}">${fmt.signed(m,2)} ATR <span style="color:var(--muted)">×${g.refused}</span></b></div>`;
+      }).join("");
   const car=$("career");
   if(car) car.innerHTML=[
     ["Rank",`${op.title} · L${op.lvl}`],["Total XP",op.xp.toLocaleString()],

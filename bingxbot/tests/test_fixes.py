@@ -718,9 +718,15 @@ def test_validate_params_portfolio_smoke():
 # ------------------------------------------------------- tunable clamping
 
 def test_apply_tunables_clamps_to_bounds():
+    """Out-of-box values must land inside the box. Asserted against TUNABLES
+    itself rather than literals, so a deliberately re-tuned bound (the
+    base_threshold floor was lowered once the champions showed they were all
+    pinned against it) can never make this test quietly meaningless."""
+    from bingxbot.engine.backtest import TUNABLES
     s, r = StrategyConfig(), RiskConfig()
     apply_tunables_inplace(s, r, {"risk_per_trade": 5.0, "base_threshold": -3.0,
                                   "time_stop_bars": 100000})
-    assert r.risk_per_trade <= 0.014, "an out-of-box apply must be clamped"
-    assert s.base_threshold >= 0.12
-    assert r.time_stop_bars <= 200
+    for name, src in (("risk_per_trade", r), ("base_threshold", s), ("time_stop_bars", r)):
+        lo, hi = TUNABLES[name][0], TUNABLES[name][1]
+        assert lo <= getattr(src, name) <= hi, f"{name} escaped its box"
+    assert r.risk_per_trade < 5.0 and s.base_threshold > -3.0, "clamping actually happened"

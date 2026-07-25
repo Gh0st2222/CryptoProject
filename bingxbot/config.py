@@ -53,6 +53,30 @@ class StrategyConfig:
     target_trades_per_hour: float = 2.5
     cost_multiple: float = 1.85     # predicted move must exceed round-trip cost x this
     micro_confirm: bool = True      # order-flow agreement gate at entry (live/paper)
+    # Rest the PROFIT TARGET as a post-only, reduce-only limit instead of
+    # market-closing when price touches it. Worth ~0.04% of notional per exit
+    # (taker->maker fee plus the slippage and spread cross) — on the scalp
+    # archetype, whose target is ~1.1 ATR, that is a large share of the whole
+    # gross target and decides whether range trading is viable at all.
+    # NOT a free upgrade: a resting order only fills when price trades THROUGH
+    # it, so a touch that used to bank a winner may now leave the position
+    # open for the trail to manage. The simulator models exactly that.
+    # Protective STOPS are never affected — they stay market orders, because a
+    # stop that fails to fill is a catastrophe while a target that fails to
+    # fill is a free ride.
+    #
+    # REACH, measured — read this before expecting it to show up in the P&L.
+    # It only ever applies to a FIXED target, and with the shipped default
+    # `risk.tp_atr_cap = 0.0` trend trades have no fixed target at all. Over
+    # 717 simulated trades on the default config the exit reasons were 50.6%
+    # stop, 49.0% trail stop, 0.4% edge reversal — ZERO maker-eligible exits.
+    # That is structural, not a bug: a trail is a moving price and a moving
+    # price cannot rest on the book, so those exits are irreducibly taker.
+    # Where it does fire (scalp style, or tp_atr_cap > 0) the saving measured
+    # 565 over ~280 target exits = 2.02 each = 0.040% of notional, exactly the
+    # figure above. So: correct, safe and free to leave on — but it earns
+    # nothing until the strategy actually carries a target.
+    maker_exits: bool = True
     # clock trial (manual research switch): the tuner alternates cycles between
     # the live interval and trial_interval, each with its own gene pool, and
     # records TAGGED champions for both — evidence for "which bar clock earns
@@ -259,7 +283,7 @@ _NESTED_USER_OWNED = {
     # auto_tune is user-owned (Settings toggle) — a migration must not silently
     # re-enable a tuner the user turned off.
     "strategy": {"interval", "warmup_bars", "adopt_symbols", "auto_tune",
-                 "clock_trial", "trial_interval", "research_duty"},
+                 "clock_trial", "trial_interval", "research_duty", "maker_exits"},
     "tape": {"enabled", "max_disk_mb", "book_ms"},
     # leverage band and max_open_positions intentionally omitted so migrating an
     # old config picks up the current defaults (2-7x band, 3 concurrent tokens);
