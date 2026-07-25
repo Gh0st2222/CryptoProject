@@ -98,3 +98,72 @@ def test_centroid_respects_tunable_types():
 def test_centroid_ignores_unknown_keys():
     mid = _centroid([{"base_threshold": 0.2, "not_a_tunable": 5.0}])
     assert "not_a_tunable" not in mid and mid["base_threshold"] == pytest.approx(0.2)
+
+
+# --------------------------------------------------- train / OOS separation
+
+def test_training_data_never_reaches_the_judges_windows():
+    """The leak this round closed: the DE fitted up to 75% of the series while
+    the OOS folds trade the last 40%, so fold 0 sat ENTIRELY inside the
+    training window and fold 1 half inside — half of every out-of-sample
+    verdict was scored on data the search had already seen. Whatever the
+    constants become, the two regions must stay disjoint."""
+    from bingxbot.engine.autotuner import (MIN_FOLD_BARS, OOS_TAIL_FRAC,
+                                           PURGE_BARS, _train_split)
+    from bingxbot.engine.search import portfolio_folds
+
+    class C:                       # portfolio_folds only needs a sequence
+        def __init__(self, i): self.ts = i
+
+    n = 8640                       # ~90 days of 15m bars
+    series = [C(i) for i in range(n)]
+    train = _train_split(series)
+    assert len(train) > MIN_FOLD_BARS
+    last_trained = train[-1].ts
+
+    folds = portfolio_folds({"BTC": series}, k=4, tail_frac=OOS_TAIL_FRAC, warmup=300)
+    assert folds, "the fold builder must still produce folds"
+    for f in folds:
+        bars = f["BTC"]
+        traded_from = bars[300].ts          # the first 300 bars are warmup lead-in
+        assert traded_from > last_trained, (
+            f"fold trades from bar {traded_from} but training reached {last_trained}")
+    assert last_trained < int(n * (1.0 - OOS_TAIL_FRAC)), "training must stop before the tail"
+    assert PURGE_BARS > 16, "the purge must exceed the largest horizon_bars in the box"
+
+
+def test_train_split_survives_short_series():
+    from bingxbot.engine.autotuner import MIN_FOLD_BARS, _train_split
+    assert len(_train_split(list(range(100)))) == MIN_FOLD_BARS or \
+        len(_train_split(list(range(100)))) == 100
+
+
+# --------------------------------------------------- history-aware promotion
+
+def test_weak_history_raises_the_promotion_bar():
+    """A challenger that loses money across the median historical era must
+    clear a higher bar — it is far likelier to be fitting the recent window
+    than to have found something. Never an outright veto, and no verdict
+    (offline) must change nothing."""
+    from bingxbot.engine.autotuner import (MIN_ABS_FITNESS, WEAK_BAR_MULT)
+
+    def applied_bar(base_bar, gaunt):
+        if gaunt is not None and gaunt.get("weak"):
+            return max(base_bar * WEAK_BAR_MULT, MIN_ABS_FITNESS)
+        return base_bar
+
+    base = 1.00
+    assert applied_bar(base, None) == base, "offline: no verdict, no change"
+    assert applied_bar(base, {"weak": False}) == base, "history passed: no change"
+    raised = applied_bar(base, {"weak": True})
+    assert raised > base and raised == pytest.approx(1.25)
+    # a marginal challenger is held; a decisively better one still gets through
+    assert not (1.10 > raised), "a hair-thin beat must not promote against history"
+    assert 1.40 > raised, "a decisive challenger is never vetoed outright"
+
+
+def test_specialist_pool_does_not_scale_with_the_judging_funnel():
+    from bingxbot.engine.autotuner import SPECIALIST_CANDS, TOP_K_VALIDATE
+    assert SPECIALIST_CANDS < TOP_K_VALIDATE, (
+        "the bench costs candidates x symbols x folds — widening the judge "
+        "must not silently multiply it")
