@@ -44,6 +44,24 @@ class StrategyConfig:
                                     # reactive intra-bar scanner already times entries
                                     # inside the forming bar; the signal itself needs a
                                     # timeframe where edge/cost > 1 (15m-4h).
+    # Decision clock, separate from the signal clock above. 1 = decide only when
+    # the exchange's own 15m bar closes (the historical behaviour, bit for bit).
+    # N = also decide on N-1 phase-shifted windows in between, each a COMPLETE
+    # 15m window built from finished 1m bars, so a setup that becomes true at
+    # :01 is acted on at :01 instead of waiting for :15.
+    #
+    # This is NOT the old intra-bar scanner, which scored the still-FORMING bar
+    # and lost ten live trades doing it: a half-built candle understates ATR by
+    # up to 20%, which both tightens the stop and inflates size (~22%) at the
+    # same time. A phase window contains no partial candle at all — measured
+    # across all 15 offsets, atr_pct moves +0.6% at worst and the MTF veto rate
+    # is unchanged (see data/phases.py and test_phases.py).
+    #
+    # Costs to respect: looking N times as often at overlapping windows crosses
+    # the threshold more often, so `threshold_adapt` will tighten to hold the
+    # target trade rate — which means selectivity changes and a champion
+    # validated at 1 phase HAS NO CREDENTIAL at 15. Re-validate before trusting.
+    entry_phases: int = 1
     warmup_bars: int = 350          # bars required before the brain may trade
     horizon_bars: int = 8           # bars over which alpha/desk calls are graded
     hedge_eta: float = 0.35         # multiplicative-weights learning rate (alphas)
@@ -283,7 +301,8 @@ _NESTED_USER_OWNED = {
     # auto_tune is user-owned (Settings toggle) — a migration must not silently
     # re-enable a tuner the user turned off.
     "strategy": {"interval", "warmup_bars", "adopt_symbols", "auto_tune",
-                 "clock_trial", "trial_interval", "research_duty", "maker_exits"},
+                 "clock_trial", "trial_interval", "research_duty", "maker_exits",
+                 "entry_phases"},
     "tape": {"enabled", "max_disk_mb", "book_ms"},
     # leverage band and max_open_positions intentionally omitted so migrating an
     # old config picks up the current defaults (2-7x band, 3 concurrent tokens);
