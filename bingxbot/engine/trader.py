@@ -139,6 +139,12 @@ class TraderEngine:
         # way to tell a gate that saves money from one that starves the account
         self.refusals = RefusalLedger(horizon=cfg.strategy.horizon_bars)
         self._bar_idx: dict[str, int] = {}
+        # Slots reserved by the CARRY desk's in-flight resting entries. The desk
+        # trades symbols deliberately excluded from self.ctx, so its pending
+        # orders are invisible to pending_entries() below — and its entry window
+        # is up to 120s, during which this engine would otherwise think the slot
+        # is free and open one position too many.
+        self.carry_pending = 0
 
     def _interval_ms(self) -> int:
         from ..util import interval_ms
@@ -416,9 +422,15 @@ class TraderEngine:
     def pending_entries(self) -> int:
         """Resting limit entries currently waiting for a fill. Each one is a
         RESERVED position slot: counting only open positions at decision time
-        let several resting limits all fill and exceed max_open_positions."""
-        return sum(1 for c in self.ctx.values()
-                   if c.pending_task is not None and not c.pending_task.done())
+        let several resting limits all fill and exceed max_open_positions.
+
+        The carry desk's in-flight entries count too. It trades symbols kept out
+        of self.ctx on purpose, so its reservations are invisible here — and it
+        rests an entry for up to 120s, which is ample time for this engine to
+        decide the slot is free and take it as well."""
+        return self.carry_pending + sum(
+            1 for c in self.ctx.values()
+            if c.pending_task is not None and not c.pending_task.done())
 
     def focus_symbol(self) -> str:
         """The symbol the machine is 'looking at' right now: an open position

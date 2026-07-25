@@ -13,7 +13,7 @@ from pathlib import Path
 
 from ..exchange.models import Candle
 from ..exchange.rest import BingXRest
-from ..util import interval_ms, now_ms
+from ..util import atomic_write, interval_ms, now_ms
 
 log = logging.getLogger("history")
 
@@ -41,7 +41,12 @@ class HistoryStore:
                     Candle(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5]))
                     for r in csv.reader(f)
                 ]
-        except (OSError, ValueError, IndexError):
+        # EOFError is the one a TRUNCATED gzip raises ("compressed file ended
+        # before the end-of-stream marker"), and it is not an OSError — so the
+        # handler that exists precisely to discard an unreadable cache used to
+        # let it straight through, and every later backtest on that symbol
+        # raised until someone deleted the file by hand.
+        except (OSError, EOFError, ValueError, IndexError):
             log.warning("cache unreadable, discarding: %s", p)
             return []
 
@@ -50,8 +55,11 @@ class HistoryStore:
         w = csv.writer(buf)
         for c in candles:
             w.writerow([c.ts, c.open, c.high, c.low, c.close, c.volume])
-        with gzip.open(self._path(symbol, interval), "wt", newline="") as f:
-            f.write(buf.getvalue())
+        # Atomic: this can be many megabytes, and writing it straight to the
+        # final path is how the truncated file above gets created in the first
+        # place. Compress in memory, then replace in one step.
+        atomic_write(self._path(symbol, interval),
+                     gzip.compress(buf.getvalue().encode("utf-8"), 6))
 
     @staticmethod
     def _merge(a: list[Candle], b: list[Candle]) -> list[Candle]:

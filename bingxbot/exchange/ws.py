@@ -31,7 +31,12 @@ def _decode(msg: aiohttp.WSMessage) -> str | None:
     if msg.type == aiohttp.WSMsgType.BINARY:
         try:
             return gzip.decompress(msg.data).decode("utf-8")
-        except (OSError, UnicodeDecodeError):
+        # A TRUNCATED gzip payload raises EOFError, which is not an OSError.
+        # This function exists to turn a bad frame into "skip it" (None), but
+        # EOFError escaped to the run loop's catch-all instead — and that means
+        # tearing down and rebuilding the whole socket, so one corrupt frame
+        # cost a data gap on every symbol on the connection.
+        except (OSError, EOFError, UnicodeDecodeError):
             return None
     if msg.type == aiohttp.WSMsgType.TEXT:
         return msg.data

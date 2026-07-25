@@ -562,7 +562,15 @@ let ws,wsRetry=1;
 function connectWS(){
   const proto=location.protocol==="https:"?"wss":"ws";
   ws=new WebSocket(`${proto}://${location.host}/ws`);
-  ws.onmessage=(ev)=>{ const m=JSON.parse(ev.data);
+  // One unparseable frame must cost us that frame, not the whole dashboard.
+  // An exception thrown out of onmessage aborts the handler, and since every
+  // update arrives this way the UI then just stops — looking connected, with
+  // nothing in view to say why. The server no longer emits NaN (which is not
+  // valid JSON and is what used to do this), but a truncated frame should be
+  // survivable regardless.
+  ws.onmessage=(ev)=>{
+    let m; try{ m=JSON.parse(ev.data); }
+    catch(err){ console.warn("dropped an unparseable frame:",err.message); return; }
     if(m.type==="state"){ S=m.data; scheduleRender("full"); }
     else if(m.type==="hot"){ applyHot(m.data); } };
   ws.onopen=()=>{wsRetry=1;}; ws.onclose=()=>setTimeout(connectWS,Math.min(wsRetry*=1.6,8)*1000); ws.onerror=()=>ws.close();

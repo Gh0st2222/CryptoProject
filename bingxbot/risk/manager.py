@@ -149,6 +149,17 @@ class RiskManager:
 
     def _roll_day(self, equity: float) -> None:
         day = time.strftime("%Y-%m-%d", time.gmtime(self.clock()))
+        # Heal a missing anchor. The daily-loss kill is written
+        # `if day_start_equity > 0: dd = -day_realized / day_start_equity`, so a
+        # zero anchor does not fail loudly — it skips the check, and the limit
+        # simply stops existing for the rest of the day. That is reachable
+        # without any corruption: restore a snapshot whose day_key is still
+        # today and the roll below is skipped, so whatever anchor came out of
+        # the file is the one we keep. Re-anchoring on current equity is
+        # approximate; having no daily-loss limit is not an option.
+        if self.state.day_key == day and self.state.day_start_equity <= 0 and equity > 0:
+            self.state.day_start_equity = equity
+            log.warning("daily-loss anchor was missing — re-anchored at %.2f", equity)
         if day != self.state.day_key:
             old = self.state
             self.state = RiskState(day_key=day, day_start_equity=equity)
@@ -199,6 +210,12 @@ class RiskManager:
             return False, f"cooldown for {int(st.cooldown_until - self.clock())}s"
         if open_positions >= self.cfg.max_open_positions:
             return False, "max open positions"
+        # `spread_bps > max` and `equity <= 0` are both False for NaN, so the
+        # last two gates here failed OPEN. The spread limit exists to stop us
+        # trading into a broken or one-sided book — which is precisely the
+        # situation that would produce an unreadable spread in the first place.
+        if not (math.isfinite(spread_bps) and math.isfinite(equity)):
+            return False, "unreadable book/equity — refusing to enter"
         if spread_bps > self.cfg.max_spread_bps:
             return False, f"spread {spread_bps:.1f}bps > {self.cfg.max_spread_bps}bps"
         if equity <= 0:
@@ -223,6 +240,17 @@ class RiskManager:
         means calm markets -> tighter stop -> more size -> higher leverage,
         and vice versa. `size_mult` (Kelly x health) scales conviction; the
         hard per-trade risk cap backstops everything."""
+        # Finiteness FIRST. `x <= 0` is False for NaN, so this guard — the last
+        # thing between a bad number and a real order — used to fail open on
+        # exactly the input it exists to stop. What follows is worse than a
+        # wrong size: clamp() passes NaN through, `min(nan, lev_max)` is NaN,
+        # `if lev <= 0` is False for NaN too, and the function ends up inside
+        # math.ceil(nan), which RAISES. A sizer must refuse, never throw.
+        if not all(math.isfinite(v) for v in (price, stop_dist, equity, size_mult)):
+            log.warning("refusing to size on non-finite input "
+                        "(price=%r stop_dist=%r equity=%r size_mult=%r)",
+                        price, stop_dist, equity, size_mult)
+            return None
         if price <= 0 or stop_dist <= 0 or equity <= 0:
             return None
         eff_mult = clamp(size_mult, 0.1, 2.0)
@@ -240,6 +268,20 @@ class RiskManager:
         if lev <= 0:
             return None
         qty = lev * equity / price
+
+        # PER-POSITION NOTIONAL CAP. This limit was declared in RiskConfig and
+        # never read by anything — a risk knob a user could set in config.json
+        # believing it protected them, that did nothing at all.
+        #
+        # Wiring it is behaviourally neutral in normal conditions: measured at
+        # the shipped defaults, risk sizing tops out near 1.6x equity at a 0.5%
+        # stop while the cap sits at 2.45x. It binds only in the tail it exists
+        # for — a very tight stop drives implied leverage into the band ceiling
+        # and the position to ~7x equity, which is exactly when a per-position
+        # ceiling should be the thing that says no.
+        max_notional = self.cfg.max_position_notional_pct * equity * lev_max
+        if max_notional > 0 and qty * price > max_notional:
+            qty = max_notional / price
 
         # hard safety cap: no single trade may risk more than max_risk_hard_pct
         max_risk = equity * self.cfg.max_risk_hard_pct

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 
 from ..exchange.models import LONG, SHORT, ContractSpec
@@ -42,6 +43,12 @@ def receiving_side(funding_rate: float) -> str:
 def carry_entry_ok(apr: float, er_4h: float, dir_4h: int, cfg) -> tuple[bool, str]:
     """Enter only when the payment is worth it AND the 4h trend doesn't oppose
     the receiving side. cfg is CarryConfig."""
+    # `abs(nan) < min_apr` and `er_4h >= trend_veto_er` are both False for NaN,
+    # so this gate used to wave through a carry entry whose payment and trend
+    # opposition it could not evaluate. The desk opens real positions on this
+    # verdict.
+    if not (math.isfinite(apr) and math.isfinite(er_4h)):
+        return False, "non-finite funding/trend read — refusing to judge carry"
     if abs(apr) < cfg.min_apr:
         return False, f"apr {apr*100:.0f}% < {cfg.min_apr*100:.0f}%"
     side = receiving_side(apr)
@@ -242,7 +249,16 @@ class CarryDesk:
         sized.allow_taker_fallback = False
         apr = row.get("funding_apr", 0.0)
         reason = f"carry {apr*100:+.0f}% APR"
-        res = await eng.broker.open_position(sym, side, sized, reason, bar_ts=now_ms())
+        # Reserve the slot for as long as the limit rests. Without this the
+        # signal engine cannot see the desk's pending order and can fill the
+        # same last slot concurrently, putting the account over
+        # max_open_positions. try/finally so a failed entry can never leak a
+        # permanently reserved slot.
+        eng.carry_pending += 1
+        try:
+            res = await eng.broker.open_position(sym, side, sized, reason, bar_ts=now_ms())
+        finally:
+            eng.carry_pending = max(0, eng.carry_pending - 1)
         if res.ok:
             self.entries += 1
             self.meta[sym] = {

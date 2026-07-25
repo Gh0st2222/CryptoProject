@@ -26,7 +26,7 @@ import time
 import numpy as np
 
 from ..config import ROOT
-from ..util import clamp
+from ..util import atomic_write, clamp
 
 log = logging.getLogger("radar")
 
@@ -360,7 +360,7 @@ class DynamicUniverse:
         self.source = "coingecko"
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps({"ts": self.fetched_ts, "bases": sorted(bases)}))
+            atomic_write(self.path, json.dumps({"ts": self.fetched_ts, "bases": sorted(bases)}))
         except OSError:
             pass
         log.info("radar universe refreshed: %d tokens (CoinGecko top-100 by market cap)",

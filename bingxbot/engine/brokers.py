@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import uuid
 
 from ..config import BotConfig
@@ -144,7 +145,8 @@ class PaperBroker(Broker):
         Post-only is modelled honestly: an order that would already cross the
         current mark is REJECTED, exactly as the exchange rejects it, and the
         caller falls back to market-close-on-touch."""
-        if price <= 0 or qty <= 0:
+        # finiteness before round_step, which floors and therefore raises on NaN
+        if not (math.isfinite(price) and math.isfinite(qty)) or price <= 0 or qty <= 0:
             return False
         spec = self.specs.get(symbol, ContractSpec(symbol))
         if round_step(qty, spec.qty_precision) < spec.min_qty:
@@ -261,8 +263,14 @@ class LiveBroker(Broker):
                 status = str(o.get("status", "")).upper()
                 if status == "FILLED":
                     ap = safe_float(o.get("avgPrice") or o.get("averagePrice"))
-                    qty = safe_float(o.get("executedQty") or o.get("origQty"))
                     fee = abs(safe_float(o.get("commission") or o.get("fee")))
+                    # executedQty is deliberately NOT used to size the position.
+                    # This poll gives up after ~1.4s, so a fill still in progress
+                    # would be read as SMALLER than it ends up — and booking that
+                    # would make reconcile see the exchange as larger and "adopt"
+                    # size upward on the next poll. Booking the requested qty and
+                    # letting reconcile correct any real shortfall is the stable
+                    # direction to be wrong in.
                     return (ap if ap > 0 else fallback), fee if fee > 0 else 0.0
                 if status in ("CANCELED", "EXPIRED", "REJECTED"):
                     break
@@ -326,6 +334,15 @@ class LiveBroker(Broker):
         existing market-close-on-touch behaviour: a position is never left
         without a way out."""
         spec = self.specs.get(symbol, ContractSpec(symbol))
+        # Validate BEFORE round_step: it goes through math.floor, which RAISES
+        # on a non-finite value, so this refusal path used to throw instead of
+        # returning False. The caller catches it, so no bad order ever reached
+        # the exchange — but "returns False" is the contract, and an order path
+        # should decline cleanly rather than rely on someone else's except.
+        if not (math.isfinite(price) and math.isfinite(qty)):
+            log.warning("maker exit %s: non-finite price/qty (%r/%r) — not arming",
+                        symbol, price, qty)
+            return False
         px = round_step(price, spec.price_precision)
         q = round_step(qty, spec.qty_precision)
         if px <= 0 or q < spec.min_qty:
@@ -460,30 +477,56 @@ class LiveBroker(Broker):
             window_s = max(1, self.cfg.strategy.maker_wait_bars) * interval_ms(self.cfg.strategy.interval) / 1000.0
         poll_gap = min(max(1.5, window_s / 40.0), 20.0)
         polls = max(2, int(window_s / poll_gap))
-        for _ in range(polls):
-            await asyncio.sleep(poll_gap)
-            try:
-                o = await self.rest.get_order(symbol, order_id)
-            except BingXError as e:
-                log.warning("maker fill poll %s: %s", order_id, e)
-                continue
-            status = str(o.get("status", "")).upper()
-            exec_qty = safe_float(o.get("executedQty") or o.get("cumQty"))
-            if status == "FILLED":
-                ap = safe_float(o.get("avgPrice") or o.get("averagePrice"))
-                return ap, exec_qty, abs(safe_float(o.get("commission") or o.get("fee")))
-            if status in ("CANCELED", "EXPIRED", "REJECTED"):
-                return 0.0, 0.0, 0.0
-        # window elapsed — take any partial fill, cancel the remainder
+        # Whether this order is definitively off the book. Anything that leaves
+        # here without it set has an order that may STILL BE RESTING on the
+        # exchange, and the finally below is what guarantees it gets pulled.
+        settled = False
         try:
+            for _ in range(polls):
+                await asyncio.sleep(poll_gap)
+                try:
+                    o = await self.rest.get_order(symbol, order_id)
+                except BingXError as e:
+                    log.warning("maker fill poll %s: %s", order_id, e)
+                    continue
+                status = str(o.get("status", "")).upper()
+                exec_qty = safe_float(o.get("executedQty") or o.get("cumQty"))
+                if status == "FILLED":
+                    settled = True
+                    ap = safe_float(o.get("avgPrice") or o.get("averagePrice"))
+                    return ap, exec_qty, abs(safe_float(o.get("commission") or o.get("fee")))
+                if status in ("CANCELED", "EXPIRED", "REJECTED"):
+                    settled = True
+                    return 0.0, 0.0, 0.0
+            # window elapsed — take any partial fill, cancel the remainder
             o = await self.rest.get_order(symbol, order_id)
             exec_qty = safe_float(o.get("executedQty") or o.get("cumQty"))
             if exec_qty > 0:
                 await self.rest.cancel_order(symbol, order_id)
+                settled = True
                 return safe_float(o.get("avgPrice")), exec_qty, abs(safe_float(o.get("commission")))
+            return 0.0, 0.0, 0.0
         except BingXError:
-            pass
-        return 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0
+        finally:
+            if not settled:
+                # The caller is about to report "unfilled — entry abandoned", so
+                # the engine forgets this order entirely. If it is still on the
+                # book it can fill HOURS later on a signal that has long since
+                # gone stale, and the first the bot knows of it is reconcile
+                # adopting a position nobody decided to take. It also silently
+                # holds margin in the meantime.
+                #
+                # This runs on every exit path, including asyncio cancellation:
+                # drop_symbol() cancels a pending entry task, and cancelling the
+                # task does nothing whatsoever to an order already on the book.
+                # shield() keeps the cancel in flight even while we are being
+                # torn down.
+                try:
+                    await asyncio.shield(self.rest.cancel_order(symbol, order_id))
+                except (BingXError, asyncio.CancelledError) as e:
+                    log.warning("could not pull unfilled limit %s on %s: %s",
+                                order_id, symbol, e)
 
     async def close_position(self, symbol: str, reason: str, frac: float | None = None,
                              maker_price: float | None = None) -> OrderResult:
@@ -563,6 +606,108 @@ class LiveBroker(Broker):
         self.portfolio.close_position(symbol, px, now_ms(), fee, reason, planned_risk)
         self._exit_orders.pop(symbol, None)   # it filled (or died with the position)
 
+    async def _protective_levels(self, symbol: str, side: str) -> tuple[float, float]:
+        """Read this position's stop and target back off the book.
+
+        The levels are OUR numbers — we placed them at entry — but after a
+        restart the only copy left is the exchange's. A reduce-only resting
+        limit on the closing side is the maker exit; a stop-market is the
+        protective stop. Anything we cannot identify is ignored rather than
+        guessed at: inventing a stop level would invent an `init_risk`, and
+        every R statistic downstream would then be quietly fictional."""
+        try:
+            orders = await self.rest.open_orders(symbol)
+        except Exception as e:  # noqa: BLE001 — see below
+            # Deliberately broad. This is best-effort ENRICHMENT of an adoption
+            # that must happen either way: failing to recover the levels costs
+            # us the trail, but letting the exception escape aborts reconcile
+            # and loses track of the POSITION itself, which is far worse.
+            log.warning("adopt %s: could not read open orders (%s)", symbol, e)
+            return 0.0, 0.0
+        stop = tp = 0.0
+        closing = SELL if side == LONG else BUY
+        for o in orders or []:
+            if str(o.get("side", "")).upper() != closing:
+                continue
+            ps = str(o.get("positionSide", "")).upper()
+            if ps and ps not in ("BOTH", side):
+                continue
+            otype = str(o.get("type", "")).upper()
+            trigger = safe_float(o.get("stopPrice") or o.get("triggerPrice"))
+            if "STOP" in otype and "PROFIT" not in otype and trigger > 0:
+                stop = trigger
+            elif "TAKE_PROFIT" in otype and trigger > 0:
+                tp = trigger
+            elif otype == "LIMIT" and safe_float(o.get("price")) > 0:
+                # The resting post-only target from maker_exits — re-adopt it so
+                # the engine knows a target is already working on the book.
+                # REDUCE-ONLY is what identifies it as ours: a plain limit on
+                # this side could be the user's own manual order, and adopting
+                # that would mean cancel_maker_exit() later pulls an order we
+                # were never entitled to touch.
+                if str(o.get("reduceOnly", "")).lower() not in ("true", "1"):
+                    continue
+                px = safe_float(o.get("price"))
+                tp = px
+                oid = str(o.get("orderId", ""))
+                if oid:
+                    self._exit_orders[symbol] = (oid, px)
+        return stop, tp
+
+    def _sync_qty(self, symbol: str, row: dict) -> None:
+        """Reconcile the SIZE of a position that exists on both sides.
+
+        Presence was already checked; size never was, so any drift between our
+        book and the exchange's was permanent. That matters more than it sounds:
+        a TradeRecord books `qty * (exit - entry)`, so carrying a stale qty does
+        not just misstate exposure — it manufactures P&L that never happened,
+        and that number feeds the journal, the live-evidence demotion rule, the
+        champion's probation stats and the report. The system LEARNS from it.
+
+        A partial fill is the ordinary way this happens, not an exotic one: a
+        resting reduce-only exit is a limit order, and price trading through it
+        briefly fills part of the size and leaves. A partially filled entry does
+        the same. Either way the symbol is still on both sides, so the presence
+        check above sees nothing wrong.
+
+        Shrinkage is booked as a real partial close (at the resting exit price
+        when one is armed — the most likely cause and a price we actually know),
+        so the P&L is recorded instead of silently vanishing. Growth can only
+        mean size we did not open, so the exchange wins and we say so loudly."""
+        pos = self.portfolio.positions.get(symbol)
+        if pos is None or pos.qty <= 0:
+            return
+        actual = abs(safe_float(row.get("positionAmt") or row.get("availableAmt")))
+        if actual <= 0:
+            return
+        spec = self.specs.get(symbol, ContractSpec(symbol))
+        # ignore dust: rounding at the symbol's own step, or sub-1% noise
+        tol = max(spec.min_qty, pos.qty * 0.01)
+        if abs(actual - pos.qty) <= tol:
+            return
+        if actual > pos.qty:
+            log.warning("reconcile: %s exchange qty %.8g > local %.8g — adopting exchange truth",
+                        symbol, actual, pos.qty)
+            pos.qty = actual
+            return
+        frac = 1.0 - actual / pos.qty
+        px = self.maker_exit_price(symbol)
+        reason = "partial fill (maker exit)" if px > 0 else "partial close (reconcile)"
+        if px <= 0:
+            px = safe_float(row.get("markPrice")) or pos.entry_price
+        fee = pos.qty * frac * px * (spec.maker_fee if "maker" in reason else spec.taker_fee)
+        log.warning("reconcile: %s shrank %.8g -> %.8g, booking %.1f%% as %s @ %.6g",
+                    symbol, pos.qty, actual, frac * 100, reason, px)
+        was_scaled = pos.scaled_out
+        if self.portfolio.scale_out(symbol, frac, px, now_ms(), fee, reason) is None:
+            pos.qty = actual        # too small to book as a trade; still sync the size
+            return
+        # scale_out() marks the position as having taken its scale-out. This was
+        # an execution artifact, not the strategy's decision, so leave that flag
+        # exactly as it was — otherwise a partial fill silently cancels a
+        # scale-out the strategy still intends to take.
+        pos.scaled_out = was_scaled
+
     async def reconcile(self, symbols: list[str]) -> None:
         """Compare exchange truth with local state; adopt or record differences."""
         try:
@@ -581,6 +726,8 @@ class LiveBroker(Broker):
             if symbol not in on_exchange:
                 log.warning("reconcile: %s closed on exchange (SL/TP or manual)", symbol)
                 self._record_external_close(symbol, reason="exchange close (reconcile)")
+            else:
+                self._sync_qty(symbol, on_exchange[symbol])
         for symbol, r in on_exchange.items():
             if symbol in self.portfolio.positions or symbol not in symbols:
                 continue
@@ -589,11 +736,29 @@ class LiveBroker(Broker):
             entry = safe_float(r.get("avgPrice"))
             if qty <= 0 or entry <= 0:
                 continue
-            log.warning("reconcile: adopting unknown %s %s position qty=%.6g", side, symbol, qty)
+            # Recover the protective levels from the exchange's own resting
+            # orders. Live deliberately never restores local state ("the
+            # exchange is the truth"), so every restart with an open position
+            # came through here — and adopting with stop_price=0 quietly
+            # DISABLED the whole adaptive exit stack for that position:
+            # `exits.manage` falls back to `risk = |entry - stop|`, which with
+            # stop=0 is the entry price itself, so rr is ~0.0001 forever. The
+            # breakeven move, the chandelier trail, the give-back lock and the
+            # scale-out are all rr-gated and none of them could ever fire again.
+            # The position was left to the exchange stop and the time stop, and
+            # its eventual trade booked r_multiple=0 into the live stats the
+            # champion demotion rule reads.
+            stop, tp = await self._protective_levels(symbol, side)
+            log.warning("reconcile: adopting unknown %s %s position qty=%.6g sl=%.6g tp=%.6g",
+                        side, symbol, qty, stop, tp)
+            if stop <= 0:
+                log.error("reconcile: %s has NO protective stop on the exchange — the "
+                          "adaptive trail cannot arm; exits fall back to the time stop", symbol)
             self.portfolio.open_position(Position(
                 symbol=symbol, side=side, qty=qty, entry_price=entry, opened_ts=now_ms(),
                 leverage=safe_float(r.get("leverage"), 1.0), entry_reason="adopted",
-                entry_bar_ts=0,
+                entry_bar_ts=0, stop_price=stop, take_profit=tp,
+                init_risk=abs(entry - stop) if stop > 0 else 0.0,
             ), entry_fee=0.0)
 
     async def flatten_all(self, reason: str) -> None:

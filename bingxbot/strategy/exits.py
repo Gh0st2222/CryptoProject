@@ -24,12 +24,16 @@ winners pay for many small losers:
 """
 from __future__ import annotations
 
+import logging
+import math
 from dataclasses import dataclass
 
 from ..config import RiskConfig
 from ..exchange.models import LONG, Position
 from ..strategy.regime import REGIME_EXIT_MULT
 from ..util import clamp
+
+log = logging.getLogger("exits")
 
 # Structural discipline on the edge-flip exit, mirroring the entry chain: the
 # entry refuses to trade against a decided 15m/1h trend (hard MTF veto) and
@@ -49,6 +53,29 @@ class Bracket:
     init_risk: float     # price distance to the initial stop = 1R
 
 
+def _checked(br: "Bracket", entry: float, d: int) -> "Bracket | None":
+    """Refuse a bracket that could not protect the position.
+
+    Guarding the INPUTS is not enough: the trend branch takes its stop from the
+    row's Donchian level, so a non-finite `dc_lo`/`dc_hi` produces a non-finite
+    stop even when entry and ATR are both fine. Nothing downstream would notice
+    — the tick watcher tests `pos.stop_price > 0` and manage() tests
+    `risk <= 0`, and both are False for NaN — so the position would run with no
+    working stop at all. Check what we are about to hand out, not just what
+    came in.
+    """
+    if not (math.isfinite(br.stop) and math.isfinite(br.init_risk)
+            and math.isfinite(br.take_profit)):
+        log.warning("refusing a non-finite bracket (stop=%r risk=%r tp=%r)",
+                    br.stop, br.init_risk, br.take_profit)
+        return None
+    if br.init_risk <= 0 or (br.stop - entry) * d >= 0:
+        log.warning("refusing a bracket whose stop is not protective "
+                    "(entry=%r stop=%r risk=%r)", entry, br.stop, br.init_risk)
+        return None
+    return br
+
+
 class AdaptiveExitManager:
     def __init__(self, cfg: RiskConfig):
         self.cfg = cfg
@@ -57,7 +84,14 @@ class AdaptiveExitManager:
 
     def initial_bracket(self, entry: float, side: str, atr: float, row: dict, regime: str,
                         style: str = "trend") -> Bracket | None:
-        if entry <= 0 or atr <= 0:
+        # Finiteness FIRST — `atr <= 0` is False for NaN and for +inf, so this
+        # guard failed open on both. The result was a Position carrying a
+        # non-finite stop_price, and NOTHING downstream catches that: the tick
+        # watcher tests `pos.stop_price > 0` (False for NaN, so the stop is
+        # never even checked), manage() tests `risk <= 0` (also False), so every
+        # rr-gated exit is dead, and a live order would carry stopPrice=NaN.
+        # That is an unmanaged position with unbounded loss — refuse instead.
+        if not all(math.isfinite(v) for v in (entry, atr)) or entry <= 0 or atr <= 0:
             return None
         cfg = self.cfg
         d = 1 if side == LONG else -1
@@ -66,7 +100,7 @@ class AdaptiveExitManager:
             dist = cfg.scalp_sl_atr * atr
             stop = entry - d * dist
             tp = entry + d * cfg.scalp_tp_atr * atr
-            return Bracket(stop=stop, take_profit=tp, init_risk=dist)
+            return _checked(Bracket(stop=stop, take_profit=tp, init_risk=dist), entry, d)
         # trend: structure stop, let it run (no fixed target)
         ex = REGIME_EXIT_MULT.get(regime, {"sl": 1.0, "tp": 1.0})
         lo, hi = cfg.sl_atr_min * ex["sl"] * atr, cfg.sl_atr_max * ex["sl"] * atr
@@ -79,7 +113,7 @@ class AdaptiveExitManager:
         dist = clamp(struct_dist, lo, hi)
         stop = entry - d * dist
         tp = entry + d * cfg.tp_atr_cap * atr if cfg.tp_atr_cap > 0 else 0.0
-        return Bracket(stop=stop, take_profit=tp, init_risk=dist)
+        return _checked(Bracket(stop=stop, take_profit=tp, init_risk=dist), entry, d)
 
     def attach(self, pos: Position, atr: float, init_risk: float) -> None:
         pos.atr_ref = atr
@@ -98,7 +132,9 @@ class AdaptiveExitManager:
         d = pos.direction()
         atr = atr if atr > 0 else pos.atr_ref
         risk = pos.init_risk if pos.init_risk > 0 else abs(pos.entry_price - pos.stop_price)
-        if risk <= 0:
+        # `risk <= 0` is False for NaN, so a position carrying a non-finite 1R
+        # would fall through and make every rr-gated exit below dead
+        if not math.isfinite(risk) or risk <= 0:
             return False, None
 
         # track best excursion (chandelier anchor) AND worst (MAE anchor)

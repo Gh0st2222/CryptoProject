@@ -29,6 +29,7 @@ from pathlib import Path
 
 log = logging.getLogger("tape")
 
+PRUNE_EVERY_S = 900.0      # enforce the disk cap on a clock, not only at day rollover
 FSYNC_EVERY_S = 2.0        # durability window: a power cut loses at most this
 QUEUE_SOFT_CAP = 60_000    # beyond this the recorder drops (and counts) events
                            # rather than growing without bound — recording must
@@ -96,7 +97,7 @@ class TapeRecorder:
 
     def _run(self) -> None:
         open_files: dict[tuple[str, str, str], object] = {}   # (sym, kind, day) -> fh
-        last_sync = time.monotonic()
+        last_sync = last_prune = time.monotonic()
         fresh = True
         while True:
             try:
@@ -124,6 +125,14 @@ class TapeRecorder:
                             pass
                     last_sync = time.monotonic()
                     fresh = False
+                if time.monotonic() - last_prune >= PRUNE_EVERY_S:
+                    # The cap used to be enforced only when a new day's file
+                    # opened, so it could be exceeded for up to 24h — and a
+                    # symbol that stops trading never rotates again, so its
+                    # archive would never be checked at all. Disk is the user's
+                    # machine; the promise is a hard cap, not a daily one.
+                    last_prune = time.monotonic()
+                    self._prune()
                 if self._stop.is_set() and self._q.qsize() == 0:
                     break
             except Exception:  # noqa: BLE001 — the recorder must outlive anything
@@ -207,13 +216,24 @@ def read_day(root: Path, symbol: str, kind: str, day: str) -> list[list[float]]:
     """Tolerant reader for audits and tests: skips '#' session markers and any
     torn/malformed line (a power cut mid-write leaves at most one)."""
     base = Path(root) / symbol / f"{kind}-{day}.csv"
-    if base.exists():
-        text = base.read_text(encoding="utf-8", errors="replace")
-    else:
-        gz = base.with_suffix(".csv.gz")
-        if not gz.exists():
-            return []
-        text = gzip.open(gz, "rt", encoding="utf-8", errors="replace").read()
+    try:
+        if base.exists():
+            text = base.read_text(encoding="utf-8", errors="replace")
+        else:
+            gz = base.with_suffix(".csv.gz")
+            if not gz.exists():
+                return []
+            # A day killed part-way through gzipping leaves a truncated archive,
+            # and reading one raises EOFError — not an OSError. This reader is
+            # documented as tolerant of a torn LINE; it has to be equally
+            # tolerant of a torn FILE, since rotation is exactly when a power
+            # cut produces one. (Also closed properly: the old form leaked the
+            # handle on every call.)
+            with gzip.open(gz, "rt", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+    except (OSError, EOFError) as e:
+        log.warning("tape %s %s %s unreadable: %s", symbol, kind, day, e)
+        return []
     want = 4 if kind == "trades" else 3
     out: list[list[float]] = []
     for line in text.splitlines():

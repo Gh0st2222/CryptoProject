@@ -15,6 +15,7 @@ all online, all observable — no parameter is hand-set at runtime.
 """
 from __future__ import annotations
 
+import logging
 import math
 from collections import deque
 from dataclasses import dataclass
@@ -43,6 +44,26 @@ META_MAX_SHIFT = 1.5
 def _logit(p: float) -> float:
     p = min(max(p, 1e-6), 1.0 - 1e-6)
     return math.log(p / (1.0 - p))
+
+
+log = logging.getLogger("brain")
+
+
+def _finite(x, default: float = 0.0) -> float:
+    """A persisted number, or `default` if it is not a real one.
+
+    Persistence must never be able to install a value the live code could not
+    itself produce. json.dumps writes NaN and Infinity as bare literals and
+    json.loads reads them straight back, so one non-finite number reaching the
+    snapshot survives every restart. A NaN alpha weight makes the fused edge
+    NaN, `abs(nan) >= threshold` is False, and the brain then sits there looking
+    perfectly healthy while never taking another trade — and restarting, the one
+    thing anybody would try, reloads the same NaN."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return default
+    return v if math.isfinite(v) else default
 
 
 def _sigmoid(z: float) -> float:
@@ -167,8 +188,31 @@ class TradingBrain:
             num += w * desk_sig[desk]
             den += w
         edge = clamp(num / den if den > 0 else 0.0, -1, 1)
+        # A non-finite edge is the quietest way this system can die. clamp() is
+        # `lo if x < lo else hi if x > hi else x`, so NaN passes straight
+        # through, and `abs(nan) >= threshold` is False — the bot then sits
+        # there looking healthy and never takes another trade, with nothing in
+        # the log and nothing a restart would fix.
+        #
+        # This is not hypothetical input: at a 1m or 3m interval (both offered
+        # as the trial clock) the 24h-context window is longer than the warmup,
+        # so seven features in `row` really are NaN. The fused edge survives
+        # today only because no current alpha happens to read one of them —
+        # a property of today's roster, not a guarantee. Refuse to act, and say
+        # WHICH feature did it so the cause is one log line away.
+        if not math.isfinite(edge):
+            bad = sorted(k for k, v in row.items()
+                         if isinstance(v, float) and not math.isfinite(v))
+            log.error("non-finite edge (%r) — refusing to trade this bar; "
+                      "non-finite features: %s", edge, bad[:8] or "none")
+            edge = 0.0
         atr_pctile = row.get("atr_pctile", 0.5)
+        if not math.isfinite(atr_pctile):
+            atr_pctile = 0.5
         p_win = self.calibrator.predict(edge, regime, atr_pctile)
+        if not math.isfinite(p_win):
+            log.error("non-finite p_win from the calibrator — treating as no-edge")
+            edge, p_win = 0.0, 0.5
         # meta-labeling second opinion: a walk-forward-credentialed GBM over the
         # FULL feature row (interactions the linear fusion can't represent).
         # Consulted only near the gate zone (where P(win) can change a decision
@@ -349,6 +393,14 @@ class TradingBrain:
 
     def entry_ok(self, edge: float, p_win: float, row: dict, fees_roundtrip: float,
                  spread_bps: float, slippage_bps: float) -> tuple[bool, str]:
+        # A gate's job is to REFUSE, so the one direction it must never fail is
+        # OPEN. `abs(nan) < threshold`, `nan < min_p_win` and `predicted < cost`
+        # are all False for NaN, so three of the four checks below used to wave
+        # through a trade whose conviction and win probability were unknown.
+        # (atr_pct was already guarded properly — these were the gaps.)
+        if not all(math.isfinite(v) for v in (edge, p_win, fees_roundtrip,
+                                              spread_bps, slippage_bps)):
+            return False, "non-finite inputs — refusing to judge this entry"
         if abs(edge) < self.threshold:
             return False, f"edge {edge:+.2f} < threshold {self.threshold:.2f}"
         if p_win < self.min_p_win:
@@ -366,6 +418,15 @@ class TradingBrain:
                      spread_bps: float, slippage_bps: float) -> list[dict]:
         """Itemized version of entry_ok — every quality gate with its live numbers,
         pass or fail, for the UI's entry-gate X-ray. Same math, no early exit."""
+        # Must agree with entry_ok's verdict. These comparisons are written as
+        # `>= ok` rather than `< reject`, so NaN correctly shows as a failure —
+        # but +inf sails through all three and the X-ray showed every gate GREEN
+        # while entry_ok was refusing. A dashboard that disagrees with the
+        # engine about why nothing is trading is worse than no dashboard.
+        if not all(math.isfinite(v) for v in (edge, p_win, fees_roundtrip,
+                                              spread_bps, slippage_bps)):
+            return [{"n": "inputs", "ok": False,
+                     "d": "non-finite — entry refused before any gate"}]
         out = [{"n": "edge", "ok": abs(edge) >= self.threshold,
                 "d": f"{edge:+.2f} vs thr {self.threshold:.2f}"},
                {"n": "p(win)", "ok": p_win >= self.min_p_win,
@@ -384,6 +445,10 @@ class TradingBrain:
         """Fractional-Kelly multiplier on the base risk budget, from calibrated
         P(win) and the trade's reward:risk. Clamped so a hot streak can't run
         risk away; returns 0 for a negative-edge bet."""
+        # `max(nan, 0.1)` is nan, and `f <= 0` is False for nan, so this
+        # returned a NaN multiplier straight into position sizing.
+        if not math.isfinite(p_win) or not math.isfinite(payoff_ratio):
+            return 0.0
         b = max(payoff_ratio, 0.1)
         f = p_win - (1 - p_win) / b
         if f <= 0:
@@ -434,7 +499,11 @@ class TradingBrain:
         try:
             for nm, w in d.get("alpha_w", {}).items():
                 if nm in self.alpha_w:
-                    self.alpha_w[nm] = float(w)
+                    # a non-finite weight poisons the fused edge forever; keep
+                    # this alpha's current (uniform) weight instead
+                    v = _finite(w, -1.0)
+                    if v >= 0.0:
+                        self.alpha_w[nm] = v
             # saved weights are already desk-normalized; re-normalizing here
             # would apply an extra shrink toward uniform. The next graded bar
             # renormalizes naturally.
@@ -444,28 +513,45 @@ class TradingBrain:
                     st.calls, st.hits, st.payoff_sum = int(s[0]), int(s[1]), float(s[2])
             for dk, lw in d.get("alloc_log_w", {}).items():
                 if dk in self.allocator._log_w:
-                    self.allocator._log_w[dk] = float(lw)
+                    self.allocator._log_w[dk] = _finite(lw, self.allocator._log_w[dk])
             for dk, pv in d.get("alloc_perf", {}).items():
                 perf = self.allocator.perf.get(dk)
                 if perf is not None:
-                    perf.ew_payoff, perf.ew_win = float(pv[0]), float(pv[1])
-                    perf.ew_var, perf.graded = float(pv[2]), int(pv[3])
+                    perf.ew_payoff = _finite(pv[0], perf.ew_payoff)
+                    perf.ew_win = _finite(pv[1], perf.ew_win)
+                    perf.ew_var = _finite(pv[2], perf.ew_var)
+                    perf.graded = int(pv[3])
                     perf.disabled = bool(pv[4])
             # restore the exact stored weights — recomputing from the (already
             # decayed) log-weights would drift them; the next graded call
             # recomputes naturally anyway.
             for dk, w in d.get("alloc_w", {}).items():
                 if dk in self.allocator.perf:
-                    self.allocator.perf[dk].weight = float(w)
+                    self.allocator.perf[dk].weight = _finite(w, self.allocator.perf[dk].weight)
             cal = d.get("cal", {})
             if len(cal.get("w", [])) == len(self.calibrator.w):
-                self.calibrator.w = [float(x) for x in cal["w"]]
-                self.calibrator.b = float(cal.get("b", 0.0))
-                self.calibrator.n = int(cal.get("n", 0))
-            self.beta = float(d.get("beta", 1.0))
-            self.threshold = float(d.get("threshold", self.base_threshold))
+                # the calibrator's weights are a coupled vector — one bad entry
+                # makes every p_win it produces meaningless, so it is all or
+                # nothing rather than a partial restore
+                wv = [_finite(x, math.nan) for x in cal["w"]]
+                b = _finite(cal.get("b", 0.0), math.nan)
+                if all(math.isfinite(x) for x in wv) and math.isfinite(b):
+                    self.calibrator.w, self.calibrator.b = wv, b
+                    self.calibrator.n = int(cal.get("n", 0))
+                else:
+                    log.warning("dropped a non-finite calibrator from the saved state")
+            # restore only within the bounds the LIVE code enforces on these
+            # (_grade clamps beta, _adapt_threshold clamps threshold), so a
+            # snapshot can never install a value the engine itself could not
+            # have produced
+            self.beta = clamp(_finite(d.get("beta", 1.0), 1.0), 0.3, 3.0)
+            self.threshold = clamp(_finite(d.get("threshold", self.base_threshold),
+                                           self.base_threshold),
+                                   self.base_threshold, 0.92)
             self.graded = int(d.get("graded", 0))
-            self._score_hist.extend(float(x) for x in d.get("score_hist", []))
+            self._score_hist.extend(
+                v for v in (_finite(x, math.nan) for x in d.get("score_hist", []))
+                if math.isfinite(v))
             return True
         except (TypeError, ValueError, KeyError, IndexError):
             return False

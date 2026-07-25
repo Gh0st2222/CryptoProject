@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import time
 from collections import deque
 
@@ -22,6 +23,35 @@ def round_step(value: float, precision: int) -> float:
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return lo if x < lo else hi if x > hi else x
+
+
+def atomic_write(path, data: str | bytes) -> None:
+    """Replace a file's contents in one step, or not at all.
+
+    `write_text` truncates first and writes second, so a process that dies in
+    between leaves a half-written file behind — and every loader here treats
+    unparseable as empty and carries on silently. For the champion vault that
+    means weeks of tuner work vanishing with nothing in the log; for the config
+    it means the bot quietly coming back on defaults.
+
+    Writing to a temp file in the SAME directory and renaming is atomic on
+    POSIX and Windows: readers see either the old file or the new one, never a
+    torn one. The fsync makes it survive a power cut too, not just a crash.
+    """
+    from pathlib import Path
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    mode = "wb" if isinstance(data, bytes) else "w"
+    kw = {} if isinstance(data, bytes) else {"encoding": "utf-8"}
+    with open(tmp, mode, **kw) as fh:
+        fh.write(data)
+        fh.flush()
+        try:
+            os.fsync(fh.fileno())
+        except OSError:
+            pass          # best effort: the rename below is the real guarantee
+    tmp.replace(path)
 
 
 def safe_float(v, default: float = 0.0) -> float:
@@ -47,6 +77,16 @@ class Ewma:
         self.value: float | None = None
 
     def update(self, x: float) -> float:
+        # A non-finite sample is ignored rather than absorbed. An EWMA is
+        # recursive, so one NaN does not pass through — it STICKS:
+        # nan + alpha*(x - nan) is nan for every sample after it, forever.
+        # These carry the live microstructure (book imbalance, spread,
+        # CVD slope, tick rate) into the alphas and the meta model, so a
+        # single bad frame would otherwise silently disable a desk for the
+        # rest of the process's life. Keeping the last good value degrades;
+        # absorbing it does not recover.
+        if not math.isfinite(x):
+            return self.value if self.value is not None else 0.0
         self.value = x if self.value is None else self.value + self.alpha * (x - self.value)
         return self.value
 

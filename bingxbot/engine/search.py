@@ -23,7 +23,7 @@ import statistics
 from pathlib import Path
 
 from ..config import ROOT, RiskConfig, StrategyConfig
-from ..util import clamp
+from ..util import atomic_write, clamp
 from .backtest import (TUNABLES, _apply_params, _coerce, _fitness,
                        candles_to_arrays, run_backtest, run_portfolio_backtest)
 from ..strategy.features import FeatureFrame
@@ -301,8 +301,7 @@ class DEOptimizer:
     # -- persistence -----------------------------------------------------
     def save(self) -> None:
         try:
-            self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            self.state_path.write_text(json.dumps({
+            atomic_write(self.state_path, json.dumps({
                 "generation": self.generation, "keys": self.keys,
                 "pop": self.pop, "fitness": self.fitness,
             }))
