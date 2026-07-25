@@ -297,6 +297,7 @@ function renderDesks(desks){
   }).join("");
 }
 function renderAlphaFloor(alphas){
+  renderConstellation(alphas);
   if(!alphas) return;
   const byDesk={}; for(const [nm,a] of Object.entries(alphas)){ (byDesk[a.desk]=byDesk[a.desk]||[]).push([nm,a]); }
   const wrap=$("alpha-desks");
@@ -940,7 +941,7 @@ $("rec-export").onclick=()=>{
 
 /* ---------------------------------------------------------------- analytics */
 async function loadAnalytics(){
-  try{ const mode=$("an-mode").value; const d=await api(`/api/journal${mode?`?mode=${mode}`:""}`); renderAnalytics(d); }
+  try{ const mode=$("an-mode").value; const d=await api(`/api/journal?limit=1200${mode?`&mode=${mode}`:""}`); renderAnalytics(d); }
   catch(e){ toast(e.message,"bad"); }
 }
 $("an-refresh").onclick=loadAnalytics; $("an-mode").onchange=loadAnalytics;
@@ -963,6 +964,10 @@ function renderAnalytics(d){
     ["Avg MFE (shown)",(s.avg_mfe_r??0).toFixed(2)+"R","pnl-pos"],
     ["MFE captured",fmt.pct(s.mfe_capture??0,0),(s.mfe_capture??0)>=0.4?"pnl-pos":""],
   ].map(([k,v,cls])=>`<div class="card"><div class="k">${k}</div><div class="v ${cls??""}">${v}</div></div>`).join("");
+  // the same payload the tables use, drawn
+  const rows=d.recent||[];
+  _exDist = s.r_dist;
+  renderExcursion(rows); renderRDist(rows, s.r_dist); renderGhostBook(S?.engine?.refusals);
   $("an-align").innerHTML=anRows(s.by_alignment); $("an-regime").innerHTML=anRows(s.by_regime);
   $("an-desk").innerHTML=anRows(s.by_desk); $("an-exit").innerHTML=anRows(s.by_exit);
   $("an-hour").innerHTML=anRows(s.by_hour); $("an-side").innerHTML=anRows(s.by_side);
@@ -1468,3 +1473,431 @@ initCharts(); connectWS();
 // slow reconciliation only (closed bars + markers) — the live candle rides the
 // 0.4s hot channel now; skip entirely while the tab is hidden.
 setInterval(()=>{ if(S?.engine&&!document.hidden) refreshCandles(false); },10000);
+
+/* ==========================================================================
+   VIZ LAYER — canvas views over data the dashboard previously printed as
+   numbers. Measured first: the profiler showed the page 77% idle with zero
+   long tasks, so the goal here is to ADD information without spending that
+   headroom. Three rules keep it that way:
+
+     1. nothing draws unless its tab is the active one (renderBottomTab
+        already dispatches per page — these hang off the same switch);
+     2. every view is a pure function of a snapshot; no view owns a timer or
+        a rAF loop of its own;
+     3. hover state repaints only the view under the cursor, and only on
+        pointermove, never on a clock.
+   ========================================================================== */
+
+const VIZ_DPR = () => Math.min(window.devicePixelRatio || 1, 2);
+
+/** Size a canvas's backing store to its CSS box. Returns the 2D context with
+ *  the transform already set so all drawing is in CSS pixels. */
+const _vizBox = new WeakMap();
+function vizInvalidate(cv){ _vizBox.delete(cv); }
+function vizCtx(cv){
+  // clientWidth/clientHeight force a layout flush. The box only changes on
+  // resize, and a ResizeObserver already tells us when that happens, so read
+  // it once and reuse it rather than on every repaint.
+  let box = _vizBox.get(cv);
+  if(!box){ box = { w: cv.clientWidth, h: cv.clientHeight }; _vizBox.set(cv, box); }
+  const w = box.w, h = box.h;
+  if(!w || !h){ _vizBox.delete(cv); return null; }
+  const d = VIZ_DPR();
+  const bw = Math.round(w * d), bh = Math.round(h * d);
+  if(cv.width !== bw || cv.height !== bh){ cv.width = bw; cv.height = bh; }
+  const g = cv.getContext("2d", { alpha: true });
+  g.setTransform(d, 0, 0, d, 0, 0);
+  g.clearRect(0, 0, w, h);
+  g.__w = w; g.__h = h;
+  return g;
+}
+/** Theme colours, resolved ONCE.
+ *  getComputedStyle() forces a style resolution on every call, and the views
+ *  below ask for a colour inside their draw loops — the constellation alone
+ *  wanted ~15 per repaint. Profiling the main tab after adding it showed p95
+ *  drifting 23.6ms -> 29ms with long tasks appearing, which is the entire cost
+ *  of asking the engine the same fixed question over and over. The palette is
+ *  a static dark theme, so it is read once and memoized. */
+const _cssCache = new Map();
+function cssVar(n){
+  let v = _cssCache.get(n);
+  if(v === undefined){
+    v = getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+    _cssCache.set(n, v);
+  }
+  return v;
+}
+function vizEmpty(host, msg){
+  const e = host.querySelector(".viz-empty");
+  if(e) e.textContent = msg, e.style.display = msg ? "grid" : "none";
+}
+/** Nice axis ticks covering [lo,hi] — at most `n` of them, on 1/2/5 steps. */
+function niceTicks(lo, hi, n = 5){
+  if(!isFinite(lo) || !isFinite(hi) || hi <= lo) return [lo || 0];
+  const raw = (hi - lo) / n, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const norm = raw / mag;
+  const step = (norm >= 5 ? 5 : norm >= 2 ? 2 : 1) * mag;
+  const out = [];
+  for(let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(+v.toFixed(10));
+  return out;
+}
+
+/** p-quantile of an ASCENDING array. */
+function pq(sorted, p){
+  if(!sorted.length) return 0;
+  const i = Math.min(sorted.length - 1, Math.max(0, Math.round((sorted.length - 1) * p)));
+  return sorted[i];
+}
+
+/* ---------------------------------------------------- 1. EXCURSION MAP
+   Every closed trade as a point: how good it ever looked (MFE, x) against how
+   much heat it took first (MAE, y), both in R. The single most diagnostic
+   picture a discretionary-style system can draw, and this dashboard only ever
+   had the two AVERAGES of it as cards.
+
+   Read it like this:
+     · far right, low     -> clean winners, little heat. More of these.
+     · far right, HIGH y  -> we were up big and gave it back through the stop.
+     · clustered near 0,0 -> chop; the gates should have refused these.
+     · above the diagonal -> the trade hurt more than it ever showed. */
+let _exTrades = [], _exHit = -1, _exGeom = null, _exDist = null;
+function renderExcursion(rows){
+  const host = $("viz-excursion"); if(!host) return;
+  const cv = host.querySelector("canvas"); const g = vizCtx(cv); if(!g) return;
+  const W = g.__w, H = g.__h;
+  const pts = (rows || []).filter(r =>
+    Number.isFinite(r.mfe_r) && Number.isFinite(r.mae_r) && Number.isFinite(r.r));
+  _exTrades = pts;
+  vizEmpty(host, pts.length ? "" : "No closed trades yet — the map fills as trades journal.");
+  if(!pts.length){ _exGeom = null; return; }
+
+  const pad = { l: 56, r: 16, t: 26, b: 26 };
+  // ROBUST axes. R-multiples are heavy-tailed — one 30R excursion on a linear
+  // scale crushes every other trade into the corner and the chart says nothing.
+  // Scale to the 95th percentile and pin the rest to the rim as hollow markers,
+  // so the bulk is readable and the outliers are still visibly THERE rather
+  // than quietly dropped.
+  const sx = pts.map(p => p.mfe_r).sort((a, b) => a - b);
+  const sy = pts.map(p => p.mae_r).sort((a, b) => a - b);
+  const maxX = Math.max(1, pq(sx, 0.98));
+  const maxY = Math.max(0.5, pq(sy, 0.98));
+  // SQUARE-ROOT axes. Percentile clipping alone was not enough: excursions are
+  // so skewed (avg MFE ~10R against avg MAE ~0.6R on this account) that even
+  // the p95 range leaves the whole population stacked against the origin. sqrt
+  // keeps 0 at 0, spreads the dense low end where the trades actually are, and
+  // compresses the tail that was drowning them — while the ticks stay labelled
+  // in real R, so nothing about the reading changes.
+  const sq = (v, m) => Math.sqrt(Math.max(0, Math.min(v, m)) / m);
+  const X = v => pad.l + sq(v, maxX) * (W - pad.l - pad.r);
+  const Y = v => H - pad.b - sq(v, maxY) * (H - pad.t - pad.b);
+  _exGeom = { X, Y, pad, W, H };
+
+  g.strokeStyle = cssVar("--grid"); g.lineWidth = 1;
+  g.fillStyle = cssVar("--muted"); g.font = "9.5px " + cssVar("--mono");
+  // ticks at fractions of the SQRT range, so they are evenly spaced on screen
+  const axTicks = (m) => [0.04, 0.16, 0.36, 0.64, 1].map(f => +(m * f).toFixed(m < 3 ? 2 : 1));
+  for(const t of axTicks(maxX)){
+    const x = Math.round(X(t)) + .5;
+    g.beginPath(); g.moveTo(x, pad.t); g.lineTo(x, H - pad.b); g.stroke();
+    g.textAlign = "center"; g.fillText(t + "R", x, H - pad.b + 13);
+  }
+  for(const t of axTicks(maxY)){
+    const y = Math.round(Y(t)) + .5;
+    g.beginPath(); g.moveTo(pad.l, y); g.lineTo(W - pad.r, y); g.stroke();
+    g.textAlign = "right"; g.fillText(t + "R", pad.l - 6, y + 3);
+  }
+  // the break-even diagonal: heat taken == profit ever shown
+  g.strokeStyle = "rgba(255,201,61,0.30)"; g.setLineDash([3, 3]);
+  g.beginPath();
+  const dEnd = Math.min(maxX, maxY);
+  for(let k = 0; k <= 24; k++){
+    const v = dEnd * k / 24;
+    k ? g.lineTo(X(v), Y(v)) : g.moveTo(X(v), Y(v));
+  }
+  g.stroke(); g.setLineDash([]);
+  g.fillStyle = "rgba(255,201,61,0.6)"; g.textAlign = "left";
+  g.fillText("heat = reward", X(dEnd) + 5, Y(dEnd) + 3);
+
+  const good = cssVar("--good"), bad = cssVar("--bad");
+  let clipped = 0;
+  for(let i = 0; i < pts.length; i++){
+    const p = pts[i], win = p.r > 0;
+    const off = p.mfe_r > maxX || p.mae_r > maxY;
+    if(off) clipped++;
+    const rad = Math.max(2.2, Math.min(8, 2.2 + Math.abs(p.r) * 1.2));
+    const x = X(Math.min(p.mfe_r, maxX)), y = Y(Math.min(p.mae_r, maxY));
+    const col = win ? good : bad;
+    g.beginPath(); g.arc(x, y, rad, 0, 6.2832);
+    if(off){                       // outlier: hollow, so it reads as "beyond"
+      g.strokeStyle = col; g.lineWidth = 1.4; g.stroke();
+    } else {
+      g.fillStyle = col + (i === _exHit ? "" : "55"); g.fill();
+      g.strokeStyle = col + (i === _exHit ? "" : "99");
+      g.lineWidth = i === _exHit ? 1.8 : 1; g.stroke();
+    }
+    if(i === _exHit){ g.strokeStyle = cssVar("--accent-2"); g.lineWidth = 1.8; g.stroke(); }
+  }
+  if(clipped){
+    g.fillStyle = cssVar("--muted"); g.font = "9.5px " + cssVar("--mono");
+    g.textAlign = "right";
+    g.fillText(`${clipped} beyond scale (hollow)`, W - pad.r - 2, pad.t - 12);
+  }
+  g.fillStyle = cssVar("--muted"); g.font = "9.5px " + cssVar("--mono");
+  g.save(); g.translate(12, (H - pad.b + pad.t) / 2); g.rotate(-Math.PI / 2);
+  g.textAlign = "center"; g.fillText("MAE — heat taken", 0, 0); g.restore();
+  g.textAlign = "right"; g.fillText("MFE — best it ever showed", W - pad.r, H - 5);
+}
+function exHover(ev){
+  const host = $("viz-excursion"); if(!host || !_exGeom || !_exTrades.length) return;
+  const cv = host.querySelector("canvas"), b = cv.getBoundingClientRect();
+  const mx = ev.clientX - b.left, my = ev.clientY - b.top;
+  let hit = -1, best = 14 * 14;
+  for(let i = 0; i < _exTrades.length; i++){
+    const p = _exTrades[i];
+    const dx = _exGeom.X(p.mfe_r) - mx, dy = _exGeom.Y(p.mae_r) - my;   // X/Y clamp internally
+    const d2 = dx * dx + dy * dy;
+    if(d2 < best){ best = d2; hit = i; }
+  }
+  const tip = host.querySelector(".viz-tip");
+  if(hit === _exHit && hit < 0) return;
+  if(hit !== _exHit){ _exHit = hit; renderExcursion(_exTrades); }
+  if(hit < 0){ tip.classList.remove("on"); return; }
+  const p = _exTrades[hit];
+  tip.innerHTML = `<b>${esc(p.symbol || "")}</b> ${esc(p.side || "")} · <b>${(p.r).toFixed(2)}R</b><br>`
+    + `showed ${p.mfe_r.toFixed(2)}R · took ${p.mae_r.toFixed(2)}R heat<br>`
+    + `${esc(p.regime || "")} · ${esc(p.reason_close || "")}`;
+  tip.classList.add("on");
+  const tw = tip.offsetWidth, th = tip.offsetHeight;
+  tip.style.left = Math.min(Math.max(4, mx + 12), cv.clientWidth - tw - 4) + "px";
+  tip.style.top = Math.max(4, my - th - 10) + "px";
+}
+
+/* ---------------------------------------------------- 2. R DISTRIBUTION
+   The SHAPE of outcomes, not their mean. A trend system is supposed to look
+   like this: a fat stack of small negatives just left of zero and a long thin
+   tail to the right. If the right tail is missing, exits are cutting winners;
+   if the left stack extends past -1R, stops are slipping. */
+function renderRDist(rows, dist){
+  const host = $("viz-rdist"); if(!host) return;
+  const cv = host.querySelector("canvas"); const g = vizCtx(cv); if(!g) return;
+  const W = g.__w, H = g.__h;
+  const vals = (rows || []).map(r => r.r).filter(Number.isFinite);
+  vizEmpty(host, vals.length ? "" : "No journaled R-multiples yet.");
+  if(!vals.length) return;
+
+  // same heavy-tail problem as the scatter: a single -12R drags the axis and
+  // leaves 30 empty bins. Clip to the 2nd/98th percentile and let the end bins
+  // ACCUMULATE everything past them, so the tail is counted, just not plotted
+  // to scale.
+  const sv = vals.slice().sort((a, b) => a - b);
+  const lo = Math.min(-1.5, Math.floor(pq(sv, 0.02) * 2) / 2);
+  const hi = Math.max(2.0, Math.ceil(pq(sv, 0.98) * 2) / 2);
+  const BINS = Math.max(12, Math.min(34, Math.round(W / 22)));
+  const step = (hi - lo) / BINS;
+  const bins = new Array(BINS).fill(0);
+  let under = 0, over = 0;
+  for(const v of vals){
+    if(v < lo) under++; else if(v > hi) over++;
+    bins[Math.max(0, Math.min(BINS - 1, Math.floor((v - lo) / step)))]++;
+  }
+  const peak = Math.max(1, ...bins);
+  const pad = { l: 28, r: 10, t: 24, b: 24 };
+  const X = v => pad.l + ((v - lo) / (hi - lo)) * (W - pad.l - pad.r);
+  const bw = (W - pad.l - pad.r) / BINS;
+
+  for(let i = 0; i < BINS; i++){
+    if(!bins[i]) continue;
+    const c0 = lo + i * step;
+    const h = (bins[i] / peak) * (H - pad.t - pad.b);
+    const x = pad.l + i * bw;
+    const grd = g.createLinearGradient(0, H - pad.b - h, 0, H - pad.b);
+    const col = c0 >= 0 ? cssVar("--good") : cssVar("--bad");
+    grd.addColorStop(0, col + "ee"); grd.addColorStop(1, col + "33");
+    g.fillStyle = grd;
+    g.fillRect(x + 0.6, H - pad.b - h, Math.max(1, bw - 1.2), h);
+  }
+  // zero line
+  g.strokeStyle = cssVar("--baseline"); g.lineWidth = 1;
+  const zx = Math.round(X(0)) + .5;
+  g.beginPath(); g.moveTo(zx, pad.t - 4); g.lineTo(zx, H - pad.b); g.stroke();
+
+  // percentile markers straight from the journal summary
+  const marks = dist ? [["p10", dist.p10], ["p50", dist.p50], ["p90", dist.p90]] : [];
+  g.font = "9.5px " + cssVar("--mono");
+  for(const [lab, v] of marks){
+    if(!Number.isFinite(v) || v < lo || v > hi) continue;
+    const x = Math.round(X(v)) + .5;
+    g.strokeStyle = "rgba(0,210,255,0.5)"; g.setLineDash([2, 3]);
+    g.beginPath(); g.moveTo(x, pad.t); g.lineTo(x, H - pad.b); g.stroke();
+    g.setLineDash([]);
+    g.fillStyle = cssVar("--accent-2"); g.textAlign = "center";
+    g.fillText(lab, x, pad.t - 6);
+  }
+  g.fillStyle = cssVar("--muted"); g.textAlign = "center"; g.font = "9.5px " + cssVar("--mono");
+  for(const t of niceTicks(lo, hi, 6)) g.fillText(t + "R", X(t), H - 8);
+  if(under || over){
+    g.textAlign = "right"; g.fillStyle = cssVar("--muted");
+    g.fillText(`${under ? `${under} ≤${lo}R` : ""}${under && over ? " · " : ""}${over ? `${over} ≥${hi}R` : ""}`,
+               W - pad.r, H - 8);
+  }
+}
+
+/* ---------------------------------------------------- 3. THE GHOST BOOK
+   What the gates REFUSED, and whether refusing was right. The refusal ledger
+   already grades every blocked signal against what price actually did next —
+   this draws it. Bar length is how many that gate refused; the colour is the
+   win rate of the trades it turned away, so a gate glowing red is one that has
+   been rejecting winners and is costing money by existing. */
+function renderGhostBook(ref){
+  const host = $("viz-ghost"); if(!host) return;
+  const cv = host.querySelector("canvas"); const g = vizCtx(cv); if(!g) return;
+  const W = g.__w, H = g.__h;
+  const gates = ((ref && ref.gates) || []).filter(x => x && x.refused > 0)
+    .sort((a, b) => b.refused - a.refused).slice(0, 8);
+  vizEmpty(host, gates.length
+    ? "" : "No graded refusals yet — the ledger needs a few bars to mature.");
+  if(!gates.length) return;
+
+  const pad = { l: 106, r: 96, t: 10, b: 14 };   // r fits "123 · 44% won"
+  const maxN = Math.max(...gates.map(x => x.refused));
+  const rowH = Math.min(24, (H - pad.t - pad.b) / gates.length);
+  g.font = "10px " + cssVar("--mono");
+  gates.forEach((x, i) => {
+    const y = pad.t + i * rowH, h = Math.max(6, Math.min(15, rowH - 7));
+    const w = Math.max(2, (x.refused / maxN) * (W - pad.l - pad.r));
+    // hue by win rate of what it refused: green = correctly refused losers,
+    // red = it has been throwing away winners
+    const wr = Number.isFinite(x.win_rate) ? x.win_rate : 0.5;
+    const col = wr >= 0.55 ? cssVar("--bad") : wr <= 0.4 ? cssVar("--good") : cssVar("--warn");
+    const grd = g.createLinearGradient(pad.l, 0, pad.l + w, 0);
+    grd.addColorStop(0, col + "22"); grd.addColorStop(1, col + "cc");
+    g.fillStyle = grd; g.fillRect(pad.l, y, w, h);
+    g.fillStyle = cssVar("--ink-2"); g.textAlign = "right";
+    g.fillText(x.gate.length > 15 ? x.gate.slice(0, 14) + "…" : x.gate, pad.l - 7, y + h - 1);
+    g.fillStyle = col; g.textAlign = "left";
+    g.fillText(`${x.refused} · ${(wr * 100).toFixed(0)}% won`, pad.l + w + 6, y + h - 1);
+  });
+}
+
+/* ---------------------------------------------------- 4. ALPHA CONSTELLATION
+   The 19-signal floor as a live radial field instead of a list. Angle groups
+   by desk, radius is |score| (centre = silent, rim = maximum conviction), and
+   the ring colour is the desk. A firing alpha pulses. Same data the alpha list
+   shows — this makes "which desks are speaking right now" readable at a glance
+   instead of by scanning nineteen numbers. */
+let _constBg = null, _constKey = "";
+
+/* Each desk owns an equal angular SECTOR. The first draft gave every desk the
+   same 0.92rad spread around a centre point, which let neighbouring desks
+   overlap and stacked low-conviction alphas on top of each other at the hub.
+   Sectors with a sqrt radius fix both: quiet alphas still separate near the
+   centre, and a desk's members always read as one group. */
+function renderConstellation(alphas){
+  const host = $("viz-constellation"); if(!host) return;
+  const cv = host.querySelector("canvas"); const g = vizCtx(cv); if(!g) return;
+  const W = g.__w, H = g.__h;
+  // the snapshot keys alphas by NAME, so normalize to a list first — the
+  // constellation needs the name for nothing but grouping, and reading
+  // `.length` off the raw object silently produced undefined (an empty view
+  // with no error, which is exactly how this shipped broken the first time).
+  const list = alphas && !Array.isArray(alphas)
+    ? Object.entries(alphas).map(([nm, a]) => ({ ...a, name: nm }))
+    : (alphas || []);
+  vizEmpty(host, list.length ? "" : "Warming up…");
+  if(!list.length) return;
+
+  const cx = W / 2, cy = H / 2;
+  const R = Math.max(24, Math.min(W * 0.34, (H - 30) * 0.46));
+  const HUB = 9;
+  const byDesk = {};
+  for(const a of list) (byDesk[a.desk] ||= []).push(a);
+  const desks = DESK_ORDER.filter(d => byDesk[d]);
+  if(!desks.length) return;
+
+  const SEC = 6.2832 / desks.length;
+  // STATIC LAYER, cached. Rings, sector dividers and desk labels depend only on
+  // the box and the desk roster, but they were being re-rasterized on every
+  // repaint. Measured with the constellation removed vs present: p50 was
+  // identical (17.2 vs 17.3ms) while p95 went 21.2 -> 26.1ms and frames over
+  // 33ms went 9 -> 23 — i.e. the cost was not per-frame, it was a spike each
+  // time it redrew. Blitting a cached bitmap turns that back into one drawImage.
+  const key = `${W}x${H}|${desks.join(",")}`;
+  if(_constKey !== key){
+    _constKey = key;
+    const d = VIZ_DPR();
+    _constBg = document.createElement("canvas");
+    _constBg.width = Math.round(W * d); _constBg.height = Math.round(H * d);
+    const bg = _constBg.getContext("2d");
+    bg.setTransform(d, 0, 0, d, 0, 0);
+    bg.strokeStyle = cssVar("--grid"); bg.lineWidth = 1;
+    for(const f of [0.4, 0.7, 1]){
+      bg.beginPath(); bg.arc(cx, cy, HUB + (R - HUB) * f, 0, 6.2832); bg.stroke();
+    }
+    desks.forEach((desk, di) => {
+      const c0 = -Math.PI / 2 + di * SEC;
+      bg.strokeStyle = cssVar("--grid");
+      bg.beginPath(); bg.moveTo(cx, cy);
+      bg.lineTo(cx + Math.cos(c0 - SEC / 2) * R * 1.06, cy + Math.sin(c0 - SEC / 2) * R * 1.06);
+      bg.stroke();
+      const col = cssVar("--" + desk) || cssVar("--accent");
+      const lx = cx + Math.cos(c0) * (R + 15), ly = cy + Math.sin(c0) * (R + 15);
+      bg.fillStyle = col + "dd"; bg.font = "9px " + cssVar("--mono");
+      bg.textAlign = Math.abs(Math.cos(c0)) < 0.3 ? "center" : (Math.cos(c0) > 0 ? "left" : "right");
+      bg.fillText(desk, lx, ly + 3);
+    });
+    bg.fillStyle = cssVar("--muted"); bg.font = "9px " + cssVar("--mono");
+    bg.textAlign = "center";
+    bg.fillText("centre = silent · rim = full conviction", cx, H - 4);
+  }
+  g.drawImage(_constBg, 0, 0, W, H);
+
+  const t = performance.now() / 1000;
+  desks.forEach((desk, di) => {
+    const arr = byDesk[desk];
+    const col = cssVar("--" + desk) || cssVar("--accent");
+    const c0 = -Math.PI / 2 + di * SEC;
+    arr.forEach((a, i) => {
+      // spread across 80% of the sector, centred
+      const frac = arr.length === 1 ? 0 : (i / (arr.length - 1)) - 0.5;
+      const ang = c0 + frac * SEC * 0.8;
+      const mag = Math.min(1, Math.abs(a.score || 0));
+      // sqrt keeps quiet alphas apart instead of piling them on the hub
+      const r = HUB + Math.sqrt(mag) * (R - HUB);
+      const x = cx + Math.cos(ang) * r, y = cy + Math.sin(ang) * r;
+      g.strokeStyle = col + "2e"; g.lineWidth = 1;
+      g.beginPath();
+      g.moveTo(cx + Math.cos(ang) * HUB, cy + Math.sin(ang) * HUB);
+      g.lineTo(x, y); g.stroke();
+      const firing = mag > 0.35;
+      const rad = (2 + mag * 3.6) * (firing ? 1 + 0.16 * Math.sin(t * 3 + i) : 1);
+      if(firing){          // halo kept tight — a big filled arc is pure overdraw
+        g.fillStyle = col + "1f";
+        g.beginPath(); g.arc(x, y, rad * 2.0, 0, 6.2832); g.fill();
+      }
+      g.fillStyle = a.score >= 0 ? col : col + "aa";
+      g.beginPath(); g.arc(x, y, rad, 0, 6.2832); g.fill();
+    });
+  });
+}
+
+/* hover readout — bound once, fires only while the pointer is over the map */
+(() => {
+  const host = $("viz-excursion"); if(!host) return;
+  const cv = host.querySelector("canvas");
+  cv.addEventListener("pointermove", exHover);
+  cv.addEventListener("pointerleave", () => {
+    host.querySelector(".viz-tip").classList.remove("on");
+    if(_exHit !== -1){ _exHit = -1; renderExcursion(_exTrades); }
+  });
+  // a canvas has no intrinsic size, so its backing store must follow its box
+  new ResizeObserver(() => {
+    document.querySelectorAll(".viz canvas").forEach(vizInvalidate);
+    if(activePage() === "analytics"){
+      // all three, not two: a view left un-redrawn keeps a stale backing store
+      // and gets CSS-stretched to the new box, i.e. silently blurry
+      renderExcursion(_exTrades);
+      renderRDist(_exTrades, _exDist);
+      renderGhostBook(S?.engine?.refusals);
+    }
+  }).observe(host);
+})();

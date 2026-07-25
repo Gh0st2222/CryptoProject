@@ -58,7 +58,12 @@
 
       <section class="panel">
         <div class="phead"><h2>Alpha floor · 19 signals</h2><span class="right">● firing ○ dormant</span></div>
-        <div class="pbody"><div class="alpha-desks" id="alpha-desks"></div></div>
+        <div class="pbody">
+          <div class="viz" id="viz-constellation" style="height:212px;border:0;background:none">
+            <canvas></canvas><div class="viz-empty"></div>
+          </div>
+          <div class="alpha-desks" id="alpha-desks"></div>
+        </div>
       </section>
     </div>
 
@@ -308,6 +313,27 @@
         <span class="foot-note" id="an-count" style="margin:0"></span>
       </div>
       <div class="cards" id="an-cards"></div>
+      <div class="viz-grid">
+        <div class="viz viz-tall" id="viz-excursion">
+          <div class="viz-h"><span class="t">Excursion map</span>
+            <span class="s">what each trade showed vs the heat it took first</span></div>
+          <div class="viz-key"><i class="win">winner</i><i class="loss">loser</i>
+            <i style="color:var(--warn)">heat = reward</i></div>
+          <canvas></canvas><div class="viz-tip"></div><div class="viz-empty"></div>
+        </div>
+        <div style="display:grid;gap:10px;min-width:0">
+          <div class="viz viz-mid" id="viz-rdist">
+            <div class="viz-h"><span class="t">R distribution</span>
+              <span class="s">the shape of outcomes, not the mean</span></div>
+            <canvas></canvas><div class="viz-empty"></div>
+          </div>
+          <div class="viz" style="height:250px" id="viz-ghost">
+            <div class="viz-h"><span class="t">Ghost book</span>
+              <span class="s">what the gates refused — red means it refused winners</span></div>
+            <canvas></canvas><div class="viz-empty"></div>
+          </div>
+        </div>
+      </div>
       <div class="an-grid">
         <div><div class="subt">By higher-TF alignment</div><table class="tbl"><thead><tr><th>Bucket</th><th class="r">N</th><th class="r">WR</th><th class="r">PnL</th></tr></thead><tbody id="an-align"></tbody></table></div>
         <div><div class="subt">By regime</div><table class="tbl"><thead><tr><th>Regime</th><th class="r">N</th><th class="r">WR</th><th class="r">PnL</th></tr></thead><tbody id="an-regime"></tbody></table></div>
