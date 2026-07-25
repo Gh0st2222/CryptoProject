@@ -234,6 +234,17 @@ class RiskManager:
         means calm markets -> tighter stop -> more size -> higher leverage,
         and vice versa. `size_mult` (Kelly x health) scales conviction; the
         hard per-trade risk cap backstops everything."""
+        # Finiteness FIRST. `x <= 0` is False for NaN, so this guard — the last
+        # thing between a bad number and a real order — used to fail open on
+        # exactly the input it exists to stop. What follows is worse than a
+        # wrong size: clamp() passes NaN through, `min(nan, lev_max)` is NaN,
+        # `if lev <= 0` is False for NaN too, and the function ends up inside
+        # math.ceil(nan), which RAISES. A sizer must refuse, never throw.
+        if not all(math.isfinite(v) for v in (price, stop_dist, equity, size_mult)):
+            log.warning("refusing to size on non-finite input "
+                        "(price=%r stop_dist=%r equity=%r size_mult=%r)",
+                        price, stop_dist, equity, size_mult)
+            return None
         if price <= 0 or stop_dist <= 0 or equity <= 0:
             return None
         eff_mult = clamp(size_mult, 0.1, 2.0)
