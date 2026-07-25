@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import uuid
 
 from ..config import BotConfig
@@ -144,7 +145,8 @@ class PaperBroker(Broker):
         Post-only is modelled honestly: an order that would already cross the
         current mark is REJECTED, exactly as the exchange rejects it, and the
         caller falls back to market-close-on-touch."""
-        if price <= 0 or qty <= 0:
+        # finiteness before round_step, which floors and therefore raises on NaN
+        if not (math.isfinite(price) and math.isfinite(qty)) or price <= 0 or qty <= 0:
             return False
         spec = self.specs.get(symbol, ContractSpec(symbol))
         if round_step(qty, spec.qty_precision) < spec.min_qty:
@@ -332,6 +334,15 @@ class LiveBroker(Broker):
         existing market-close-on-touch behaviour: a position is never left
         without a way out."""
         spec = self.specs.get(symbol, ContractSpec(symbol))
+        # Validate BEFORE round_step: it goes through math.floor, which RAISES
+        # on a non-finite value, so this refusal path used to throw instead of
+        # returning False. The caller catches it, so no bad order ever reached
+        # the exchange — but "returns False" is the contract, and an order path
+        # should decline cleanly rather than rely on someone else's except.
+        if not (math.isfinite(price) and math.isfinite(qty)):
+            log.warning("maker exit %s: non-finite price/qty (%r/%r) — not arming",
+                        symbol, price, qty)
+            return False
         px = round_step(price, spec.price_precision)
         q = round_step(qty, spec.qty_precision)
         if px <= 0 or q < spec.min_qty:

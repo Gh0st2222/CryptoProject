@@ -210,6 +210,12 @@ class RiskManager:
             return False, f"cooldown for {int(st.cooldown_until - self.clock())}s"
         if open_positions >= self.cfg.max_open_positions:
             return False, "max open positions"
+        # `spread_bps > max` and `equity <= 0` are both False for NaN, so the
+        # last two gates here failed OPEN. The spread limit exists to stop us
+        # trading into a broken or one-sided book — which is precisely the
+        # situation that would produce an unreadable spread in the first place.
+        if not (math.isfinite(spread_bps) and math.isfinite(equity)):
+            return False, "unreadable book/equity — refusing to enter"
         if spread_bps > self.cfg.max_spread_bps:
             return False, f"spread {spread_bps:.1f}bps > {self.cfg.max_spread_bps}bps"
         if equity <= 0:
