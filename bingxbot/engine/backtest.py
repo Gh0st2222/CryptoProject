@@ -43,6 +43,12 @@ def _alpha_cache(ff) -> list[dict]:
         ff._alpha = [{nm: float(fn(ff.row_cached(i), NO_MICRO, NO_CTX)) for nm, fn in fns}
                      for i in range(ff.n)]
     return ff._alpha
+EVIDENCE_K = 15.0   # trades at which a winning window keeps half its raw score.
+                    # Calibrated against the real failure case rather than by
+                    # taste: below ~12 a lucky 6-trade window at triple risk
+                    # still out-ranks a 40-trade window with genuine growth,
+                    # which is the exact pattern that produced the vault's
+                    # weak, fast-decaying champions.
 ASSUMED_SPREAD_BPS = 1.0
 EV_MARGIN = 0.02            # P(win) must clear the cost-adjusted breakeven prob by this
 FILL_THROUGH_BPS = 1.0      # a resting limit fills only when price trades THROUGH it
@@ -797,10 +803,12 @@ def _apply_params(strat: StrategyConfig, risk: RiskConfig, p: dict) -> tuple[Str
     return s, r
 
 
-FITNESS_VER = 3   # bump when the fitness scale changes — birth scores recorded
+FITNESS_VER = 4   # bump when the fitness scale changes — birth scores recorded
                   # under a different version are not comparable to current ones
                   # (v3: honest fills — trade-through limits, double stop slip —
-                  # compressed the whole scale vs v2)
+                  # compressed the whole scale vs v2. v4: evidence shrinkage —
+                  # winning scores are discounted by sample size, so every
+                  # number is smaller than its v3 equivalent)
 
 
 def _fitness(stats: dict) -> float:
@@ -824,8 +832,18 @@ def _fitness(stats: dict) -> float:
     if growth > 0:
         quality = clamp(min(pf, 3.0) / 1.5, 0.3, 2.0)   # stability of the earning, capped
         score = growth * dd_pen * quality
-        # among winners, mild preference for more evidence
-        score *= clamp(0.8 + 0.2 * (t / 30.0), 0.8, 1.4)
+        # EVIDENCE SHRINKAGE. A window's growth is an ESTIMATE, and its error
+        # shrinks with the number of trades behind it — so a winning score is
+        # discounted toward zero by how little evidence supports it. The old
+        # multiplier (0.8..1.4 over 30 trades) was far too weak to matter: a
+        # set could triple its risk, triple its in-sample growth and pay only a
+        # ~1.4x evidence premium, so the search kept pinning risk_per_trade and
+        # kelly_fraction at their box maxima and promoting champions off a
+        # handful of lucky fills. Doubling risk now doubles growth but buys no
+        # extra certainty, so it no longer buys rank. Losers keep their own
+        # branch: shrinking them toward zero would make frequent junk look
+        # SAFER than confident junk and destroy the search's gradient.
+        score *= t / (t + EVIDENCE_K)
     else:
         # losers: junkier losing (low pf) must score MORE negative, never less —
         # multiplying a negative by a small "quality" would invert the ordering.
