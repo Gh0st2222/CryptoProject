@@ -466,30 +466,56 @@ class LiveBroker(Broker):
             window_s = max(1, self.cfg.strategy.maker_wait_bars) * interval_ms(self.cfg.strategy.interval) / 1000.0
         poll_gap = min(max(1.5, window_s / 40.0), 20.0)
         polls = max(2, int(window_s / poll_gap))
-        for _ in range(polls):
-            await asyncio.sleep(poll_gap)
-            try:
-                o = await self.rest.get_order(symbol, order_id)
-            except BingXError as e:
-                log.warning("maker fill poll %s: %s", order_id, e)
-                continue
-            status = str(o.get("status", "")).upper()
-            exec_qty = safe_float(o.get("executedQty") or o.get("cumQty"))
-            if status == "FILLED":
-                ap = safe_float(o.get("avgPrice") or o.get("averagePrice"))
-                return ap, exec_qty, abs(safe_float(o.get("commission") or o.get("fee")))
-            if status in ("CANCELED", "EXPIRED", "REJECTED"):
-                return 0.0, 0.0, 0.0
-        # window elapsed — take any partial fill, cancel the remainder
+        # Whether this order is definitively off the book. Anything that leaves
+        # here without it set has an order that may STILL BE RESTING on the
+        # exchange, and the finally below is what guarantees it gets pulled.
+        settled = False
         try:
+            for _ in range(polls):
+                await asyncio.sleep(poll_gap)
+                try:
+                    o = await self.rest.get_order(symbol, order_id)
+                except BingXError as e:
+                    log.warning("maker fill poll %s: %s", order_id, e)
+                    continue
+                status = str(o.get("status", "")).upper()
+                exec_qty = safe_float(o.get("executedQty") or o.get("cumQty"))
+                if status == "FILLED":
+                    settled = True
+                    ap = safe_float(o.get("avgPrice") or o.get("averagePrice"))
+                    return ap, exec_qty, abs(safe_float(o.get("commission") or o.get("fee")))
+                if status in ("CANCELED", "EXPIRED", "REJECTED"):
+                    settled = True
+                    return 0.0, 0.0, 0.0
+            # window elapsed — take any partial fill, cancel the remainder
             o = await self.rest.get_order(symbol, order_id)
             exec_qty = safe_float(o.get("executedQty") or o.get("cumQty"))
             if exec_qty > 0:
                 await self.rest.cancel_order(symbol, order_id)
+                settled = True
                 return safe_float(o.get("avgPrice")), exec_qty, abs(safe_float(o.get("commission")))
+            return 0.0, 0.0, 0.0
         except BingXError:
-            pass
-        return 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0
+        finally:
+            if not settled:
+                # The caller is about to report "unfilled — entry abandoned", so
+                # the engine forgets this order entirely. If it is still on the
+                # book it can fill HOURS later on a signal that has long since
+                # gone stale, and the first the bot knows of it is reconcile
+                # adopting a position nobody decided to take. It also silently
+                # holds margin in the meantime.
+                #
+                # This runs on every exit path, including asyncio cancellation:
+                # drop_symbol() cancels a pending entry task, and cancelling the
+                # task does nothing whatsoever to an order already on the book.
+                # shield() keeps the cancel in flight even while we are being
+                # torn down.
+                try:
+                    await asyncio.shield(self.rest.cancel_order(symbol, order_id))
+                except (BingXError, asyncio.CancelledError) as e:
+                    log.warning("could not pull unfilled limit %s on %s: %s",
+                                order_id, symbol, e)
 
     async def close_position(self, symbol: str, reason: str, frac: float | None = None,
                              maker_price: float | None = None) -> OrderResult:

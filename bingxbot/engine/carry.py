@@ -242,7 +242,16 @@ class CarryDesk:
         sized.allow_taker_fallback = False
         apr = row.get("funding_apr", 0.0)
         reason = f"carry {apr*100:+.0f}% APR"
-        res = await eng.broker.open_position(sym, side, sized, reason, bar_ts=now_ms())
+        # Reserve the slot for as long as the limit rests. Without this the
+        # signal engine cannot see the desk's pending order and can fill the
+        # same last slot concurrently, putting the account over
+        # max_open_positions. try/finally so a failed entry can never leak a
+        # permanently reserved slot.
+        eng.carry_pending += 1
+        try:
+            res = await eng.broker.open_position(sym, side, sized, reason, bar_ts=now_ms())
+        finally:
+            eng.carry_pending = max(0, eng.carry_pending - 1)
         if res.ok:
             self.entries += 1
             self.meta[sym] = {
