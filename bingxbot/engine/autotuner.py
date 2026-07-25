@@ -62,7 +62,23 @@ TOP_K_VALIDATE = 10         # DE members sent to the REAL (full-python, portfoli
                             # candidates with a brain that has no meta head.
 MIN_VETO_TRADES = 5         # the newest fold must show at least this many trades
                             # before its profit factor is allowed to mean
-                            # anything — the same evidence floor _fitness uses          # validate this many training-best members OOS, keep the best generalizer
+                            # anything — the same evidence floor _fitness uses
+# The OOS folds trade the last OOS_TAIL_FRAC of the series, so DE TRAINING must
+# stop where they begin. It used to stop at 75% while the folds started at 60%:
+# fold 0 was 100% inside the training window and fold 1 50% inside, which means
+# half of every "out-of-sample" verdict was scored on data the search had
+# already fitted. Deriving one from the other makes the two impossible to drift
+# apart again. PURGE_BARS then drops the last stretch of training so a training
+# bar's outcome — which matures `horizon_bars` later — cannot land inside the
+# judge's window either (standard purging; the horizon box tops out at 16).
+OOS_TAIL_FRAC = 0.40
+TRAIN_FRAC = 1.0 - OOS_TAIL_FRAC
+PURGE_BARS = 64
+WEAK_BAR_MULT = 1.25        # a challenger that loses money across the median
+                            # historical era must clear a higher bar
+SPECIALIST_CANDS = 5        # candidates the per-symbol bench considers (its cost
+                            # is candidates x symbols x folds, so it must not
+                            # scale with the widened judging funnel)
 OOS_FOLDS = 4               # purged sequential portfolio folds a champion must earn
                             # across — 4 gives the median+worst composite a real
                             # median (undersized folds self-drop in portfolio_folds)
@@ -102,6 +118,14 @@ def _current_params(cfg) -> dict:
         src = cfg.strategy if grp == "strategy" else cfg.risk
         p[name] = getattr(src, name)
     return p
+
+
+def _train_split(candles: list) -> list:
+    """The bars the DE may FIT on: everything before the OOS folds start, minus
+    a purge gap. Anything after this point is the judge's, and the judge's
+    windows must contain no bar the search has already seen."""
+    cut = int(len(candles) * TRAIN_FRAC) - PURGE_BARS
+    return candles[:max(MIN_FOLD_BARS, cut)]
 
 
 def _centroid(param_sets: list[dict]) -> dict:
@@ -435,8 +459,7 @@ class AutoTuner:
         strat, risk = cfg.strategy, cfg.risk
 
         n = len(candles)
-        val_cut = int(n * 0.75)
-        train = candles[:val_cut]
+        train = _train_split(candles)
         valid = self._valid_window(candles)
 
         # validation BASKET = the symbols the engine is ACTUALLY TRADING (user
@@ -501,7 +524,7 @@ class AutoTuner:
                 continue
             hit = self._cache.get(tsym)
             if hit and len(hit[0]) >= MIN_BARS:
-                cf = _make_folds(hit[0][:int(len(hit[0]) * 0.75)], nf)
+                cf = _make_folds(_train_split(hit[0]), nf)
                 # a fold below the backtester's floor scores -1.0 for EVERY
                 # candidate: harmless to the ordering but pure wasted CPU, so
                 # only co-train when the second symbol can carry the same
@@ -585,7 +608,7 @@ class AutoTuner:
                 cbs_full[tsym] = hit[0]
         if not cbs_full:
             cbs_full = {symbol: candles}
-        folds_cbs = portfolio_folds(cbs_full, k=OOS_FOLDS)
+        folds_cbs = portfolio_folds(cbs_full, k=OOS_FOLDS, tail_frac=OOS_TAIL_FRAC)
         if not folds_cbs:
             return False
         nf_oos = len(folds_cbs)
@@ -623,6 +646,7 @@ class AutoTuner:
         best_folds: list[float] = []
         pf_passed = 0    # candidates whose newest-fold PF cleared 1.0 (promotable pool)
         thin_rejected = 0  # ...and those refused for judging on too few trades
+        ranked: list[tuple[float, int]] = []   # (OOS score, index) of the promotable
         for i, c in enumerate(cands):
             oos, stats0, fold_fits_oos = cand_fit(i)
             # NO in-sample-vs-OOS value penalty anymore: training fitness is a
@@ -653,6 +677,7 @@ class AutoTuner:
             if float(stats0.get("profit_factor", 0.0) or 0.0) < 1.0:
                 continue
             pf_passed += 1
+            ranked.append((adj, i))
             if adj > best_adj:
                 best, best_i, best_adj, best_stats = c, i, adj, stats0
                 best_folds = fold_fits_oos
@@ -671,21 +696,37 @@ class AutoTuner:
         # challenger must beat it in a MAJORITY of the purged folds — a set
         # that wins on average but loses most windows is one lucky window.
         beat = sum(1 for a, b in zip(best_folds, champ_folds) if a > b)
+        bar = max(champ_fit * margin, MIN_ABS_FITNESS)
         gaunt = None
-        if (different and best_adj > max(champ_fit * margin, MIN_ABS_FITNESS)
-                and beat * 2 > nf_oos):
+        gauntlet_blocked = False
+        qualifies = different and best_adj > bar and beat * 2 > nf_oos
+        if qualifies:
             # REGIME GAUNTLET: score the incoming champion across five years of
             # Binance regime eras (2021 top, 2022 crash, 2023 chop, ...) —
-            # same portfolio simulator, same BingX fees, Binance prices. This
-            # is SOFT evidence by design: it can never block a promotion (a
-            # 2022-shaped failure says little about a 2026 edge, and no
-            # internet must never mean no tuning) — but a champion that loses
-            # money in most eras carries a 'weak' stamp that DOUBLES its live
-            # probation: more proof required before full-size tuition.
+            # same portfolio simulator, same BingX fees, Binance prices.
+            #
+            # It now runs BEFORE the decision instead of after it. The evidence
+            # was already being paid for and then ignored at the only moment it
+            # could have mattered: a set that beats the incumbent by a hair on
+            # 36 days but loses money across the median historical era is far
+            # more likely to be fitting the recent window than to have found
+            # something. Such a challenger must clear a HIGHER bar. It is still
+            # never an outright veto — a 2022-shaped failure says little about a
+            # 2026 edge — and with no internet there is no verdict and nothing
+            # changes, so research never depends on Binance being reachable.
             try:
                 gaunt = await self._gauntlet(best_params, interval, taker, slip, strat, risk)
             except Exception as e:  # noqa: BLE001 — evidence, never a dependency
                 log.debug("gauntlet failed: %s", e)
+            if gaunt is not None and gaunt.get("weak"):
+                bar = max(bar * WEAK_BAR_MULT, MIN_ABS_FITNESS)
+                qualifies = best_adj > bar
+                gauntlet_blocked = not qualifies
+                if gauntlet_blocked:
+                    log.info("promotion held: challenger %.2f fails history "
+                             "(median era %.2f) and misses the raised bar %.2f",
+                             best_adj, gaunt.get("median", 0.0), bar)
+        if qualifies:
             self.orch.apply_params(best_params)
             self.improvements += 1
             promoted = True
@@ -765,7 +806,13 @@ class AutoTuner:
         if self.cycles % SPECIALIST_EVERY == 0:
             try:
                 applied_params = best_params if promoted else champ
-                sym_results = await self._specialist_pass(cands, applied_params, folds_cbs,
+                # the bench costs candidates x symbols x folds, so it takes the
+                # best few by OOS rather than everything the widened funnel
+                # judged — its job is finding per-symbol overlays, and a
+                # near-clone of a mediocre set has nothing to teach a symbol.
+                top = [cands[i] for _s, i in sorted(ranked, reverse=True)[:SPECIALIST_CANDS]]
+                sym_results = await self._specialist_pass(top or cands[:SPECIALIST_CANDS],
+                                                          applied_params, folds_cbs,
                                                           interval, slip, strat, risk)
                 overlays = select_specialists(sym_results)
                 self.orch.update_symbol_overlays(overlays, traded=list(sym_results))
@@ -877,7 +924,8 @@ class AutoTuner:
             # promotion transparency: how close is anything to taking the seat?
             "pf_passed": pf_passed, "cands_judged": len(cands),
             "thin_rejected": thin_rejected, "co_symbol": co_sym or None,
-            "bar": round(max(champ_fit * margin, MIN_ABS_FITNESS), 3),
+            "gauntlet_blocked": gauntlet_blocked,
+            "bar": round(bar, 3),   # the bar as actually applied, history raise included
             "promoted": promoted, "candidates": len(candidates),
             "vault_candidates": len(vault), "de_candidates": len(topk),
             "champion_source": (best["source"] if best else None),
@@ -1031,7 +1079,7 @@ class AutoTuner:
                 log.debug("trial basket %s: %s", tsym, e)
         if not cbs_full:
             return
-        folds_cbs = portfolio_folds(cbs_full, k=OOS_FOLDS)
+        folds_cbs = portfolio_folds(cbs_full, k=OOS_FOLDS, tail_frac=OOS_TAIL_FRAC)
         if not folds_cbs:
             return
         specs_map = {s: self.orch.specs.get(s, ContractSpec(s)) for s in cbs_full}
