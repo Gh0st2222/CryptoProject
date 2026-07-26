@@ -1111,18 +1111,61 @@ class TraderEngine:
             "tape": self.tape[-10:],
         }
 
+    # The brain scalars a symbol's decisions are made with, and where each one
+    # comes from. `_apply_brain_params` writes them; `param_divergence` proves
+    # afterwards that what is in force is still what these two sources say.
+    _BRAIN_PARAMS = (
+        # (overlay key, brain attribute, config attribute, coerce)
+        ("base_threshold", "base_threshold", "base_threshold", None),
+        ("cost_multiple", "cost_multiple", "cost_multiple", None),
+        ("hedge_eta", "eta", "hedge_eta", None),
+        ("horizon_bars", "horizon", "horizon_bars", lambda v: max(1, int(v))),
+        ("kelly_fraction", "kelly_fraction", "kelly_fraction", None),
+        ("min_p_win", "min_p_win", "min_p_win", None),
+        ("target_trades_per_hour", "target_rate", "target_trades_per_hour",
+         lambda v: max(0.1, v)),
+    )
+
     def _apply_brain_params(self, brain, strat, ov: dict | None) -> None:
         """Push brain scalars from the global strategy config, overridden by the
         symbol's overlay where one exists."""
         g = (lambda k, d: ov.get(k, d)) if ov else (lambda k, d: d)
-        brain.base_threshold = g("base_threshold", strat.base_threshold)
-        brain.cost_multiple = g("cost_multiple", strat.cost_multiple)
-        brain.eta = g("hedge_eta", strat.hedge_eta)
-        brain.horizon = max(1, int(g("horizon_bars", strat.horizon_bars)))
-        brain.kelly_fraction = g("kelly_fraction", strat.kelly_fraction)
-        brain.min_p_win = g("min_p_win", strat.min_p_win)
-        brain.target_rate = max(0.1, g("target_trades_per_hour", strat.target_trades_per_hour))
+        for okey, battr, cattr, coerce in self._BRAIN_PARAMS:
+            v = g(okey, getattr(strat, cattr))
+            setattr(brain, battr, coerce(v) if coerce else v)
         brain.threshold_adapt = strat.threshold_adapt
+
+    def param_divergence(self) -> list[dict]:
+        """Brain scalars in force that match NEITHER the live global set nor the
+        symbol's registered overlay.
+
+        Every writer of these values goes through `_apply_brain_params`, so a
+        symbol's brain should always equal (global set, overridden by overlay).
+        If it does not, the symbol is trading on parameters that appear nowhere
+        in the config or the overlay ledger — which is invisible in every other
+        readout, because the terminal and the resume both print the CONFIG and
+        the OVERLAYS, never what the brain is actually holding. A stale value
+        here silently gates one symbol differently from what the operator is
+        looking at.
+        """
+        s = self.cfg.strategy
+        out: list[dict] = []
+        for sym, c in self.ctx.items():
+            ov = self.overlays.get(sym) or {}
+            for okey, battr, cattr, coerce in self._BRAIN_PARAMS:
+                want = ov.get(okey, getattr(s, cattr))
+                if coerce:
+                    want = coerce(want)
+                got = getattr(c.brain, battr, None)
+                try:
+                    same = abs(float(got) - float(want)) <= 1e-9
+                except (TypeError, ValueError):
+                    same = got == want
+                if not same:
+                    out.append({"symbol": sym, "param": okey,
+                                "in_force": got, "expected": want,
+                                "source": "overlay" if okey in ov else "global"})
+        return out
 
     def set_overlay(self, sym: str, params: dict | None) -> None:
         """Per-symbol brain overlay from the tuner: apply now if the symbol is
