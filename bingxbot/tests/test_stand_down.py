@@ -12,8 +12,6 @@ four of six historical eras.
 
 These tests pin the boundary itself, so the gap cannot quietly reopen.
 """
-import pytest
-
 from bingxbot.engine.autotuner import (DEMOTE_FLOOR, DEMOTE_PATIENCE,
                                        DEMOTE_PATIENCE_WEAK, MIN_ABS_FITNESS)
 
