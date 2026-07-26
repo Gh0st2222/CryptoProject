@@ -20,10 +20,12 @@ champion in the vault negative and 618 cycles without a promotion. These tests
 pin the geometry so it cannot slide back there, and pin the pooled evidence
 floor that replaced a single fold's trade count.
 """
-from bingxbot.engine.autotuner import (LOOKBACK_DAYS, MIN_BARS,
-                                       MIN_OOS_TRADED_BARS, MIN_POOLED_TRADES,
-                                       MIN_VETO_TRADES, OOS_FOLDS,
-                                       OOS_TAIL_FRAC, _oos_fold_count)
+import pytest
+
+from bingxbot.engine.autotuner import (MIN_BARS, MIN_OOS_TRADED_BARS,
+                                       MIN_POOLED_TRADES, MIN_VETO_TRADES,
+                                       OOS_FOLDS, OOS_TAIL_FRAC,
+                                       _oos_fold_count, lookback_days)
 from bingxbot.engine.search import portfolio_folds
 
 WARMUP = 300
@@ -40,10 +42,11 @@ def test_the_default_lookback_gives_judged_folds_a_length_that_works():
     """The whole finding in one assertion: at the configured lookback, splitting
     the out-of-sample tail into OOS_FOLDS must leave each fold well clear of the
     length where the judge stopped meaning anything."""
-    n = _bars(LOOKBACK_DAYS)
+    days = lookback_days("15m")
+    n = _bars(days)
     traded = int(n * OOS_TAIL_FRAC) // OOS_FOLDS
     assert traded >= MIN_OOS_TRADED_BARS, (
-        f"{LOOKBACK_DAYS}d split {OOS_FOLDS} ways gives {traded} traded bars per "
+        f"{days}d split {OOS_FOLDS} ways gives {traded} traded bars per "
         f"fold; below {MIN_OOS_TRADED_BARS} the judge's verdict stops "
         f"correlating with the next window")
 
@@ -71,7 +74,7 @@ def test_thin_history_widens_the_folds_instead_of_slicing_confetti():
 def test_plenty_of_history_still_uses_the_full_fold_count():
     """Widening folds is a concession to thin data, not the new normal — the
     median+worst composite needs several folds to have a median at all."""
-    assert _oos_fold_count({"BTC-USDT": list(range(_bars(LOOKBACK_DAYS)))}) == OOS_FOLDS
+    assert _oos_fold_count({"BTC-USDT": list(range(_bars(lookback_days("15m"))))}) == OOS_FOLDS
 
 
 def test_the_fold_count_never_returns_zero_or_negative():
@@ -128,3 +131,51 @@ def test_the_pooled_floor_is_reachable_at_the_configured_geometry():
     to carry the pooled floor with room to spare."""
     measured_trades_per_fold = 14      # median, 1260-bar folds, two symbols
     assert OOS_FOLDS * measured_trades_per_fold >= MIN_POOLED_TRADES
+
+
+# ------------------------------------------------- history sized in bars
+
+def test_research_history_is_counted_in_bars_not_days():
+    """What the fold-length measurement constrains is BARS per judged fold. A
+    fixed day count answers that correctly for exactly one bar size: 180 days is
+    17k bars at 15m and 259k at 1m — and the trial clock runs at 1m to 5m. Ten
+    symbols of 1m history at a day-based lookback is 2.6 million candles held in
+    the research cache on a machine that is also trading."""
+    from bingxbot.engine.autotuner import RESEARCH_BARS, lookback_days
+    from bingxbot.util import interval_ms
+    for iv in ("3m", "5m", "15m"):
+        bars = lookback_days(iv) * 86_400_000 / interval_ms(iv)
+        assert bars == pytest.approx(RESEARCH_BARS, rel=0.02), (
+            f"{iv} asks for {bars:,.0f} bars, not {RESEARCH_BARS:,}")
+
+
+def test_the_fifteen_minute_clock_still_gets_its_measured_geometry():
+    """The primary clock is the one the measurement was taken on; switching the
+    unit must not have moved it."""
+    from bingxbot.engine.autotuner import lookback_days
+    n = lookback_days("15m") * 96
+    assert int(n * OOS_TAIL_FRAC) // OOS_FOLDS >= MIN_OOS_TRADED_BARS
+
+
+def test_a_fast_clock_cannot_ask_for_a_gigabyte_of_candles():
+    """The bound that makes the trial lane safe. 1m at an unbounded bar count
+    would still be reasonable, but the floor and ceiling are what stop any
+    future clock from being pathological."""
+    from bingxbot.engine.autotuner import (LOOKBACK_MAX_DAYS, LOOKBACK_MIN_DAYS,
+                                           lookback_days)
+    from bingxbot.util import interval_ms
+    for iv in ("1m", "3m", "5m", "15m", "1h", "4h"):
+        d = lookback_days(iv)
+        assert LOOKBACK_MIN_DAYS <= d <= LOOKBACK_MAX_DAYS, f"{iv}: {d} days"
+        bars = d * 86_400_000 / interval_ms(iv)
+        assert bars <= 40_000, f"{iv} would cache {bars:,.0f} bars per symbol"
+
+
+def test_a_slow_clock_degrades_by_widening_folds_not_by_lying():
+    """At 1h the ceiling bites and there are not enough bars for four judged
+    folds. The honest answer is fewer, longer folds — never four short ones."""
+    from bingxbot.engine.autotuner import lookback_days
+    bars = int(lookback_days("1h") * 24)
+    k = _oos_fold_count({"X": list(range(bars))})
+    assert k < OOS_FOLDS, "an hour clock should not claim the full fold count"
+    assert k >= 1

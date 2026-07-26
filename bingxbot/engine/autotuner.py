@@ -30,7 +30,7 @@ import time
 from ..config import MODE_IDLE
 from ..exchange.models import ContractSpec
 from ..strategy.regime_profile import build_profile, classify_era, dominant_regime
-from ..util import clamp
+from ..util import clamp, interval_ms
 from .backtest import TUNABLES, _coerce
 from .search import (STATE_PATH, DEOptimizer, portfolio_folds, recency_weights,
                      robust_aggregate, score_fold, validate_params,
@@ -163,16 +163,23 @@ LIVE_MIN_SAMPLE = 8         # real trades before live evidence can demote: 1 win
                             # coincidence — waiting longer just pays more tuition
 LIVE_RECENT_N = 20          # judge a champion on its most recent real trades
 LIVE_PF_FLOOR = 0.7         # real profit factor below this (and < 1/2 expectation) -> demote
-LOOKBACK_DAYS = 180.0       # DOUBLED, and the reason is the fold-length table
-                            # above: at 90 days the 40% OOS tail split four ways
-                            # gave each judged fold ~560 traded bars and ~7
-                            # trades, which is below the point where the verdict
-                            # means anything. 180 days puts each fold near 1400
-                            # traded bars — the regime the measurement shows
-                            # works — and buys wider regime coverage and ~2x the
-                            # meta-training samples on the way. Recency weighting
-                            # on the TRAINING folds keeps the search current, so
-                            # the extra history informs without anchoring.
+# RESEARCH HISTORY IS COUNTED IN BARS, NOT DAYS. What the fold-length table
+# above measures is bars per judged fold, and that is what the search needs:
+# enough bars that OOS_TAIL_FRAC of them, split OOS_FOLDS ways, clears
+# MIN_OOS_TRADED_BARS. A fixed number of DAYS answers that question correctly
+# for exactly one bar size and badly for every other — 180 days is 17k bars at
+# 15m and 259k at 1m, and the trial clock runs at 1m, 3m or 5m. Ten symbols of
+# 1m history at a day-based lookback is 2.6 MILLION candles held in the research
+# cache, on a machine that is also trading.
+RESEARCH_BARS = 17_280      # 4 judged folds x ~1730 traded bars, plus the
+                            # training window: the geometry the measurement
+                            # shows works, expressed in the unit it was
+                            # measured in. (At 15m this is 180 days, double the
+                            # 90 that produced 618 cycles without a champion.)
+LOOKBACK_MIN_DAYS = 20.0    # ...but never ask for so little wall-clock history
+LOOKBACK_MAX_DAYS = 240.0   # that regimes vanish, nor so much that a slow clock
+                            # spends the session downloading. Outside this band
+                            # _oos_fold_count widens the folds instead.
 DATA_TTL_S = 1800
 GAP_FAST = 20               # cadence right after a promotion (keep hammering)
 GAP_SLOW = 60               # cadence when stable
@@ -186,6 +193,18 @@ SPECIALIST_EVERY = 5        # per-symbol specialist (overlay) pass every N cycle
 MIN_BARS = 3000
 MIN_FOLD_BARS = 450         # a training fold below this can't produce a meaningful
                             # backtest (warmup + a real trading tail)
+
+
+def lookback_days(interval: str) -> float:
+    """How much wall-clock history RESEARCH_BARS is on this clock, bounded.
+
+    The bound is what keeps a 1m trial clock from asking for a year and a 1h
+    clock from asking for two hundred bars: below the floor there is no regime
+    variety to learn from, above the ceiling the download outlasts the session.
+    When the bound bites, the fold count gives way instead — see
+    _oos_fold_count."""
+    per_day = 86_400_000.0 / max(1, interval_ms(interval))
+    return clamp(RESEARCH_BARS / per_day, LOOKBACK_MIN_DAYS, LOOKBACK_MAX_DAYS)
 
 
 def _current_params(cfg) -> dict:
@@ -500,9 +519,11 @@ class AutoTuner:
         if hit and time.time() - hit[1] < DATA_TTL_S:
             return hit[0]
         cfg = self.orch.cfg
+        iv = interval or cfg.strategy.interval
+        # history sized in BARS for THIS clock: the trial lane runs at 1m-5m,
+        # where a fixed day count is either a rounding error or a gigabyte
         candles = await self.orch._get_backtest_candles(
-            symbol, interval or cfg.strategy.interval, LOOKBACK_DAYS,
-            cfg.feed == "synthetic", _NullJob())
+            symbol, iv, lookback_days(iv), cfg.feed == "synthetic", _NullJob())
         cache[symbol] = (candles, time.time())
         if len(cache) > 10:  # bound the cache to the working set
             oldest = min(cache, key=lambda s: cache[s][1])
@@ -527,10 +548,16 @@ class AutoTuner:
 
     def _valid_window(self, candles: list) -> list:
         """The held-out recent window, with a lead-in EXACTLY equal to the
-        backtester's warmup (300) so OOS trading starts precisely at the 75%
-        cut. The old 400-bar lead-in started trading 100 bars early — 100 bars
-        of TRAINING data silently counted toward every 'out-of-sample' score."""
-        val_cut = int(len(candles) * 0.75)
+        backtester's warmup (300) so OOS trading starts precisely where training
+        stops. The old 400-bar lead-in started trading 100 bars early — 100 bars
+        of TRAINING data silently counted toward every 'out-of-sample' score.
+
+        The cut is DERIVED from OOS_TAIL_FRAC rather than written down again. It
+        used to be a hard-coded 0.75 against a tail that is 0.40, which was safe
+        only by accident: it threw away a third of the held-out data, and the day
+        anyone tightened the tail below 0.25 it would have started scoring vault
+        champions on bars the search had already fitted, silently."""
+        val_cut = int(len(candles) * TRAIN_FRAC)
         return candles[max(0, val_cut - 300):]
 
     async def _specialist_pass(self, cands: list[dict], applied_params: dict,
@@ -1259,8 +1286,17 @@ class AutoTuner:
                 self.trial_de.seed_population(_current_params(cfg))
         de = self.trial_de
 
-        val_cut = int(len(candles) * 0.75)
-        train = candles[:val_cut]
+        # THE SAME SPLIT THE PRIMARY CLOCK USES. This was a hard-coded 0.75 while
+        # the judge below builds its folds from OOS_TAIL_FRAC (0.40), i.e. from
+        # 60% of the series onward — so the trial DE was fitting bars up to 75%
+        # and then being scored on folds that began at 60%. The first fold sat
+        # entirely inside its own training data and the second half-way in, with
+        # no purge gap either: precisely the leak the primary clock's comment
+        # describes as fixed, still live on the clock whose whole job is to
+        # answer "which bar size earns more out-of-sample". Its champions are
+        # tagged and kept in the vault for the day the user switches interval,
+        # so the inflated numbers were not harmless.
+        train = _train_split(candles)
         max_folds_by_data = max(1, len(train) // MIN_FOLD_BARS)
         nf = int(clamp(min(self.orch.research_workers, max_folds_by_data), 1, 8))
         folds = _make_folds(train, nf)
