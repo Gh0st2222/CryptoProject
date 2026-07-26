@@ -69,13 +69,16 @@ def mtf_from_row(row: dict, ladder) -> dict:
 
 
 class FeatureFrame:
-    __slots__ = ("n", "f", "ladder", "_rows", "_alpha", "_kmats")
+    __slots__ = ("n", "f", "ladder", "_rows", "_alpha", "_kmats", "_keys", "_mat", "_read")
 
     def __init__(self, arrays: dict[str, np.ndarray], interval: str | None = None):
         self.ladder: list[str] = []
         self._rows = None    # lazy per-bar row-dict cache (candidate-invariant)
         self._alpha = None   # lazy per-bar alpha-score cache (set by the backtester)
         self._kmats = None   # lazy compiled-kernel matrices (features/alphas/regimes)
+        self._keys = None    # lazy row-view: column order + (bars x features)
+        self._mat = None     # float64 matrix backing row() / row_cached()
+        self._read = False   # a frame read once (live scan) never builds the grid
         o = arrays.get("open", arrays["close"])
         c, h, l, v = arrays["close"], arrays["high"], arrays["low"], arrays["volume"]
         self.n = len(c)
@@ -212,10 +215,42 @@ class FeatureFrame:
         f["htf_med_dir"] = higher[0] if higher else np.zeros(n)
         f["htf_hi_dir"] = higher[-1] if higher else np.zeros(n)
 
+    def _grid(self) -> tuple[list[str], np.ndarray]:
+        """Feature values as one (bars x features) float64 matrix.
+
+        `row()` is the hottest function in the backtester after the brain
+        itself — one call per bar per symbol, plus one per entry. Reading it
+        as `{k: float(a[i]) ...}` walks 68 separate arrays and converts 68
+        numpy scalars one at a time in the interpreter. Slicing one row of a
+        contiguous matrix and calling `.tolist()` does the same conversions in
+        a single C call: measured 7.8us -> 3.0us per row, for a 3ms/3MB
+        one-time build. Same keys, same python floats, same values (NaNs
+        included) — every array is float64-castable, exactly as `float()`
+        already required.
+        """
+        keys = self._keys
+        if keys is None or len(keys) != len(self.f):
+            keys = list(self.f)
+            mat = np.empty((self.n, len(keys)), dtype=np.float64)
+            for j, k in enumerate(keys):
+                mat[:, j] = self.f[k]
+            self._keys, self._mat = keys, mat
+        return self._keys, self._mat
+
     def row(self, i: int) -> dict[str, float]:
         if i < 0:
             i += self.n
-        return {k: float(a[i]) for k, a in self.f.items()}
+        # The matrix has to earn itself. The live reactive scanner builds a
+        # whole FeatureFrame over the 1500-bar tail and then reads exactly ONE
+        # row from it, several times a second — for that caller the grid is
+        # 800KB of copying to serve 68 values. A second read is the signal
+        # that this frame belongs to a backtest, where the build is repaid a
+        # few thousand times over. First read stays on the direct path.
+        if self._mat is None and not self._read:
+            self._read = True
+            return {k: float(a[i]) for k, a in self.f.items()}
+        keys, mat = self._grid()
+        return dict(zip(keys, mat[i].tolist()))
 
     def row_cached(self, i: int) -> dict[str, float]:
         """Same values as row(i), but built ONCE for every bar and reused.
@@ -223,10 +258,8 @@ class FeatureFrame:
         shared across tuner candidates pays this cost once instead of once per
         candidate. Callers must treat cached rows as read-only."""
         if self._rows is None:
-            keys = list(self.f)
-            cols = [self.f[k] for k in keys]
-            self._rows = [dict(zip(keys, (float(c[j]) for c in cols)))
-                          for j in range(self.n)]
+            keys, mat = self._grid()
+            self._rows = [dict(zip(keys, r)) for r in mat.tolist()]
         if i < 0:
             i += self.n
         return self._rows[i]

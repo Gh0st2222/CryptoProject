@@ -49,6 +49,59 @@ def _logit(p: float) -> float:
 log = logging.getLogger("brain")
 
 
+
+class _ScoreWindow:
+    """The last `cap` absolute edges, stored ready for the quantile step.
+
+    `_adapt_threshold` takes a k-th order statistic of this window on every
+    graded bar. As a deque it had to be copied into an array first, and that
+    copy — 720 python floats, ~16us — cost more than six times the partition it
+    fed, which is ~6% of a whole portfolio backtest. A numpy buffer of twice
+    the capacity, compacted once every `cap` appends, hands out the same window
+    as a contiguous view with no copy at all; the amortized cost of an append
+    is one store.
+
+    Same values, same order, same trimming rule as `deque(maxlen=cap)`.
+    """
+
+    __slots__ = ("_buf", "_n", "cap")
+
+    def __init__(self, cap: int):
+        self.cap = int(cap)
+        self._buf = np.empty(self.cap * 2, dtype=np.float64)
+        self._n = 0
+
+    def __len__(self) -> int:
+        return min(self._n, self.cap)
+
+    def __iter__(self):
+        return iter(self.view().tolist())
+
+    def clear(self) -> None:
+        self._n = 0
+
+    def append(self, v: float) -> None:
+        if self._n == self._buf.size:
+            # keep the newest `cap`; the halves never overlap
+            self._buf[:self.cap] = self._buf[self.cap:]
+            self._n = self.cap
+        self._buf[self._n] = v
+        self._n += 1
+
+    def extend(self, vals) -> None:
+        for v in vals:
+            self.append(v)
+
+    def view(self) -> np.ndarray:
+        """The live window, oldest first. A read-only borrow — np.partition
+        copies, so the quantile never reorders what is stored here."""
+        return self._buf[self._n - len(self):self._n]
+
+    def tail(self, k: int) -> list[float]:
+        v = self.view()
+        return (v[-k:] if k < v.size else v).tolist()
+
+
 def _finite(x, default: float = 0.0) -> float:
     """A persisted number, or `default` if it is not a real one.
 
@@ -122,7 +175,7 @@ class TradingBrain:
         self.calibrator = ProbabilityCalibrator()
 
         self._pending: deque[_Pending] = deque()
-        self._score_hist: deque[float] = deque(maxlen=720)
+        self._score_hist = _ScoreWindow(720)
         self._idx = 0
         self.use_meta = True       # the ML dataset builder disables this on its
         self.meta_p = None         # own brain so the model never labels itself
@@ -154,7 +207,7 @@ class TradingBrain:
         desk_sig, desk_conf, desk_active = {}, {}, {}
         for desk, names in DESKS.items():
             num = den = 0.0
-            active = same = 0
+            active = pos = neg = 0
             for nm in names:
                 s = alpha_scores[nm]
                 w = self.alpha_w[nm]
@@ -162,11 +215,21 @@ class TradingBrain:
                 den += w
                 if abs(s) > 0.05:
                     active += 1
+                    # tally the two directions on the way past: agreement with
+                    # the desk signal is decided by SIGN, and sign(sig) is
+                    # sign(num), so the second pass this used to make over the
+                    # same alphas told us nothing the first one could not.
+                    if s > 0:
+                        pos += 1
+                    elif s < 0:
+                        neg += 1
             sig = clamp(num / den if den > 0 else 0.0, -1, 1)
             desk_sig[desk] = sig
             desk_active[desk] = active
             if active:
-                same = sum(1 for nm in names if abs(alpha_scores[nm]) > 0.05 and alpha_scores[nm] * sig > 0)
+                # a zero (or non-finite) sig agrees with nothing, exactly as
+                # `alpha_scores[nm] * sig > 0` evaluated for every alpha
+                same = pos if sig > 0 else neg if sig < 0 else 0
                 desk_conf[desk] = abs(sig) * (same / active)
             else:
                 desk_conf[desk] = 0.0
@@ -346,22 +409,43 @@ class TradingBrain:
             self.graded += 1
 
     def _renormalize_desks(self) -> None:
+        # Runs once per graded bar, so ~17k times per portfolio backtest. The
+        # arithmetic below is unchanged — same operations in the same order on
+        # the same values — but the two generator expressions and the per-call
+        # `excess` dict are gone: accumulate into a local and reuse one list.
+        # Cannot be hoisted out of _grade's loop: the shrink toward uniform and
+        # the floor redistribution are affine, not scale-invariant, so
+        # (update, renorm, update, renorm) is genuinely not (update, update,
+        # renorm) when several pending bars grade at once.
         lam = 0.004
+        w = self.alpha_w
+        floor = self.floor
         for names in DESKS.values():
             k = len(names)
             uni = 1.0 / k
-            total = sum(self.alpha_w[nm] for nm in names) or 1.0
+            total = 0.0
             for nm in names:
-                self.alpha_w[nm] = (1 - lam) * (self.alpha_w[nm] / total) + lam * uni
-            excess = {nm: max(self.alpha_w[nm] - self.floor, 0.0) for nm in names}
-            tot = sum(excess.values())
-            free = 1.0 - k * self.floor
+                total += w[nm]
+            if not total:
+                total = 1.0
+            excess = []
+            tot = 0.0
+            for nm in names:
+                nw = (1 - lam) * (w[nm] / total) + lam * uni
+                w[nm] = nw
+                e = nw - floor
+                if e < 0.0:  # noqa: PLR1730 — max() is a call; this loop runs
+                    e = 0.0   # ~325k times a backtest and the branch is 3.9x cheaper
+                excess.append(e)
+                tot += e
+            free = 1.0 - k * floor
             if tot <= 1e-12 or free <= 0:
                 for nm in names:
-                    self.alpha_w[nm] = uni
+                    w[nm] = uni
             else:
-                for nm in names:
-                    self.alpha_w[nm] = self.floor + excess[nm] * (free / tot)
+                scale = free / tot
+                for j, nm in enumerate(names):
+                    w[nm] = floor + excess[j] * scale
 
     def _adapt_threshold(self) -> None:
         if not self.threshold_adapt or len(self._score_hist) < 120:
@@ -377,7 +461,7 @@ class TradingBrain:
         # bar. Profiling showed that full sort was ~12% of an entire python
         # backtest run (it executes once per graded bar, in every tuner
         # validation, specialist pass, gauntlet era and meta labeling run).
-        arr = np.asarray(self._score_hist, dtype=np.float64)
+        arr = self._score_hist.view()
         k = min(int(p * arr.size), arr.size - 1)
         q = float(np.partition(arr, k)[k])
         # the adaptive part may only TIGHTEN the gate above the OOS-validated
@@ -487,7 +571,7 @@ class TradingBrain:
                     "n": self.calibrator.n},
             "beta": self.beta, "threshold": self.threshold,
             "graded": self.graded,
-            "score_hist": list(self._score_hist)[-240:],
+            "score_hist": self._score_hist.tail(240),
         }
 
     def load_state(self, d: dict) -> bool:
