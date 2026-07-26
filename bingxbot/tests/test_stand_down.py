@@ -1,43 +1,111 @@
-"""The dead zone between the stand-down floor and the promotion bar.
+"""When does a champion lose its seat, and can it lose it for the wrong reason?
 
-A champion is replaced only by something scoring above MIN_ABS_FITNESS, and
-removed only by scoring below DEMOTE_FLOOR. Everything in between is a seat
-nobody can take and nobody can revoke.
+The stand-down has now failed twice in opposite directions, both times because
+it was pinned to a number on the fitness scale.
 
-At a floor of -0.5 against a bar of 0.15 that zone was 0.65 wide, and a live
-incumbent sat at -0.177 inside it for 450 consecutive cycles — losing on every
-re-validation while `_champ_bad_streak` reset each time, because -0.177 is
-comfortably above -0.5. It also carried `gauntlet_weak: true`, having lost in
-four of six historical eras.
+  * At a floor of -0.5 against a promotion bar of 0.15 there was a 0.65-wide
+    dead zone: a live incumbent measured at -0.177 sat in it for 450 consecutive
+    cycles, losing on every re-validation, while the streak counter reset each
+    time because -0.177 is comfortably above -0.5.
 
-These tests pin the boundary itself, so the gap cannot quietly reopen.
+  * Raising the floor to 0.0 closed that zone and opened a worse one. Measured
+    across 966 evaluations, the best composite ANY parameter set reached was
+    -0.18 — profitable ones included. A floor at zero sits above the whole
+    distribution and would have stood every champion down on a six-cycle timer,
+    forever.
+
+So the test is no longer a fitness threshold. It reads the incumbent's pooled
+economics over the judged stretch: did it make or lose money, on enough trades
+to be a verdict. These tests pin that mechanism, and pin the property that
+matters most — a profitable champion keeps its seat, a losing one cannot.
 """
-from bingxbot.engine.autotuner import (DEMOTE_FLOOR, DEMOTE_PATIENCE,
-                                       DEMOTE_PATIENCE_WEAK, MIN_ABS_FITNESS)
+import math
+
+from bingxbot.engine.autotuner import (DEAD_CHAMPION_TRADES, DEMOTE_PATIENCE,
+                                       DEMOTE_PATIENCE_WEAK, MARGIN_FLOOR,
+                                       MIN_ABS_FITNESS, MIN_POOLED_TRADES,
+                                       _pool_stats, _promotion_bar)
 
 
-def test_a_losing_champion_is_reachable_by_the_stand_down():
-    """The floor must not sit below zero. A champion whose re-validated fitness
-    on the traded basket is negative is, by the system's own measure, worse
-    than not trading — there is no reading of "less toxic than -0.5" that earns
-    it real money."""
-    assert DEMOTE_FLOOR >= 0.0, "a negative incumbent must be removable"
+def _losing(pool: dict) -> bool:
+    """The tuner's own condition, kept in one place so the tests and the engine
+    cannot drift apart in meaning."""
+    trades = int(pool.get("trades", 0) or 0)
+    ret = float(pool.get("total_return", 0.0) or 0.0)
+    return (ret < 0.0 and trades >= MIN_POOLED_TRADES) or trades < DEAD_CHAMPION_TRADES
 
 
-def test_the_dead_zone_is_only_the_promotion_bar():
-    """Nothing may be simultaneously unpromotable AND unremovable except by the
-    overfit guard itself. Any width here is a seat the system cannot vacate."""
-    unreachable = MIN_ABS_FITNESS - DEMOTE_FLOOR
-    assert unreachable <= MIN_ABS_FITNESS, (
-        f"dead zone {unreachable:.2f} is wider than the promotion bar — a "
-        f"champion between {DEMOTE_FLOOR} and {MIN_ABS_FITNESS} can neither be "
-        f"beaten nor removed")
+def _fold(trades, ret, gw=0.0, gl=0.0, dd=0.0):
+    return {"trades": trades, "total_return": ret, "gross_win": gw,
+            "gross_loss": gl, "max_drawdown": dd}
 
 
-def test_the_live_incumbent_that_prompted_this_would_now_stand_down():
-    """The exact number from the resume: -0.177, gauntlet_weak, 450 cycles."""
-    champ_fit = -0.177
-    assert champ_fit < DEMOTE_FLOOR, "this is the case that used to be immortal"
+# ------------------------------------------------------- pooling the evidence
+
+def test_pooling_compounds_log_wealth_rather_than_averaging_percentages():
+    """Trading one set through consecutive windows compounds; +10% then -10% is
+    -1%, not 0%."""
+    p = _pool_stats([_fold(20, 0.10), _fold(20, -0.10)])
+    assert p["trades"] == 40
+    assert math.isclose(p["total_return"], 0.10 * -0.10 + 0.10 - 0.10, abs_tol=1e-12)
+    assert p["total_return"] < 0.0
+
+
+def test_pooling_takes_the_worst_drawdown_not_the_average():
+    p = _pool_stats([_fold(10, 0.01, dd=0.02), _fold(10, 0.01, dd=0.19)])
+    assert p["max_drawdown"] == 0.19
+
+
+def test_a_perfect_profit_factor_on_three_trades_no_longer_walks_through():
+    """A real champion was promoted off a newest fold with three trades and no
+    losers: profit factor 999 sails past a `< 1.0` test. Pooled against windows
+    that did have losers, the same set is judged on all of it."""
+    lucky = _fold(3, 0.02, gw=200.0, gl=0.0)
+    assert _pool_stats([lucky])["profit_factor"] == 999.0
+    real = _pool_stats([lucky, _fold(40, -0.05, gw=100.0, gl=400.0)])
+    assert real["profit_factor"] < 1.0
+    assert real["total_return"] < 0.0
+
+
+def test_an_empty_stretch_pools_to_nothing_rather_than_dividing_by_zero():
+    p = _pool_stats([])
+    assert p["trades"] == 0 and p["total_return"] == 0.0 and p["profit_factor"] == 0.0
+
+
+def test_a_total_wipeout_is_clamped_instead_of_taking_the_log_of_zero():
+    """total_return of -1.0 is log(0). The clamp keeps the pool finite so one
+    blown fold cannot poison every comparison with -inf."""
+    p = _pool_stats([_fold(10, -1.0), _fold(10, 0.05)])
+    assert math.isfinite(p["total_return"]) and p["total_return"] < -0.9
+
+
+# ------------------------------------------------------------ the stand-down
+
+def test_a_champion_that_lost_money_on_real_evidence_stands_down():
+    assert _losing(_pool_stats([_fold(20, -0.03), _fold(20, -0.02)]))
+
+
+def test_a_champion_that_made_money_keeps_its_seat_however_low_its_fitness():
+    """The exact hole the 0.0 floor would have opened: a set that is genuinely
+    profitable but whose composite is negative, which measurement says is EVERY
+    profitable set at the old fold length."""
+    assert not _losing(_pool_stats([_fold(30, 0.04), _fold(30, 0.01)]))
+
+
+def test_a_losing_stretch_with_too_little_evidence_is_not_a_verdict():
+    """Below the evidence floor there is nothing to appeal — but it must not
+    read as an acquittal either, so this case is caught by the dead-champion
+    rule instead, one test down."""
+    pool = _pool_stats([_fold(4, -0.01), _fold(4, -0.01)])
+    assert pool["trades"] < MIN_POOLED_TRADES
+    assert not _losing(pool), "8 trades is not enough to convict"
+
+
+def test_a_champion_that_barely_trades_at_all_vacates_the_seat():
+    """'Profitable' by having taken two trades is not a champion, it is an
+    empty chair. This is the owner's complaint about sets that never fire."""
+    assert _losing(_pool_stats([_fold(1, 0.001), _fold(1, 0.0)]))
+    assert not _losing(_pool_stats([_fold(DEAD_CHAMPION_TRADES, 0.001)]))
 
 
 def test_patience_is_shorter_for_a_gauntlet_failure():
@@ -48,38 +116,17 @@ def test_patience_is_shorter_for_a_gauntlet_failure():
 
 
 def test_patience_survives_a_single_bad_window():
-    """A floor at zero sits much closer to the noise than one at -0.5, and
-    re-validation reruns the same recent window each cycle. One negative
-    reading must not vacate the seat."""
+    """Re-validation reruns the same recent window each cycle, so consecutive
+    readings are highly correlated. One negative reading must not vacate."""
     assert DEMOTE_PATIENCE >= 3 and DEMOTE_PATIENCE_WEAK >= 2
 
 
-# ------------------------------------------------------- the mechanism itself
-
-class _Champs:
-    """The slice of the orchestrator the stand-down actually touches."""
-
-    def __init__(self, champions, active):
-        self.champions = champions
-        self.active_champion_id = active
-        self.applied = None
-
-    def find_champion(self, cid):
-        return next((c for c in self.champions if c.get("id") == cid), None)
-
-    def apply_params(self, p):
-        self.applied = p
-
-    def mark_champion_used(self, cid):
-        pass
-
-
-def _streak_to_stand_down(champ_fit, weak):
+def _streak_to_stand_down(pool, weak):
     """Replay the counter the tuner keeps, and report the cycle it fires on."""
     patience = DEMOTE_PATIENCE_WEAK if weak else DEMOTE_PATIENCE
     streak = 0
     for cycle in range(1, 500):
-        if champ_fit >= DEMOTE_FLOOR:
+        if not _losing(pool):
             streak = 0
         else:
             streak += 1
@@ -88,18 +135,54 @@ def _streak_to_stand_down(champ_fit, weak):
     return None
 
 
-def test_the_old_behaviour_never_fired_and_the_new_one_does():
-    assert _streak_to_stand_down(-0.177, weak=False) == DEMOTE_PATIENCE
-    assert _streak_to_stand_down(-0.177, weak=True) == DEMOTE_PATIENCE_WEAK
-    # a profitable incumbent keeps its seat forever, which is the point
-    assert _streak_to_stand_down(0.31, weak=False) is None
-    assert _streak_to_stand_down(0.31, weak=True) is None
+def test_the_counter_fires_on_the_loser_and_never_on_the_earner():
+    loser = _pool_stats([_fold(40, -0.04)])
+    earner = _pool_stats([_fold(40, 0.04)])
+    assert _streak_to_stand_down(loser, weak=False) == DEMOTE_PATIENCE
+    assert _streak_to_stand_down(loser, weak=True) == DEMOTE_PATIENCE_WEAK
+    assert _streak_to_stand_down(earner, weak=False) is None
+    assert _streak_to_stand_down(earner, weak=True) is None
 
 
-def test_a_marginal_champion_is_not_thrashed_out():
-    """Exactly at the floor is not below it."""
-    assert _streak_to_stand_down(DEMOTE_FLOOR, weak=False) is None
+def test_exactly_flat_is_not_below_zero():
+    """A set that ended the stretch precisely where it started has not lost
+    money, and must not be thrashed out for rounding."""
+    assert not _losing(_pool_stats([_fold(40, 0.0)]))
 
+
+# ------------------------------------------------------- the promotion bar
+
+def test_the_margin_runs_the_right_way_below_zero():
+    """`champ_fit * 1.16` is -0.21 for an incumbent at -0.177: the worse a
+    champion did, the LOWER the bar it set. Multiple-testing inflation, whose
+    entire job is to raise the bar as more candidates take a shot, moved it the
+    wrong way too."""
+    for champ in (-2.0, -0.177, -0.001, 0.0, 0.001, 0.31, 2.0):
+        loose = _promotion_bar(champ, 1.06)
+        tight = _promotion_bar(champ, 1.16)
+        assert tight >= loose, f"more candidates tried must never lower the bar ({champ})"
+        assert loose >= champ, f"the bar must sit above the incumbent ({champ})"
+
+
+def test_the_bar_is_never_below_the_absolute_floor():
+    for champ in (-5.0, -0.177, 0.0, 0.1):
+        assert _promotion_bar(champ, 1.06) >= MIN_ABS_FITNESS
+
+
+def test_a_champion_near_zero_still_has_to_be_beaten_by_something():
+    """The margin is a fraction of the incumbent's magnitude, so at champ ~= 0
+    it would vanish. The floor on that magnitude keeps the step real."""
+    step = _promotion_bar(0.0, 1.10) - 0.0
+    assert step >= 0.10 * MARGIN_FLOOR
+
+
+def test_the_absolute_floor_inflates_with_the_multiple_testing_meter():
+    """While a champion is under water the floor is what binds, so that is
+    exactly where the deflation has to bite — it used to do nothing there."""
+    assert _promotion_bar(-1.0, 1.16) > _promotion_bar(-1.0, 1.06)
+
+
+# --------------------------------------------------------- the fallback set
 
 def test_the_fallback_prefers_a_positive_vault_set_over_the_baseline():
     """And when every vault champion is negative — as all four were — there is
@@ -115,6 +198,17 @@ def test_the_fallback_prefers_a_positive_vault_set_over_the_baseline():
     alt = max((c for c in with_positive if c.get("fitness", 0.0) > 0),
               key=lambda c: c["fitness"], default=None)
     assert alt is not None and alt["id"] == "c"
+
+
+class _Champs:
+    """The slice of the orchestrator the stand-down actually touches."""
+
+    def __init__(self, champions, active):
+        self.champions = champions
+        self.active_champion_id = active
+
+    def find_champion(self, cid):
+        return next((c for c in self.champions if c.get("id") == cid), None)
 
 
 def test_find_champion_tolerates_an_unknown_active_id():

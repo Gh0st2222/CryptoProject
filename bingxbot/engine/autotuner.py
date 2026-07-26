@@ -29,6 +29,7 @@ import time
 
 from ..config import MODE_IDLE
 from ..exchange.models import ContractSpec
+from ..strategy.regime_profile import build_profile, classify_era, dominant_regime
 from ..util import clamp
 from .backtest import TUNABLES, _coerce
 from .search import (STATE_PATH, DEOptimizer, portfolio_folds, recency_weights,
@@ -46,6 +47,10 @@ DEFLATE_K = 0.03            # margin inflation per decade of candidates tried on
                             # OOS window — multiple-testing honesty: after thousands
                             # of shots at the same gate, a marginal "win" is luck
 DEFLATE_CAP = 0.10          # never demand more than +10% extra margin
+MARGIN_FLOOR = 0.20         # the margin is a fraction of the incumbent's
+                            # magnitude, so a champion sitting near zero would
+                            # set a bar only microscopically above itself; this
+                            # is the smallest magnitude the margin is charged on
 MIN_ABS_FITNESS = 0.15      # ...and be clearly profitable (positive risk-adjusted
                             # score). Recalibrated for the honest-fills scale
                             # (v3): trade-through limits + double stop slippage
@@ -60,9 +65,19 @@ TOP_K_VALIDATE = 10         # DE members sent to the REAL (full-python, portfoli
                             # keeps the judge unbiased — the alternative (a
                             # cheap kernel pre-screen) would have filtered
                             # candidates with a brain that has no meta head.
-MIN_VETO_TRADES = 5         # the newest fold must show at least this many trades
-                            # before its profit factor is allowed to mean
-                            # anything — the same evidence floor _fitness uses
+MIN_VETO_TRADES = 5         # a single fold below this is not a verdict — it is
+                            # the placeholder ramp _fitness returns when there is
+                            # nothing to judge
+MIN_POOLED_TRADES = 30      # ...and the EVIDENCE FLOOR that actually decides a
+                            # promotion, counted across ALL judged folds rather
+                            # than the newest one alone. Measured: judging on the
+                            # newest fold's trade count rejected 49% of
+                            # candidates on the coin flip of whether one 6-day
+                            # window happened to fire five times, and the folds
+                            # that survived carried ~7 trades — below the point
+                            # where the judge's verdict correlates with anything.
+                            # Pooling the judged stretch turns ~7 trades into
+                            # ~30-60, which is where a verdict starts to hold.
 # The OOS folds trade the last OOS_TAIL_FRAC of the series, so DE TRAINING must
 # stop where they begin. It used to stop at 75% while the folds started at 60%:
 # fold 0 was 100% inside the training window and fold 1 50% inside, which means
@@ -82,29 +97,64 @@ SPECIALIST_CANDS = 5        # candidates the per-symbol bench considers (its cos
 OOS_FOLDS = 4               # purged sequential portfolio folds a champion must earn
                             # across — 4 gives the median+worst composite a real
                             # median (undersized folds self-drop in portfolio_folds)
+# THE FOLD LENGTH IS THE WHOLE BALL GAME. Measured on 181 parameter sets scored
+# across purged portfolio folds, leaving each fold out in turn as the unseen
+# future (traded bars = fold length minus the 300-bar indicator warmup):
+#
+#   traded bars   median trades   folds under the   best composite   lift of the
+#   per fold      per fold        t<5 placeholder   anyone reaches   promoted set
+#   600                8               32%              -0.39          +0.01 pp
+#   960               14               14%              +0.86          +3.59 pp
+#
+# Same judge, same statistic, same +0.15 bar. At 600 traded bars the judge's
+# output NEVER REACHES ITS OWN PROMOTION BAR — not once in 966 evaluations —
+# and its ranking carries no usable signal. At 960 it clears the bar and picks
+# sets that beat the field by ~3.6 points of return on a window they were never
+# scored on, positive in all 8 splits. The same sweep, split by evidence rather
+# than by length, puts the turn between them: a candidate's mean R over half the
+# windows predicted the other half at r=-0.38 below 15 trades and r=+0.49 at
+# 30-60.
+#
+# A 90-day lookback split four ways gave production 864 traded bars per judged
+# fold — between the two rows, and the live board settles which side: every
+# champion in the vault negative, best -0.115, and 618 research cycles without a
+# promotion. That is the failing row, and it is a property of the geometry, not
+# of the promotion logic that was repeatedly blamed for it.
+MIN_OOS_TRADED_BARS = 900   # judged folds are widened (by using fewer of them)
+                            # until each carries at least this many TRADED bars,
+                            # rather than slicing a short history into confetti
 VAULT_CANDIDATES = 4        # also re-validate this many top vault champions each cycle (candidate pool, not graveyard)
 STALL_REINJECT = 20         # cycles without a promotion before a diversity restart
-# The stand-down floor and the promotion bar between them define a DEAD ZONE: a
-# champion scoring above the floor can never be removed, and a challenger
-# scoring below the bar can never replace it. At -0.5 against a MIN_ABS_FITNESS
-# bar of 0.15 that zone was 0.65 wide, and an incumbent measured at -0.177 sat
-# in it for 450 consecutive cycles — losing by the system's own re-validation
-# every one of them, while the streak counter reset each time because -0.177 is
-# comfortably above -0.5.
+# THE STAND-DOWN, and why it is no longer a fitness threshold.
 #
-# Zero is the only defensible floor. A champion whose re-validated fitness on
-# the symbols we actually trade is negative is, by our own measure, worse than
-# not trading — there is no reading of "slightly less toxic than -0.5" that
-# justifies leaving real money on it. The dead zone is now the promotion bar
-# alone, which is where an overfit-guard belongs.
-DEMOTE_FLOOR = 0.0          # incumbent scoring below this on the TRADED basket is
-                            # not earning its seat...
-DEMOTE_PATIENCE = 6         # ...for this many consecutive cycles -> stand down.
-                            # Raised with the floor: re-validation runs on the
-                            # same recent window each cycle, so consecutive
-                            # readings are highly correlated and a floor this
-                            # close to the noise needs more agreement than one
-                            # buried at -0.5 did.
+# A champion scoring above the removal floor can never be removed, and a
+# challenger scoring below the promotion bar can never replace it: between the
+# two is a DEAD ZONE, a seat nobody can take and nobody can revoke. A floor at
+# -0.5 against a bar of 0.15 made that zone 0.65 wide, and a live incumbent
+# measured at -0.177 sat in it for 450 consecutive cycles, losing on every
+# re-validation while the streak counter reset each time.
+#
+# Raising the floor to 0.0 closed the zone and opened a worse hole. Measured
+# across 966 evaluations at the old fold length, the BEST composite any
+# parameter set reached was -0.18 — including every set that was genuinely
+# profitable over the whole out-of-sample stretch. A floor at zero sits above
+# that entire distribution, so it would have stood down every champion on a
+# six-cycle timer, forever, resetting to baseline in a loop.
+#
+# Both failures come from the same mistake: pinning a decision to a number on a
+# scale the fitness function owns and can move. The removal test now reads the
+# incumbent's POOLED ECONOMICS instead — did it make or lose money across the
+# windows it was judged on, with enough trades for that to be a verdict — which
+# is scale-free, means the same thing in every market, and is the sentence a desk
+# would actually say. The dead zone is now the promotion bar alone, which is
+# where an overfit guard belongs.
+DEAD_CHAMPION_TRADES = 3    # a champion that took fewer than this many trades in
+                            # the ENTIRE judged stretch is not being cautious, it
+                            # is not trading; that vacates the seat too
+DEMOTE_PATIENCE = 6         # consecutive losing cycles before a stand-down.
+                            # Re-validation reruns the same window each cycle, so
+                            # consecutive readings are highly correlated and one
+                            # negative stretch must not vacate the seat.
 DEMOTE_PATIENCE_WEAK = 3    # a champion that also FAILED the regime gauntlet has
                             # already been told it does not survive other eras;
                             # it does not get the full benefit of the doubt
@@ -113,9 +163,16 @@ LIVE_MIN_SAMPLE = 8         # real trades before live evidence can demote: 1 win
                             # coincidence — waiting longer just pays more tuition
 LIVE_RECENT_N = 20          # judge a champion on its most recent real trades
 LIVE_PF_FLOOR = 0.7         # real profit factor below this (and < 1/2 expectation) -> demote
-LOOKBACK_DAYS = 90.0        # more history = wider regime coverage per fold and
-                            # ~50% more meta-training samples; recency weighting
-                            # on training folds keeps the search current
+LOOKBACK_DAYS = 180.0       # DOUBLED, and the reason is the fold-length table
+                            # above: at 90 days the 40% OOS tail split four ways
+                            # gave each judged fold ~560 traded bars and ~7
+                            # trades, which is below the point where the verdict
+                            # means anything. 180 days puts each fold near 1400
+                            # traded bars — the regime the measurement shows
+                            # works — and buys wider regime coverage and ~2x the
+                            # meta-training samples on the way. Recency weighting
+                            # on the TRAINING folds keeps the search current, so
+                            # the extra history informs without anchoring.
 DATA_TTL_S = 1800
 GAP_FAST = 20               # cadence right after a promotion (keep hammering)
 GAP_SLOW = 60               # cadence when stable
@@ -168,6 +225,74 @@ def _oos_composite(fits: list[float]) -> float:
     money outright. The median demands profit in the typical window; the
     worst-fold term keeps the tail priced in."""
     return 0.7 * statistics.median(fits) + 0.3 * min(fits)
+
+
+def _oos_fold_count(cbs: dict[str, list], tail_frac: float = OOS_TAIL_FRAC,
+                    warmup: int = 300) -> int:
+    """How many judged folds this much history can actually support.
+
+    `portfolio_folds` will happily cut any tail into k slices; what it cannot do
+    is make a slice long enough to be worth judging. Below ~900 traded bars a
+    fold produces so few trades that its fitness is largely _fitness's
+    placeholder ramp (see the table on MIN_OOS_TRADED_BARS), and a median over
+    such numbers is a verdict about nothing. So the fold COUNT gives way to the
+    fold LENGTH: with thin history the tuner judges on two long windows rather
+    than four short ones, and only widens back to four when there are bars to
+    spare. The warmup is a lead-in, not evidence, so it is not counted.
+
+    The shortest symbol governs: a portfolio fold is traded on the basket's
+    common grid, so taking the longest series would overstate what is there."""
+    if not cbs:
+        return 1
+    n = min(len(cs) for cs in cbs.values())
+    tail = int(n * tail_frac)
+    for k in range(OOS_FOLDS, 1, -1):
+        # portfolio_folds also refuses a fold under warmup+60, so a count it
+        # would silently drop must never be returned here either.
+        if tail // k >= max(MIN_OOS_TRADED_BARS, 60):
+            return k
+    return 1
+
+
+def _promotion_bar(champ_fit: float, margin: float) -> float:
+    """The score a challenger must exceed: clear of the incumbent by `margin`,
+    and clear of the absolute floor by the same margin.
+
+    Written additively because the multiplicative form ran BACKWARDS on a losing
+    incumbent. `champ_fit * 1.16` is -0.21 when champ_fit is -0.177: the worse
+    the champion did, the LOWER the bar it set, so a champion deep in the red was
+    easier to replace than one merely flat — and the multiple-testing inflation,
+    whose whole job is to make the bar rise as more candidates take a shot at the
+    same window, moved it the wrong way too. Adding the margin as a fraction of
+    the incumbent's MAGNITUDE keeps "beat it by 6%+" meaning the same thing above
+    and below zero, and the deflation now inflates the absolute floor as well —
+    where it actually binds while a champion is under water."""
+    step = (margin - 1.0) * max(abs(champ_fit), MARGIN_FLOOR)
+    return max(champ_fit + step, MIN_ABS_FITNESS * margin)
+
+
+def _pool_stats(stats_list: list[dict]) -> dict:
+    """Add several folds' verdicts into ONE account-level summary.
+
+    Log-wealth adds (trading the same set through consecutive windows compounds),
+    trades add, gross win and gross loss add; drawdown takes the worst window,
+    which is the least it could have been. Unlike the fitness composite this
+    stays on a FIXED scale — percent and trades — no matter how the fitness
+    function is weighted, which is why the gate's absolute tests are written
+    against it. A fitness floor can silently become unreachable when the scoring
+    changes; "made money over the judged stretch" cannot."""
+    tr = 0
+    gw = gl = log_growth = worst_dd = 0.0
+    for s in stats_list:
+        t = int(s.get("trades", 0) or 0)
+        tr += t
+        gw += float(s.get("gross_win", 0.0) or 0.0)
+        gl += float(s.get("gross_loss", 0.0) or 0.0)
+        log_growth += math.log1p(clamp(float(s.get("total_return", 0.0) or 0.0), -0.95, 20.0))
+        worst_dd = max(worst_dd, float(s.get("max_drawdown", 0.0) or 0.0))
+    pf = (gw / gl) if gl > 0 else (999.0 if gw > 0 else 0.0)
+    return {"trades": tr, "total_return": math.expm1(log_growth), "profit_factor": pf,
+            "max_drawdown": worst_dd, "gross_win": gw, "gross_loss": gl}
 
 
 # Brain-only scalars that may differ PER SYMBOL. Risk/exit geometry stays
@@ -282,6 +407,9 @@ class AutoTuner:
         # regime gauntlet: (params-sig, interval, window) -> result. Windows
         # are immutable history, so entries never expire.
         self._gauntlet_cache: dict[tuple, dict] = {}
+        # (era, interval) -> (dominant regime, shares). An era's CHARACTER does
+        # not depend on which champion is being tested, so it is classified once.
+        self._era_regime_cache: dict[tuple, tuple] = {}
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -627,7 +755,8 @@ class AutoTuner:
                 cbs_full[tsym] = hit[0]
         if not cbs_full:
             cbs_full = {symbol: candles}
-        folds_cbs = portfolio_folds(cbs_full, k=OOS_FOLDS, tail_frac=OOS_TAIL_FRAC)
+        folds_cbs = portfolio_folds(cbs_full, k=_oos_fold_count(cbs_full),
+                                    tail_frac=OOS_TAIL_FRAC)
         if not folds_cbs:
             return False
         nf_oos = len(folds_cbs)
@@ -655,19 +784,23 @@ class AutoTuner:
                 self._val_cache[key] = r
         val_res = [self._val_cache[k] for k in all_keys]
 
-        def cand_fit(idx: int) -> tuple[float, dict, list[float]]:
+        def cand_fit(idx: int) -> tuple[float, dict, list[float], dict]:
             rs = val_res[idx * nf_oos:(idx + 1) * nf_oos]
             fits = [r["fitness"] for r in rs]
-            return _oos_composite(fits), rs[-1]["stats"], fits    # stats from the most recent fold
+            stats = [r["stats"] for r in rs]
+            # `stats[-1]` (newest fold) still travels for the champion record and
+            # the dashboard; the GATE reads the pooled column instead.
+            return _oos_composite(fits), stats[-1], fits, _pool_stats(stats)
 
-        champ_fit, _, champ_folds = cand_fit(len(cands))
+        champ_fit, _, champ_folds, champ_pool = cand_fit(len(cands))
         best, best_i, best_adj, best_stats = None, -1, -1e18, {}
         best_folds: list[float] = []
-        pf_passed = 0    # candidates whose newest-fold PF cleared 1.0 (promotable pool)
-        thin_rejected = 0  # ...and those refused for judging on too few trades
+        best_pool: dict = {}
+        pf_passed = 0    # candidates whose pooled economics cleared (promotable pool)
+        thin_rejected = 0  # ...and those refused for judging on too little evidence
         ranked: list[tuple[float, int]] = []   # (OOS score, index) of the promotable
         for i, c in enumerate(cands):
-            oos, stats0, fold_fits_oos = cand_fit(i)
+            oos, stats0, fold_fits_oos, pool = cand_fit(i)
             # NO in-sample-vs-OOS value penalty anymore: training fitness is a
             # SINGLE-SYMBOL score and OOS is a PORTFOLIO composite — different
             # simulators, different units. Subtracting them charged every DE
@@ -679,27 +812,32 @@ class AutoTuner:
             adj = oos
             if c["source"] == "vault" and c["cid"]:
                 self.orch.set_champion_current(c["cid"], oos, stats0)  # keep its CURRENT eval fresh
-            # absolute-profit veto: whatever the fitness composite says, a set
-            # whose validation on the MOST RECENT window loses money gross
-            # (PF < 1) cannot take the seat.
+            # ABSOLUTE-PROFIT VETO, on the POOLED judged stretch. Whatever the
+            # fitness composite says, a set that did not actually make the
+            # account money across the windows it was judged on cannot take the
+            # seat — and "made money" is read off summed log-wealth and summed
+            # gross win/loss, not off one window.
             #
-            # ...but PF is meaningless on a handful of fills, and that hole was
-            # being walked through: champion 89b19991 was promoted off a newest
-            # fold with THREE trades and no losers — PF 999, which sailed past
-            # this veto, while _fitness scored that very fold -1.4 because it
-            # considers anything under 5 trades unjudgeable. The veto now uses
-            # the same evidence floor as the objective: too thin to judge is
-            # too thin to promote.
-            if int(stats0.get("trades", 0) or 0) < MIN_VETO_TRADES:
+            # This used to read the NEWEST FOLD ALONE, which had two failures.
+            # A set could be promoted off three trades with no losers (PF 999
+            # sails past a `< 1.0` test) — that hole was walked through by a
+            # real champion. And measurement showed the opposite edge doing more
+            # damage: requiring five trades in one 6-day window rejected 49% of
+            # all candidates on the coin flip of whether that particular window
+            # happened to fire, regardless of how the set did everywhere else.
+            # Pooling answers both — 999 needs real losing trades to survive
+            # alongside it, and the evidence floor is met by the whole stretch.
+            if int(pool.get("trades", 0) or 0) < MIN_POOLED_TRADES:
                 thin_rejected += 1
                 continue
-            if float(stats0.get("profit_factor", 0.0) or 0.0) < 1.0:
+            if (float(pool.get("profit_factor", 0.0) or 0.0) < 1.0
+                    or float(pool.get("total_return", 0.0) or 0.0) <= 0.0):
                 continue
             pf_passed += 1
             ranked.append((adj, i))
             if adj > best_adj:
                 best, best_i, best_adj, best_stats = c, i, adj, stats0
-                best_folds = fold_fits_oos
+                best_folds, best_pool = fold_fits_oos, pool
 
         self.cycles += 1
         self.champion_fitness = round(champ_fit, 3)
@@ -715,7 +853,7 @@ class AutoTuner:
         # challenger must beat it in a MAJORITY of the purged folds — a set
         # that wins on average but loses most windows is one lucky window.
         beat = sum(1 for a, b in zip(best_folds, champ_folds) if a > b)
-        bar = max(champ_fit * margin, MIN_ABS_FITNESS)
+        bar = _promotion_bar(champ_fit, margin)
         gaunt = None
         gauntlet_blocked = False
         qualifies = different and best_adj > bar and beat * 2 > nf_oos
@@ -738,7 +876,7 @@ class AutoTuner:
             except Exception as e:  # noqa: BLE001 — evidence, never a dependency
                 log.debug("gauntlet failed: %s", e)
             if gaunt is not None and gaunt.get("weak"):
-                bar = max(bar * WEAK_BAR_MULT, MIN_ABS_FITNESS)
+                bar = _promotion_bar(champ_fit, 1.0 + (margin - 1.0) * WEAK_BAR_MULT)
                 qualifies = best_adj > bar
                 gauntlet_blocked = not qualifies
                 if gauntlet_blocked:
@@ -780,13 +918,29 @@ class AutoTuner:
 
         # DEFENSIVE STAND-DOWN: the promotion gate only swaps for something
         # BETTER — it never removed something TOXIC. If the incumbent keeps
-        # scoring clearly negative on the symbols we actually trade and nothing
-        # beats the bar, stop trading it: fall back to the best still-positive
-        # vault set, else to the code-default baseline.
+        # LOSING MONEY on the symbols we actually trade and nothing beats the
+        # bar, stop trading it: fall back to the best still-positive vault set,
+        # else to the code-default baseline.
+        #
+        # The trigger is the incumbent's POOLED ECONOMICS over the judged
+        # stretch, not a fitness threshold. A fitness floor is a number on a
+        # scale the scoring function owns, and that scale moves: measured across
+        # 966 evaluations at the old fold length, NO parameter set — including
+        # every one that was genuinely profitable — ever scored above -0.18, so
+        # a floor at 0.0 would have stood every champion down on a six-cycle
+        # timer forever. "Lost money over the windows we judged it on, with
+        # enough trades for that to mean something" cannot drift that way, and
+        # it is the same sentence a desk would use.
         act_now = self.orch.find_champion(self.orch.active_champion_id) or {}
         weak_now = bool(act_now.get("gauntlet_weak"))
         patience = DEMOTE_PATIENCE_WEAK if weak_now else DEMOTE_PATIENCE
-        if promoted or champ_fit >= DEMOTE_FLOOR:
+        champ_trades = int(champ_pool.get("trades", 0) or 0)
+        champ_ret = float(champ_pool.get("total_return", 0.0) or 0.0)
+        # ...and a champion that barely trades at all is not "safe", it is a seat
+        # doing nothing. Below the evidence floor there is no verdict to appeal.
+        champ_losing = (champ_ret < 0.0 and champ_trades >= MIN_POOLED_TRADES) \
+            or champ_trades < DEAD_CHAMPION_TRADES
+        if promoted or not champ_losing:
             self._champ_bad_streak = 0
         else:
             self._champ_bad_streak += 1
@@ -954,6 +1108,18 @@ class AutoTuner:
             "research_symbol": symbol,
             "basket": [s for s, _ in basket],
             "clock": interval,
+            # HOW MUCH EVIDENCE stood behind this verdict. A bar nothing can
+            # reach and a floor nothing can clear both look identical from
+            # outside — "no promotion again" — and both hid here for 618 cycles.
+            # These are the numbers that tell the two apart, and the report's
+            # self-check reads them.
+            "oos_folds": nf_oos,
+            "oos_traded_bars": max(0, min(len(v) for v in folds_cbs[0].values()) - 300),
+            "champ_oos_trades": champ_trades,
+            "champ_oos_return": round(champ_ret, 4),
+            "best_oos_trades": int(best_pool.get("trades", 0) or 0) if best else None,
+            "best_oos_return": (round(float(best_pool.get("total_return", 0.0) or 0.0), 4)
+                                if best else None),
             "gauntlet": ({"median": gaunt["median"], "pf_ge1": gaunt["pf_ge1"],
                           "n": gaunt["n"], "weak": gaunt["weak"]}
                          if gaunt else None),
@@ -1015,12 +1181,13 @@ class AutoTuner:
             # meta-free: applying TODAY'S meta model to a 2021 era would mix
             # impossible hindsight into the score — eras judge the core brain
             args.append((params, cbs, interval, specs_map, taker, slip, strat, risk, False))
-            keys.append((name, ck))
+            keys.append((name, ck, cbs))
         if args:
             res = await self.orch.map_cpu(validate_params_portfolio, args, research=True)
-            for (name, ck), r in zip(keys, res):
+            for (name, ck, cbs), r in zip(keys, res):
                 entry = {"fit": round(float(r.get("fitness", -1.0)), 3),
-                         "pf": round(float(r.get("stats", {}).get("profit_factor", 0.0) or 0.0), 3)}
+                         "pf": round(float(r.get("stats", {}).get("profit_factor", 0.0) or 0.0), 3),
+                         "regime": await self._era_regime(name, interval, cbs)}
                 self._gauntlet_cache[ck] = entry
                 results[name] = entry
         if len(results) < 3:
@@ -1028,9 +1195,38 @@ class AutoTuner:
         fits = [r["fit"] for r in results.values()]
         pf_ge1 = sum(1 for r in results.values() if r["pf"] >= 1.0)
         med = statistics.median(fits)
+        # PER-REGIME PROFILE — the part the live engine actually uses. An era's
+        # score filed under the era's CHARACTER turns "this set died in 2022"
+        # from a mark against it into an instruction: stand down when the tape
+        # looks like that again. Losing money in a crash is not a defect in a
+        # trend set, it is a description of when that set should be flat.
+        by_regime = build_profile({n: {**r, "name": n} for n, r in results.items()})
         return {"n": len(results), "median": round(med, 3), "worst": round(min(fits), 3),
                 "pf_ge1": pf_ge1, "weak": med < 0.0, "windows": results,
-                "symbols": syms, "meta_free": True}
+                "by_regime": by_regime, "symbols": syms, "meta_free": True}
+
+    async def _era_regime(self, name: str, interval: str, cbs: dict) -> str | None:
+        """What KIND of market an era was, by the live classifier.
+
+        Independent of any parameter set and of immutable history, so it is
+        computed once per (era, interval) and reused for every champion the
+        gauntlet ever runs — the classification pass is a bar loop over three
+        months and would otherwise be paid once per candidate for no reason."""
+        key = (name, interval)
+        hit = self._era_regime_cache.get(key)
+        if hit is not None:
+            return hit[0]
+        # the first (largest) series is representative: the eras are named for
+        # the market as a whole, and the gauntlet's symbols are correlated majors
+        series = max(cbs.values(), key=len) if cbs else []
+        try:
+            shares = await asyncio.to_thread(classify_era, series, interval)
+        except Exception as e:  # noqa: BLE001 — a label, never a dependency
+            log.debug("era classification failed for %s: %s", name, e)
+            return None
+        reg = dominant_regime(shares)
+        self._era_regime_cache[key] = (reg, shares)
+        return reg
 
     async def _trial_cycle(self) -> None:
         """One research cycle on the TRIAL clock (clock_trial setting): its own
@@ -1101,7 +1297,8 @@ class AutoTuner:
                 log.debug("trial basket %s: %s", tsym, e)
         if not cbs_full:
             return
-        folds_cbs = portfolio_folds(cbs_full, k=OOS_FOLDS, tail_frac=OOS_TAIL_FRAC)
+        folds_cbs = portfolio_folds(cbs_full, k=_oos_fold_count(cbs_full),
+                                    tail_frac=OOS_TAIL_FRAC)
         if not folds_cbs:
             return
         specs_map = {s: self.orch.specs.get(s, ContractSpec(s)) for s in cbs_full}
@@ -1118,8 +1315,13 @@ class AutoTuner:
             rs = vres[i * nfo:(i + 1) * nfo]
             fit = _oos_composite([r["fitness"] for r in rs])
             stats0 = rs[-1]["stats"]
-            pf = float(stats0.get("profit_factor", 0.0) or 0.0)
-            if (best_fit is None or fit > best_fit) and pf >= 1.0:
+            # same pooled economics the live clock admits on, so a trial
+            # champion in the vault means what a live one means
+            pool = _pool_stats([r["stats"] for r in rs])
+            admitted = (int(pool.get("trades", 0) or 0) >= MIN_POOLED_TRADES
+                        and float(pool.get("profit_factor", 0.0) or 0.0) >= 1.0
+                        and float(pool.get("total_return", 0.0) or 0.0) > 0.0)
+            if (best_fit is None or fit > best_fit) and admitted:
                 best_fit, best_params, best_stats = fit, prm, stats0
         recorded = None
         if best_params is not None and best_fit is not None and best_fit > MIN_ABS_FITNESS:
