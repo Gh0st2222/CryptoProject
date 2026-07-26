@@ -502,6 +502,7 @@ function renderAll(){
     cortexFeed();
     const tc=S.engine.portfolio.stats.trades; refreshCandles(false).then(()=>{lastTradeCount=tc;}); }
   renderLiveViews();
+  pushAmbient();
   renderBottomTab(activePage());
 }
 
@@ -549,6 +550,7 @@ function renderHot(){
   renderSymTabs();   // adopted set + auto-follow react at hot cadence
   const es=engSym(); if(es&&es.brain){ renderEdgeGauge(es.brain, es); renderMTF(es); renderGates(es); }
   renderLiveViews();
+  pushAmbient();
   // live-forming candle straight off the hot channel — the chart moves at tick
   // cadence now instead of waiting for the next REST poll.
   if(es?.candle&&candleSeries){
@@ -2401,6 +2403,38 @@ function renderBudget(){
 function renderLiveViews(){
   if(!S) return;
   renderBoard(); renderRunway(); renderFlow(); renderBudget();
+}
+
+/* ---------------------------------------------------------- ambient layer
+   Hand the WebGL wallpaper four numbers and let it ease toward them on its own
+   clock. Deliberately a push of plain values, not a subscription: the ambient
+   layer must never reach into the snapshot, hold a reference to it, or force
+   layout — if it ever costs more than its own budget it degrades itself, and
+   the terminal is not supposed to notice either way. */
+let _ambSig = "";
+function pushAmbient(){
+  const f = window.ambientState;
+  if(typeof f !== "function" || !S?.engine) return;
+  const es = engSym(), b = es?.brain;
+  const thr = Math.max(1e-6, b?.threshold ?? 0.3);
+  const edge = Math.abs(b?.edge ?? 0);
+  const st = {
+    regime: b?.regime || "",
+    // conviction as a fraction of THIS symbol's own bar, so the room brightens
+    // as a signal closes on firing rather than on an absolute number that
+    // means something different per symbol
+    edge: Math.min(1, edge / thr),
+    armed: edge >= thr,
+    alarm: !!S.engine.risk?.killed || !!S.engine.bar_stale,
+  };
+  const sig = `${st.regime}|${st.edge.toFixed(2)}|${st.armed}|${st.alarm}`;
+  if(sig === _ambSig) return;   // nothing changed; do not touch the GL layer
+  _ambSig = sig;
+  f(st);
+  // one class toggle drives the header's scanning bar. Gated on the signature
+  // above so it flips only on a real state change — writing a class every push
+  // would invalidate style for the whole subtree several times a second.
+  document.body.classList.toggle("armed", st.armed && !st.alarm);
 }
 
 /* board interaction — bound once */

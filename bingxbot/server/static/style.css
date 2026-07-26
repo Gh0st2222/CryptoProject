@@ -39,19 +39,37 @@
 
 * { box-sizing: border-box; }
 html, body { height: 100%; }
+/* The four stacked background-images that used to live here (two radial washes
+   plus a 44px grid) are now terms in the ambient shader, where they animate,
+   react to the machine's state and cost one draw call instead of four
+   full-viewport paint layers. The flat colour stays as the fallback for a
+   browser with no WebGL2. */
 body {
   margin: 0; background: var(--page); color: var(--ink);
   font: 12px/1.4 var(--sans); -webkit-font-smoothing: antialiased;
-  background-image:
-    radial-gradient(1100px 480px at 78% -12%, rgba(0,210,255,0.07), transparent 62%),
-    radial-gradient(900px 420px at 8% 108%, rgba(157,107,255,0.05), transparent 60%),
-    linear-gradient(rgba(0,210,255,0.022) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(0,210,255,0.022) 1px, transparent 1px);
-  background-size: auto, auto, 44px 44px, 44px 44px;
 }
-/* CRT scanlines: REMOVED. A fixed full-viewport overlay sits in every display
-   list Firefox rebuilds, and the profiler showed display-list churn as the #1
-   main-thread cost. Not worth a texture. */
+/* CRT scanlines, the rolling bar and the hologram sweep all MOVED to the
+   ambient WebGL layer (ambient.js). As DOM overlays they sat in every display
+   list the browser rebuilt — profiling put that churn at the top of
+   main-thread cost. As fragment-shader terms they are a handful of
+   instructions on pixels the GPU already owns, and the main thread never sees
+   them. This is the whole reason the look could come back. */
+#ambient {
+  position: fixed; inset: 0; width: 100%; height: 100%;
+  z-index: 0; pointer-events: none;
+  /* rendered at ~0.5x device resolution and stretched: full-screen effects are
+     fill-rate bound, and every term in that shader is low-frequency, so the
+     upscale is invisible while the pixel count is a third */
+  image-rendering: auto;
+  /* its own compositor layer, once. The research is unambiguous that
+     will-change is a scalpel — one promoted layer here is right, fifty
+     promoted layers across the UI would be memory pressure pretending to be
+     an optimization. */
+  will-change: transform;
+  contain: strict;
+}
+/* everything real sits above the wallpaper */
+.topbar, .tape, .wrap, .modal-back, #toasts { position: relative; z-index: 1; }
 button, input, select { font: inherit; color: inherit; }
 .num { font-variant-numeric: tabular-nums; font-family: var(--mono); }
 .mono { font-family: var(--mono); }
@@ -166,11 +184,18 @@ input.field { width: 100%; font-family: var(--mono); }
   .col-c .pbody { max-height: 700px; overflow-y: auto; }
 }
 
+/* Panels are TRANSLUCENT, not frosted. The glass look wants backdrop-filter,
+   and backdrop-filter is the one effect the performance literature is
+   unanimous about: poorly isolated it drops mobile below 30fps, and there are
+   ~20 panels here. Plain rgba costs a blend the compositor was doing anyway,
+   and the ambient grid reading faintly through the chrome gets 90% of the
+   look for 0% of the cost. */
 .panel { contain: layout paint;
-  background: linear-gradient(180deg, rgba(0,210,255,.025), transparent 46%), var(--surface);
+  background: linear-gradient(180deg, rgba(0,210,255,.045), transparent 46%),
+              rgba(10, 12, 19, 0.78);
   border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;
   clip-path: polygon(var(--cut) 0, 100% 0, 100% calc(100% - var(--cut)), calc(100% - var(--cut)) 100%, 0 100%, 0 var(--cut));
-  box-shadow: 0 4px 12px rgba(0,0,0,.42);
+  box-shadow: 0 4px 18px rgba(0,0,0,.5), inset 0 1px 0 rgba(0,210,255,.07);
 }
 .phead { display: flex; align-items: center; gap: 9px; padding: 8px 12px; border-bottom: 1px solid var(--border);
   background: linear-gradient(90deg, rgba(0,210,255,0.06), transparent 55%); position: relative; }
@@ -547,3 +572,123 @@ input.field { width: 100%; font-family: var(--mono); }
   background: currentColor; box-shadow: 0 0 6px currentColor;
 }
 .viz-key i.win { color: var(--good); } .viz-key i.loss { color: var(--bad); }
+
+/* ==========================================================================
+   Y2K / GOTH CHROME
+   ==========================================================================
+   The ambient shader owns the room; this owns the furniture. Every rule here
+   is deliberately compositor-safe or free:
+
+     · animation touches ONLY transform and opacity, never geometry or colour
+       stops, so it stays off the main thread;
+     · exactly TWO elements get a `will-change` layer (the cortex frame and the
+       armed sweep). The literature is blunt that will-change is a scalpel — a
+       page with fifty promoted layers is memory pressure wearing an
+       optimization's clothes, and there are ~20 panels here;
+     · no backdrop-filter anywhere. It is the one effect every source agrees
+       collapses mobile framerates, and translucency plus a shader behind it
+       gets the same read for the cost of a blend the compositor already does;
+     · the corner brackets, hairlines and chroma fringes are box-shadows and
+       text-shadows on elements that are already painted — no new layers, no
+       new nodes, nothing added to the display list.
+   ========================================================================== */
+
+/* --- chromatic fringing: the y2k print-misregistration tell. Two coloured
+   shadows a pixel apart, on text the browser is painting anyway. */
+.brand .logo,
+.phead h2,
+.gauge-box .big,
+.hud-edge {
+  text-shadow:
+    0.6px 0 0 rgba(255, 45, 120, 0.55),
+   -0.6px 0 0 rgba(0, 210, 255, 0.55),
+    0 0 14px var(--glow);
+}
+
+/* --- corner brackets. Pure inset box-shadows on ::before/::after of an element
+   that already exists; the panel's own clip-path cuts the opposite corner, so
+   the frame reads as machined rather than drawn. */
+.panel > .phead::after {
+  content: ""; position: absolute; right: 0; top: 0;
+  width: 14px; height: 14px; pointer-events: none;
+  border-top: 1px solid var(--accent);
+  border-right: 1px solid var(--accent);
+  opacity: 0.45;
+}
+
+/* --- hairline under every panel header: a magenta-to-cyan bleed that makes the
+   header read as a lit edge instead of a border. */
+.phead {
+  box-shadow: inset 0 -1px 0 rgba(255, 45, 120, 0.14),
+              0 1px 0 rgba(0, 210, 255, 0.10);
+}
+
+/* --- the cortex is the centerpiece, so it is the one panel that gets a living
+   frame: a conic sheen rotated by TRANSFORM (compositor-only) behind a mask.
+   Rotating the element is free; animating a gradient's stops would repaint. */
+.cortex-panel { position: relative; isolation: isolate; }
+.cortex-panel::before {
+  content: ""; position: absolute; inset: -40%;
+  z-index: -1; pointer-events: none;
+  background: conic-gradient(from 0deg,
+    transparent 0turn, rgba(0,210,255,.16) .08turn, transparent .2turn,
+    transparent .5turn, rgba(255,45,120,.13) .58turn, transparent .72turn, transparent 1turn);
+  animation: cortex-sheen 18s linear infinite;
+  will-change: transform;          /* one of exactly two promoted layers */
+}
+@keyframes cortex-sheen { to { transform: rotate(1turn); } }
+
+/* --- ARMED: when a signal is at the gate the terminal should feel it. A single
+   scanning bar, translated across the header — one layer, one property. */
+.topbar { position: sticky; overflow: hidden; }
+.topbar::after {
+  content: ""; position: absolute; inset: 0 auto 0 0;
+  width: 22%; pointer-events: none; opacity: 0;
+  background: linear-gradient(90deg, transparent, rgba(0,210,255,.16), transparent);
+  transform: translate3d(-120%, 0, 0);
+}
+body.armed .topbar::after {
+  opacity: 1;
+  animation: armed-sweep 2.4s cubic-bezier(.45,0,.15,1) infinite;
+  will-change: transform;          /* the second, and last, promoted layer */
+}
+@keyframes armed-sweep { to { transform: translate3d(560%, 0, 0); } }
+
+/* --- goth contrast pass: deeper wells, brighter marks. Tracks and rails go
+   near-black so neon reads as emission rather than as a light-grey tint. */
+.bar-track, .desk .track, .alpha .wt, .health-meter, .op-xp {
+  background: #05060c;
+  box-shadow: inset 0 0 0 1px rgba(0,210,255,.07);
+}
+.tbl th { border-bottom-color: rgba(255,45,120,.22); }
+.tbl tr:hover td { background: rgba(0,210,255,.055); box-shadow: inset 2px 0 0 var(--accent); }
+
+/* --- the active tab gets a lit rail rather than a plain underline */
+.tab.active { position: relative; }
+.tab.active::after {
+  content: ""; position: absolute; left: 8px; right: 8px; bottom: -1px; height: 2px;
+  background: linear-gradient(90deg, var(--magenta), var(--accent));
+  box-shadow: 0 0 12px var(--glow);
+}
+
+/* --- respect the operator. Anyone who has asked their OS to stop moving things
+   gets a still terminal: the shader keeps its state colours, the chrome stops. */
+@media (prefers-reduced-motion: reduce) {
+  .cortex-panel::before,
+  body.armed .topbar::after,
+  .tape-track { animation: none !important; }
+}
+
+/* No ambient layer (no WebGL2, or a software rasterizer we refuse to shade on):
+   put back a static version of what the shader was drawing, as plain gradients.
+   Costs one paint at load and never animates. */
+.no-ambient body {
+  background-image:
+    radial-gradient(1200px 520px at 50% 88%, rgba(0,210,255,0.10), transparent 64%),
+    radial-gradient(900px 420px at 12% 8%, rgba(157,107,255,0.06), transparent 60%),
+    linear-gradient(rgba(0,210,255,0.020) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0,210,255,0.020) 1px, transparent 1px);
+  background-size: auto, auto, 44px 44px, 44px 44px;
+  background-attachment: fixed;
+}
+.no-ambient .panel { background: linear-gradient(180deg, rgba(0,210,255,.045), transparent 46%), var(--surface); }

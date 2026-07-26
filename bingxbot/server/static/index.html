@@ -9,6 +9,12 @@
 </head>
 <body>
 
+<!-- Ambient layer: one WebGL2 fullscreen pass behind everything. Scanlines and
+     the hologram sweep live HERE now — as DOM overlays they sat in every
+     display list the browser rebuilt, which profiling showed was the single
+     biggest main-thread cost on this page. -->
+<canvas id="ambient" aria-hidden="true"></canvas>
+
 <header class="topbar">
   <div class="brand"><div class="logo"><span class="bolt">⚡</span>PULSE</div><div class="sub">adaptive futures terminal</div></div>
   <div id="mode-pill" class="pill idle"><span class="dot"></span><span id="mode-text">IDLE</span></div>
@@ -530,5 +536,8 @@
 
 <script src="/static/vendor/lightweight-charts.standalone.production.js"></script>
 <script src="/static/app.js"></script>
+<!-- last, and deferred by position: the terminal must be interactive before a
+     single decorative pixel is shaded -->
+<script src="/static/ambient.js"></script>
 </body>
 </html>
