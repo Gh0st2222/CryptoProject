@@ -89,6 +89,14 @@ MIN_POOLED_TRADES = 30      # ...and the EVIDENCE FLOOR that actually decides a
 OOS_TAIL_FRAC = 0.40
 TRAIN_FRAC = 1.0 - OOS_TAIL_FRAC
 PURGE_BARS = 64
+TRAIN_BARS_CAP = 6000       # the SEARCH's window is bounded independently of the
+                            # JUDGE's. Fold length is what the measurement
+                            # constrains, and it constrains the judged folds;
+                            # the DE was converging fine on ~5100 bars and
+                            # doubling it only doubled the cycle. Slightly above
+                            # the depth that was already working, so nothing
+                            # regresses, and taken from the bars nearest the cut
+                            # because those are the ones that resemble tomorrow.
 WEAK_BAR_MULT = 1.25        # a challenger that loses money across the median
                             # historical era must clear a higher bar
 SPECIALIST_CANDS = 5        # candidates the per-symbol bench considers (its cost
@@ -218,9 +226,19 @@ def _current_params(cfg) -> dict:
 def _train_split(candles: list) -> list:
     """The bars the DE may FIT on: everything before the OOS folds start, minus
     a purge gap. Anything after this point is the judge's, and the judge's
-    windows must contain no bar the search has already seen."""
+    windows must contain no bar the search has already seen.
+
+    Bounded at TRAIN_BARS_CAP, taking the bars nearest the cut. Doubling the
+    lookback fixed the JUDGE — that is what the fold-length measurement
+    constrains — but it also doubled the SEARCH, which nothing measured said was
+    broken: DE training went from 8.1s to 18.4s per worker per cycle, and with
+    duty pacing that halves the number of cycles an hour. Champions the gate can
+    finally promote, arriving half as often, is a bad trade when the search
+    never needed the extra depth. The judge keeps its long folds; the search
+    keeps its old cost and gets the bars closest to now."""
     cut = int(len(candles) * TRAIN_FRAC) - PURGE_BARS
-    return candles[:max(MIN_FOLD_BARS, cut)]
+    cut = max(MIN_FOLD_BARS, cut)
+    return candles[max(0, cut - TRAIN_BARS_CAP):cut]
 
 
 def _centroid(param_sets: list[dict]) -> dict:

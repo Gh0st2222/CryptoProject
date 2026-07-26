@@ -112,3 +112,50 @@ def test_a_short_series_still_yields_a_usable_training_split():
     DE selection into a coin flip."""
     for n in (400, 1_000, 3_000):
         assert len(_train_split(list(range(n)))) >= min(MIN_FOLD_BARS, n)
+
+
+# ------------------------------------- the search window, bounded separately
+
+def test_the_search_window_is_capped_independently_of_the_judge():
+    """Doubling the lookback fixed the JUDGE — fold length is what the
+    measurement constrains. It also doubled the SEARCH, which nothing measured
+    said was broken: 8.1s to 18.4s per worker per cycle, which duty pacing turns
+    into half as many cycles an hour. Champions the gate can finally promote,
+    arriving half as often, is a bad trade."""
+    from bingxbot.engine.autotuner import TRAIN_BARS_CAP, lookback_days
+    n = int(lookback_days("15m") * 96)
+    train = _train_split(list(range(n)))
+    assert len(train) == TRAIN_BARS_CAP
+    uncapped = int(n * TRAIN_FRAC) - PURGE_BARS
+    assert len(train) < uncapped, "the cap must actually bind at the full lookback"
+
+
+def test_the_cap_takes_the_bars_nearest_the_cut():
+    """Which half of the history the search keeps is not arbitrary: the bars
+    closest to the judged window are the ones that resemble it."""
+    n = 17_280
+    train = _train_split(list(range(n)))
+    cut = max(MIN_FOLD_BARS, int(n * TRAIN_FRAC) - PURGE_BARS)
+    assert train[-1] == cut - 1, "the search window must end AT the purge cut"
+
+
+def test_the_cap_never_starves_a_short_history():
+    """A thin symbol must still get everything it has, not a slice of nothing."""
+    for n in (400, 1_000, 3_000, 8_640):
+        train = _train_split(list(range(n)))
+        assert train, f"{n} bars produced an empty training window"
+        assert len(train) <= max(MIN_FOLD_BARS, int(n * TRAIN_FRAC) - PURGE_BARS)
+
+
+def test_the_capped_window_still_supports_the_fold_machinery():
+    """_make_folds splits the training window one fold per research worker, and
+    score_fold returns -1 for every candidate below its floor — a cap that made
+    folds too short would zero out the whole cycle and turn DE selection into
+    noise, which this project has already been bitten by once."""
+    from bingxbot.engine.autotuner import _make_folds
+    train = _train_split(list(range(17_280)))
+    for workers in (1, 2, 4, 8):
+        nf = min(workers, max(1, len(train) // MIN_FOLD_BARS))
+        folds = _make_folds(train, nf)
+        assert folds and min(len(f) for f in folds) >= MIN_FOLD_BARS, (
+            f"{workers} workers: folds of {min(len(f) for f in folds)} bars")
