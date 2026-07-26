@@ -21,6 +21,7 @@ from ..config import config_public_dict
 from ..data.feed import bars_overdue
 from ..engine.autotuner import MIN_OOS_TRADED_BARS
 from ..engine.tradability import symbol_economics
+from ..strategy.regime_profile import stands_down
 from ..util import interval_ms, now_ms
 
 TRADES_N = 60          # recent closed trades included
@@ -419,6 +420,29 @@ def build_report(orch) -> str:
                            f"a closed gate; check the judged-fold length and the "
                            f"scale MIN_ABS_FITNESS is written on."),
             })
+
+        # 7) the champion is deliberately flat. This is correct behaviour, but
+        #    it is indistinguishable from a broken engine unless it says so —
+        #    "nothing is trading" has cost this project weeks twice already.
+        prof = getattr(eng, "champion_regime_profile", None)
+        if prof:
+            grounded = {}
+            for sym, c in eng.ctx.items():
+                reg = (c.brain.last or {}).get("regime")
+                if reg and stands_down(prof, reg):
+                    grounded[sym] = (reg, prof.get(reg, {}))
+            if grounded:
+                syms = ", ".join(f"{s} ({r})" for s, (r, _) in sorted(grounded.items()))
+                one = next(iter(grounded.values()))[1]
+                findings.append({
+                    "level": "INFO", "check": "champion-standing-down",
+                    "detail": (f"the active champion is refusing new entries on "
+                               f"{syms}: it scored {one.get('fit', 0):+.1f} across "
+                               f"{one.get('eras', 0)} historical era(s) of this "
+                               f"market ({', '.join(one.get('names', []) or ['—'])}). "
+                               f"This is the regime gate working, not a stall — it "
+                               f"trades again when the tape changes character."),
+                })
 
         if not findings:
             return "no contradictions found"

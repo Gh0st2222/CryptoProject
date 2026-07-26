@@ -327,6 +327,7 @@ class TraderEngine:
             target_trades_per_hour=s.target_trades_per_hour,
             bars_per_hour=bars_per_hour, cost_multiple=s.cost_multiple,
             min_p_win=s.min_p_win, kelly_fraction=s.kelly_fraction,
+            desk_tilt_idx=getattr(s, "desk_tilt", 0),
         ))
 
     async def adopt_symbol(self, sym: str) -> bool:
@@ -1152,6 +1153,10 @@ class TraderEngine:
         # (overlay key, brain attribute, config attribute, coerce)
         ("base_threshold", "base_threshold", "base_threshold", None),
         ("cost_multiple", "cost_multiple", "cost_multiple", None),
+        # the strategy ARCHETYPE travels the same road as every other brain
+        # scalar, so a promoted champion's identity reaches the live brains on
+        # the hot swap and param_divergence proves afterwards that it did
+        ("desk_tilt", "desk_tilt_idx", "desk_tilt", lambda v: int(v)),
         ("hedge_eta", "eta", "hedge_eta", None),
         ("horizon_bars", "horizon", "horizon_bars", lambda v: max(1, int(v))),
         ("kelly_fraction", "kelly_fraction", "kelly_fraction", None),

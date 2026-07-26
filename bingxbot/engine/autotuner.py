@@ -299,7 +299,9 @@ def _pool_stats(stats_list: list[dict]) -> dict:
 # global — one account, one risk policy; but BTC and a hot adopted mid-cap
 # genuinely should not share one edge threshold.
 BRAIN_PARAMS = ("base_threshold", "target_trades_per_hour", "cost_multiple",
-                "hedge_eta", "horizon_bars", "min_p_win", "kelly_fraction")
+                "hedge_eta", "horizon_bars", "min_p_win", "kelly_fraction",
+                "desk_tilt")   # a hot mid-cap can genuinely want a different
+                               # KIND of desk than BTC, not just a different bar
 
 
 def overlay_of(params: dict) -> dict:

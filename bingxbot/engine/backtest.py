@@ -225,7 +225,8 @@ class _SymSim:
             base_threshold=strat.base_threshold, threshold_adapt=strat.threshold_adapt,
             target_trades_per_hour=strat.target_trades_per_hour,
             bars_per_hour=bph, cost_multiple=strat.cost_multiple,
-            min_p_win=strat.min_p_win, kelly_fraction=strat.kelly_fraction)
+            min_p_win=strat.min_p_win, kelly_fraction=strat.kelly_fraction,
+            desk_tilt_idx=getattr(strat, "desk_tilt", 0))
         # meta-free evidence lanes: the GBM head is trained on the LIVE clock's
         # recent bars — consulting it while judging another clock (trial) or
         # another era (gauntlet) measures the mismatch, not the parameters.
@@ -763,6 +764,16 @@ TUNABLES: dict[str, tuple] = {
     "min_efficiency":         (0.06, 0.50, "strategy", "float"),
     "min_p_win":              (0.40, 0.60, "strategy", "float"),
     "kelly_fraction":         (0.15, 0.60, "strategy", "float"),
+    # STRATEGY ARCHETYPE, not another scalar: 0 balanced, 1 trend-led,
+    # 2 meanrev-led, 3 volatility-led. Every champion before this was the same
+    # strategy with different constants — the desk mix started uniform in every
+    # brain and was only ever learned online, so nothing in a parameter set
+    # could say what KIND of desk it was. One integer dimension buys four
+    # genuinely different identities, which is far cheaper out-of-sample than
+    # five continuous desk weights would be. The archetypes lean only on desks
+    # the judge can see (klines carry no book, tape or funding, so micro and
+    # carry are dormant in every backtest).
+    "desk_tilt":              (0, 3, "strategy", "int"),
     "maker_offset_bps":       (0.0, 3.0, "strategy", "float"),
     # pullback entries: rest the trend-entry limit this deep behind the signal
     # (in ATRs) and let the retrace fill us — 0 = chase at the touch. The tuner

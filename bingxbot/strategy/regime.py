@@ -20,6 +20,59 @@ REGIME_DESK_MULT: dict[str, dict[str, float]] = {
     VOLATILE:   {"trend": 0.75, "meanrev": 0.6, "micro": 0.85, "vol": 0.7, "carry": 0.8},
 }
 
+# STRATEGY ARCHETYPES — what KIND of desk this champion is, as opposed to which
+# constants it uses. Every champion until now was the same strategy with
+# different numbers: the desk mix was learned online from a uniform start and
+# reset with every brain, so nothing in the parameter set could say "I trade
+# trends" or "I fade extremes". The tuner owns this choice like any other, and
+# out-of-sample validation decides which identity actually pays on this board.
+#
+# It is a STANDING tilt applied at the same site as REGIME_DESK_MULT, so the
+# three layers compose in the obvious way: the archetype says what this champion
+# is, the regime says what today's market rewards, and the online allocator
+# still moves weight toward whatever is actually working. Index 0 is exactly
+# uniform, so every champion promoted before this existed behaves identically.
+#
+# Only desks the JUDGE can see are tilted. Historical klines carry no book, no
+# tape and no funding, so the micro and carry desks are dormant in every
+# backtest — an archetype leaning on them would be a knob the tuner selects at
+# random because nothing out-of-sample can tell the settings apart.
+# The archetype is a PREFERENCE; the regime is a fact about the market, and
+# facts win. Every tilt below is deliberately weaker than the regime spread it
+# competes with (RANGE already favours mean-reversion 1.4 : 0.5, a ratio of
+# 2.8), so a trend-led champion is still outvoted by mean-reversion inside a
+# range and a mean-reversion champion still cannot fade a decided trend. Making
+# the archetype the stronger term would re-open exactly the failure the regime
+# multipliers were introduced for — the allocator over-weighting mean-reversion
+# into an uptrend — with the tuner able to select it.
+DESK_TILT_NAMES = ("balanced", "trend-led", "meanrev-led", "volatility-led")
+DESK_TILTS: tuple[dict[str, float], ...] = (
+    {"trend": 1.00, "meanrev": 1.00, "micro": 1.00, "vol": 1.00, "carry": 1.00},
+    {"trend": 1.45, "meanrev": 0.70, "micro": 1.00, "vol": 1.00, "carry": 1.00},
+    {"trend": 0.70, "meanrev": 1.45, "micro": 1.00, "vol": 1.00, "carry": 1.00},
+    {"trend": 0.90, "meanrev": 0.80, "micro": 1.00, "vol": 1.50, "carry": 1.00},
+)
+
+
+def desk_tilt_weights(idx) -> dict[str, float]:
+    """The archetype's standing desk multipliers.
+
+    Rounds rather than truncates, because `_coerce` rounds every int tunable and
+    a hand-edited 1.7 must not mean archetype 1 here and archetype 2 to the rest
+    of the pipeline. Anything unrecognisable falls back to balanced: this number
+    arrives from a tuned parameter set and from champion JSON on disk, and an
+    unknown archetype must mean "no opinion", never an IndexError in the fusion
+    loop or an out-of-bounds read in the compiled one."""
+    try:
+        f = float(idx)
+    except (TypeError, ValueError):
+        return DESK_TILTS[0]
+    # written as a positive test so NaN (every comparison False) falls back too
+    if not 0.0 <= f <= len(DESK_TILTS) - 1:
+        return DESK_TILTS[0]
+    return DESK_TILTS[int(round(f))]
+
+
 # Exit geometry adapts to regime as well.
 REGIME_EXIT_MULT: dict[str, dict[str, float]] = {
     TREND_UP:   {"sl": 1.0, "tp": 1.25, "trail": 1.1},

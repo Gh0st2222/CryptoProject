@@ -121,6 +121,13 @@ class StrategyConfig:
                                     # (trend systems profit at <50% via asymmetric R)
     use_kelly: bool = True          # size by fractional Kelly from P(win)
     kelly_fraction: float = 0.30    # fraction of full Kelly (conservative)
+    desk_tilt: int = 0              # STRATEGY ARCHETYPE (see regime.DESK_TILTS):
+                                    # 0 balanced, 1 trend-led, 2 meanrev-led,
+                                    # 3 volatility-led. A standing tilt on the
+                                    # desk mix, so a champion can be a KIND of
+                                    # strategy and not only a set of constants.
+                                    # 0 is uniform — the behaviour of every
+                                    # champion that predates this field.
     entry_mode: str = "maker"       # maker (post-only, pays maker fee) | taker
     maker_offset_bps: float = 1.0   # how far inside the touch to rest the limit
     maker_wait_bars: int = 2        # bars to wait for a maker fill before cancelling
