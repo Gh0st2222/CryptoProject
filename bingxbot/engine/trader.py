@@ -1088,6 +1088,12 @@ class TraderEngine:
                     "hi24": _fin(c.last_row.get("hi_24h"), 8),
                     "lo24": _fin(c.last_row.get("lo_24h"), 8),
                     "rpos24": _fin(c.last_row.get("range_pos_24h"), 4),
+                    # order-flow state rides the FAST channel. It used to travel
+                    # only on the full snapshot, which is gated behind bar/trade
+                    # events — on a 15m signal clock that meant the dashboard's
+                    # book reading was up to fifteen minutes stale while the
+                    # tape underneath it moved every tick. Five floats.
+                    "micro": self.feed.states[sym].micro_snapshot(),
                     "candle": self._live_candle(sym),
                     "gates": c.gates,
                     "viz": c.brain.viz(),   # cortex animation: alpha/desk wiring

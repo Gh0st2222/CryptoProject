@@ -100,6 +100,19 @@
         <div class="phead"><h2>Desk allocation — the CIO backing live winners</h2></div>
         <div class="pbody"><div class="desks" id="desks"></div></div>
       </section>
+
+      <!-- every market at once. The rest of the terminal is single-symbol
+           (chart, cortex, brain all follow one focus); this is the only place
+           that shows what the machine sees across the whole watchlist. -->
+      <section class="panel grow">
+        <div class="phead"><h2>Symbol board — the whole watchlist</h2>
+          <span class="right">click a row to focus it</span></div>
+        <div class="pbody tight">
+          <div class="viz viz-bare viz-grow" id="viz-board" style="min-height:222px">
+            <canvas></canvas><div class="viz-tip"></div><div class="viz-empty"></div>
+          </div>
+        </div>
+      </section>
     </div>
 
     <!-- COLUMN C: the brain -->
@@ -144,6 +157,43 @@
           <div style="margin-top:8px">
             <div class="kv"><span class="k">Health governor · risk scalar</span><span class="v" id="kv-health">—</span></div>
             <div class="health-meter"><div class="health-fill" id="health-fill"></div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- open risk, drawn on the only axis that matters: stop -> target. The
+           positions table has these numbers, but a number can't show you that
+           price is sitting two thirds of the way back to the stop. -->
+      <section class="panel">
+        <div class="phead"><h2>Trade runway — where the open risk sits</h2>
+          <span class="right" id="runway-cap">—</span></div>
+        <div class="pbody tight">
+          <div class="viz viz-bare" id="viz-runway" style="height:176px">
+            <canvas></canvas><div class="viz-empty"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- the tape, as a picture. OBI and flow are the fastest-moving real
+           numbers in the system and were a single line of text. -->
+      <section class="panel grow">
+        <div class="phead"><h2>Order flow — the book the machine is reading</h2>
+          <span class="right" id="flow-cap">—</span></div>
+        <div class="pbody tight">
+          <div class="viz viz-bare viz-grow" id="viz-flow" style="min-height:236px">
+            <canvas></canvas><div class="viz-empty"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- how much room is left before the machine stops itself. Nothing else
+           on screen shows the distance to the kill switch. -->
+      <section class="panel">
+        <div class="phead"><h2>Risk budget — room before it halts</h2>
+          <span class="right" id="budget-cap">—</span></div>
+        <div class="pbody tight">
+          <div class="viz viz-bare" id="viz-budget" style="height:196px">
+            <canvas></canvas><div class="viz-empty"></div>
           </div>
         </div>
       </section>
