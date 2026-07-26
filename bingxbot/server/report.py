@@ -18,7 +18,9 @@ import time
 from dataclasses import asdict as dc_asdict
 
 from ..config import config_public_dict
-from ..util import now_ms
+from ..data.feed import bars_overdue
+from ..engine.tradability import symbol_economics
+from ..util import interval_ms, now_ms
 
 TRADES_N = 60          # recent closed trades included
 JOURNAL_RAW_N = 40     # raw journal rows (with decision context)
@@ -244,7 +246,155 @@ def build_report(orch) -> str:
     def config():
         return _dump(config_public_dict(orch.cfg))
 
+    def tradability():
+        """What a round trip costs each symbol, in units of the risk taken.
+
+        Everything else in this system works to raise P(win) and the payoff
+        ratio. This is the other side of the same inequality and nothing in the
+        signal stack can move it: fees are charged on notional, notional is
+        (risk / stop distance), so the cost of trading is set by how wide the
+        stop is — which is set by ATR, which is set by the bar clock and the
+        symbol. A number here above ~0.4 means the symbol is asking for a win
+        rate a directional system does not produce.
+        """
+        eng = orch.engine
+        if eng is None:
+            return "engine idle"
+        r = orch.cfg.risk
+        out = {}
+        for sym in eng.ctx:
+            st = eng.feed.states.get(sym)
+            row = eng.ctx[sym].last_row or {}
+            atr_pct = row.get("atr_pct")
+            micro = st.micro_snapshot() if st is not None else {}
+            spec = eng.specs.get(sym)
+            fees_rt = ((spec.taker_fee if spec else orch.cfg.exchange.taker_fee)
+                       + ((spec.maker_fee if spec else orch.cfg.exchange.maker_fee)
+                          if orch.cfg.strategy.entry_mode == "maker"
+                          else (spec.taker_fee if spec else orch.cfg.exchange.taker_fee)))
+            e = symbol_economics(
+                atr_pct if isinstance(atr_pct, (int, float)) else float("nan"),
+                micro.get("spread_bps", float("nan")),
+                fees_rt, orch.cfg.paper.slippage_bps, r.sl_atr_min,
+                eng.risk.payoff_ratio("trend"))
+            e["fees_roundtrip"] = round(fees_rt, 6)
+            out[sym] = e
+        return _dump({
+            "note": ("cost_r = (fees + spread + 2 x slippage) / (sl_atr_min x atr_pct); "
+                     "breakeven_win_rate = (1 + cost_r) / (1 + payoff_b). "
+                     "Longer bar clocks and wider stops both raise the "
+                     "denominator, which is the only free lever here."),
+            "interval": orch.cfg.strategy.interval,
+            "sl_atr_min": r.sl_atr_min,
+            "entry_mode": orch.cfg.strategy.entry_mode,
+            "symbols": out,
+        })
+
+    def self_check():
+        """Contradictions and dead ends the machine can see in its own state.
+
+        Everything else in this file is a readout: it tells you what a number
+        is, not whether that number can be right. Reading a resume then means
+        cross-referencing the config against the overlays against the gates by
+        eye, and the things worth catching are exactly the ones that survive
+        that — a symbol whose spread cap it can never clear, a brain holding a
+        scalar that appears in neither the config nor the overlay ledger.
+        """
+        eng = orch.engine
+        findings: list[dict] = []
+        if eng is None:
+            return "engine idle — nothing to check"
+
+        # 1) brain scalars that match neither the global set nor the overlay
+        for d in eng.param_divergence():
+            findings.append({
+                "level": "WARN", "check": "brain-params-diverged",
+                "detail": (f"{d['symbol']} is deciding with {d['param']}="
+                           f"{d['in_force']}, but the {d['source']} set says "
+                           f"{d['expected']}. Nothing in the config or the "
+                           f"overlay ledger shows the value it is using."),
+            })
+
+        # 2) a symbol whose book cannot clear its own spread cap is not being
+        #    filtered, it is switched off — it holds a position slot, a brain
+        #    and a share of the research pool while being unable to trade
+        cap = orch.cfg.risk.max_spread_bps
+        for sym in eng.ctx:
+            st = eng.feed.states.get(sym)
+            sp = st.micro_snapshot().get("spread_bps") if st is not None else None
+            if sp is not None and math.isfinite(sp) and sp > cap:
+                findings.append({
+                    "level": "WARN", "check": "spread-cap-unreachable",
+                    "detail": (f"{sym} spread is {sp:.1f}bps against a "
+                               f"max_spread_bps of {cap}. Its risk gate cannot "
+                               f"pass at this spread — it occupies a seat "
+                               f"without being able to trade."),
+                })
+
+        # 3) bar pipeline, stated against the rule instead of raw seconds, so
+        #    nobody has to remember that bars are open-stamped
+        iv = interval_ms(orch.cfg.strategy.interval)
+        for sym in eng.ctx:
+            st = eng.feed.states.get(sym)
+            lt = st.candles.last_ts if st is not None and len(st.candles) else 0
+            if not lt:
+                continue
+            age = now_ms() - lt
+            if bars_overdue(lt, now_ms(), iv):
+                findings.append({
+                    "level": "WARN", "check": "bar-pipeline-starved",
+                    "detail": (f"{sym} last closed bar is {age/1000:.0f}s old, "
+                               f"past the {3*iv/1000:.0f}s overdue line — the "
+                               f"kline stream has missed at least one close."),
+                })
+                break
+
+        # 4) the meta head's vote is credentialed by its own AUC, not by how
+        #    much evidence the online calibrator has. On a cold brain that
+        #    means the GBM decides P(win) essentially alone.
+        try:
+            from ..ml.meta import get_meta
+            m = get_meta()
+        except Exception:  # noqa: BLE001 — the ML stack is optional
+            m = None
+        if m is not None and m.ready and m.blend_weight >= 0.8:
+            cold = [s for s, c in eng.ctx.items()
+                    if getattr(c.brain.calibrator, "n", 0) == 0]
+            if cold:
+                findings.append({
+                    "level": "INFO", "check": "meta-alone-on-cold-brains",
+                    "detail": (f"meta blend weight is {m.blend_weight:.2f} (its "
+                               f"cap is 0.85) while the calibrator has graded "
+                               f"nothing on {', '.join(sorted(cold))}. Until "
+                               f"those brains have outcomes, P(win) is close to "
+                               f"the model's opinion alone."),
+                })
+
+        # 5) a research desk that has never promoted is either correctly
+        #    conservative or aiming at a bar it cannot reach — either way the
+        #    operator should be told, not left to notice an empty vault
+        at = orch.autotuner
+        if at is not None:
+            snap = at.snapshot()
+            cyc, imp = snap.get("cycles", 0), snap.get("improvements", 0)
+            if cyc >= 10 and not imp:
+                lc = snap.get("last_cycle") or {}
+                findings.append({
+                    "level": "INFO", "check": "tuner-never-promoted",
+                    "detail": (f"{cyc} cycles, 0 promotions, vault holds "
+                               f"{len(orch.champions)}. Last cycle judged "
+                               f"{lc.get('cands_judged')} candidates and "
+                               f"{lc.get('pf_passed')} cleared the portfolio "
+                               f"gate against a bar of {lc.get('bar')}."),
+                })
+
+        if not findings:
+            return "no contradictions found"
+        return _dump(findings)
+
     parts.append("PULSE — diagnostic resume (no secrets; safe to share)")
+    section("SELF-CHECK", self_check)
+    section("TRADABILITY (what a round trip costs, in R)", tradability)
     section("HEADER / SESSION", header)
     section("RISK & HEALTH", risk_health)
     section("DIVERGENCE MONITOR", divergence)
