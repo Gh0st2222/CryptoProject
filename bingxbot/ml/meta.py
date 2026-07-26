@@ -199,6 +199,10 @@ class MetaModel:
         # different base rate; only the deviation from this reference is
         # transferable evidence.
         self.base_rate = float(base_rate) if 0.0 < float(base_rate) < 1.0 else 0.5
+        # compiled single-row traversal over this model's own trees, built on
+        # first use. _fast is None = not attempted, False = unsupported or
+        # failed parity (sklearn forever after).
+        self._fast = None
 
     @property
     def ready(self) -> bool:
@@ -211,7 +215,23 @@ class MetaModel:
         return float(min(max((self.auc - 0.50) * 10.0, 0.0), 0.85))
 
     def predict_one(self, x: np.ndarray) -> float:
-        p = self.model.predict_proba(x.reshape(1, -1))[0, 1]
+        """P(win) for one feature row, clamped away from certainty.
+
+        The brain asks for this once per (bar, direction) near the gate, so it
+        is called one row at a time — the shape sklearn's predict_proba is
+        worst at, since it re-validates the input and then re-enters Cython
+        once per boosting iteration (150 times) for a single row. `fasttree`
+        walks the same trees in one compiled pass and is checked against
+        sklearn's own raw prediction before it is ever used; anything it
+        cannot reproduce leaves `_fast` False and this method on sklearn.
+        """
+        if self._fast is None:
+            from .fasttree import build
+            self._fast = build(self.model) or False
+        if self._fast is not False:
+            p = self._fast.proba(x)
+        else:
+            p = self.model.predict_proba(x.reshape(1, -1))[0, 1]
         return float(min(max(p, 0.05), 0.95))
 
     def save(self, path=MODEL_PATH) -> None:
