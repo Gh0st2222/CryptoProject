@@ -19,6 +19,7 @@ from dataclasses import asdict as dc_asdict
 
 from ..config import config_public_dict
 from ..data.feed import bars_overdue
+from ..engine.tradability import symbol_economics
 from ..util import interval_ms, now_ms
 
 TRADES_N = 60          # recent closed trades included
@@ -245,6 +246,50 @@ def build_report(orch) -> str:
     def config():
         return _dump(config_public_dict(orch.cfg))
 
+    def tradability():
+        """What a round trip costs each symbol, in units of the risk taken.
+
+        Everything else in this system works to raise P(win) and the payoff
+        ratio. This is the other side of the same inequality and nothing in the
+        signal stack can move it: fees are charged on notional, notional is
+        (risk / stop distance), so the cost of trading is set by how wide the
+        stop is — which is set by ATR, which is set by the bar clock and the
+        symbol. A number here above ~0.4 means the symbol is asking for a win
+        rate a directional system does not produce.
+        """
+        eng = orch.engine
+        if eng is None:
+            return "engine idle"
+        r = orch.cfg.risk
+        out = {}
+        for sym in eng.ctx:
+            st = eng.feed.states.get(sym)
+            row = eng.ctx[sym].last_row or {}
+            atr_pct = row.get("atr_pct")
+            micro = st.micro_snapshot() if st is not None else {}
+            spec = eng.specs.get(sym)
+            fees_rt = ((spec.taker_fee if spec else orch.cfg.exchange.taker_fee)
+                       + ((spec.maker_fee if spec else orch.cfg.exchange.maker_fee)
+                          if orch.cfg.strategy.entry_mode == "maker"
+                          else (spec.taker_fee if spec else orch.cfg.exchange.taker_fee)))
+            e = symbol_economics(
+                atr_pct if isinstance(atr_pct, (int, float)) else float("nan"),
+                micro.get("spread_bps", float("nan")),
+                fees_rt, orch.cfg.paper.slippage_bps, r.sl_atr_min,
+                eng.risk.payoff_ratio("trend"))
+            e["fees_roundtrip"] = round(fees_rt, 6)
+            out[sym] = e
+        return _dump({
+            "note": ("cost_r = (fees + spread + 2 x slippage) / (sl_atr_min x atr_pct); "
+                     "breakeven_win_rate = (1 + cost_r) / (1 + payoff_b). "
+                     "Longer bar clocks and wider stops both raise the "
+                     "denominator, which is the only free lever here."),
+            "interval": orch.cfg.strategy.interval,
+            "sl_atr_min": r.sl_atr_min,
+            "entry_mode": orch.cfg.strategy.entry_mode,
+            "symbols": out,
+        })
+
     def self_check():
         """Contradictions and dead ends the machine can see in its own state.
 
@@ -349,6 +394,7 @@ def build_report(orch) -> str:
 
     parts.append("PULSE — diagnostic resume (no secrets; safe to share)")
     section("SELF-CHECK", self_check)
+    section("TRADABILITY (what a round trip costs, in R)", tradability)
     section("HEADER / SESSION", header)
     section("RISK & HEALTH", risk_health)
     section("DIVERGENCE MONITOR", divergence)
