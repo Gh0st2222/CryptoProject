@@ -367,6 +367,10 @@ class Orchestrator:
             # a weak regime-gauntlet stamp doubles live probation: this set
             # needs twice the real-trade proof before full-size tuition
             self.engine.champion_gauntlet_weak = bool(c.get("gauntlet_weak"))
+            # ...and its per-regime history becomes an operating manual: which
+            # markets this set has actually lost money in, so it can sit those
+            # out live rather than be refused the seat over them
+            self.engine.champion_regime_profile = (c.get("gauntlet") or {}).get("by_regime")
         self.save_champions()
 
     def prune_champions(self) -> None:
@@ -617,6 +621,12 @@ class Orchestrator:
         self.engine = TraderEngine(self.cfg, feed, broker, portfolio, risk, self.specs,
                                    on_update, journal=self.journal, record=self.record)
         self.engine.active_champion_id = self.active_champion_id
+        # the active champion's gauntlet stamps must survive a restart too, or a
+        # set that stood down in crashes would come back trading them
+        _act = self.find_champion(self.active_champion_id)
+        if _act is not None:
+            self.engine.champion_gauntlet_weak = bool(_act.get("gauntlet_weak"))
+            self.engine.champion_regime_profile = (_act.get("gauntlet") or {}).get("by_regime")
         for sym, ov in self.symbol_overlays.items():   # overlays survive restarts
             self.engine.set_overlay(sym, ov.get("params"))
         if mode == MODE_PAPER and snap:                # learning survives restarts too

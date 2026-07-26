@@ -40,7 +40,8 @@ except Exception:  # noqa: BLE001 — kernel is an optimization, never a depende
         return deco if not (len(a) == 1 and callable(a[0])) else a[0]
 
 from ..strategy.alphas import ALPHAS, ALPHA_META, DESK_ORDER
-from ..strategy.regime import REGIME_DESK_MULT, REGIME_EXIT_MULT, detect_regime
+from ..strategy.regime import (DESK_TILTS, REGIME_DESK_MULT, REGIME_EXIT_MULT,
+                               detect_regime)
 
 ALPHA_NAMES = list(ALPHAS)
 N_ALPHA = len(ALPHA_NAMES)
@@ -53,6 +54,10 @@ REG_DESK_MULT = np.array([[REGIME_DESK_MULT[r].get(d, 1.0) for d in DESK_ORDER]
                           for r in REGIMES], dtype=np.float64)
 REG_EXIT = np.array([[REGIME_EXIT_MULT[r]["sl"], REGIME_EXIT_MULT[r]["tp"],
                       REGIME_EXIT_MULT[r]["trail"]] for r in REGIMES], dtype=np.float64)
+# strategy archetypes, built from the SAME table the python brain reads, so the
+# two engines cannot fork on what "trend-led" means
+DESK_TILT = np.array([[t.get(d, 1.0) for d in DESK_ORDER] for t in DESK_TILTS],
+                     dtype=np.float64)
 
 # exits.py structural constants (must track that module)
 MTF_EXIT_GUARD = 0.35
@@ -89,7 +94,7 @@ PARAM_NAMES = (
     "max_open_positions", "max_daily_loss_pct", "max_consecutive_losses",
     "cooldown_minutes", "max_spread_bps", "scaleout_rr", "scaleout_frac",
     "trail_scale_trend", "trail_scale_chop", "maker_exits",
-    "max_position_notional_pct",
+    "max_position_notional_pct", "desk_tilt",
 )
 P = {n: i for i, n in enumerate(PARAM_NAMES)}
 
@@ -187,6 +192,16 @@ def run_kernel(feats, amat, regs, p, warmup, taker, maker_fee, slip_bps,
     d_graded = np.zeros(N_DESK)
     d_disabled = np.zeros(N_DESK)
     alloc = np.full(N_DESK, 1.0 / N_DESK)
+    # the champion's standing desk tilt. Rounds and range-checks exactly as
+    # regime.desk_tilt_weights does — a parameter set from disk must never index
+    # off the end of the table inside a nopython loop, and the two engines must
+    # not disagree about which archetype a given number names. The test is
+    # written positively so a NaN (every comparison False) falls back too.
+    tf = p[P_TILT]
+    ti = 0
+    if 0.0 <= tf <= DESK_TILT.shape[0] - 1.0:
+        ti = int(round(tf))
+    tilt = DESK_TILT[ti]
     cal_w = np.array([1.2, 0.0, 0.15, 0.0])
     cal_b = 0.0
     cal_n = 0
@@ -496,7 +511,10 @@ def run_kernel(feats, amat, regs, p, warmup, taker, maker_fee, slip_bps,
         for dk in range(N_DESK):
             if d_active[dk] == 0:
                 continue
-            w = alloc[dk] * REG_DESK_MULT[reg, dk]
+            # archetype x regime x online allocator — the same three factors in
+            # the same order as TradingBrain.score, so the compiled path and the
+            # python path fuse identically
+            w = alloc[dk] * REG_DESK_MULT[reg, dk] * tilt[dk]
             fnum += w * desk_sig[dk]
             fden += w
         edge = _clamp(fnum / fden if fden > 0 else 0.0, -1.0, 1.0)
@@ -990,7 +1008,7 @@ P_DAYLOSS = P["max_daily_loss_pct"]; P_MAXLOSS = P["max_consecutive_losses"]
 P_COOL = P["cooldown_minutes"]; P_MAXSPR = P["max_spread_bps"]
 P_SORR = P["scaleout_rr"]; P_SOFRAC = P["scaleout_frac"]
 P_TRSTREND = P["trail_scale_trend"]; P_TRSCHOP = P["trail_scale_chop"]
-P_MKEXIT = P["maker_exits"]
+P_MKEXIT = P["maker_exits"]; P_TILT = P["desk_tilt"]
 
 
 def kernel_fitness(ff, strat, risk, spec, taker: float, slip_bps: float,

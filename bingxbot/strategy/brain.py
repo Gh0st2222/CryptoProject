@@ -26,7 +26,8 @@ from ..util import clamp
 from .alphas import ALPHA_META, ALPHAS, DESK_ORDER, DESKS, EVENT, MICRO_ALPHAS
 from .allocator import MetaAllocator
 from .calibration import ProbabilityCalibrator
-from .regime import REGIME_DESK_MULT, detect_regime
+from .regime import (DESK_TILT_NAMES, REGIME_DESK_MULT, desk_tilt_weights,
+                     detect_regime)
 
 try:  # meta-labeling layer (optional: no sklearn / no trained model => no-op)
     from ..ml.meta import features_from as _meta_features
@@ -153,7 +154,12 @@ class TradingBrain:
     def __init__(self, eta=0.35, weight_floor=0.05, horizon_bars=5,
                  base_threshold=0.30, threshold_adapt=True,
                  target_trades_per_hour=1.5, bars_per_hour=12.0,
-                 cost_multiple=1.4, min_p_win=0.50, kelly_fraction=0.30):
+                 cost_multiple=1.4, min_p_win=0.50, kelly_fraction=0.30,
+                 desk_tilt_idx=0):
+        # what KIND of desk this is: a standing tilt on the desk mix, so a
+        # champion can be a trend follower or a fader rather than only a set of
+        # constants. Index 0 is uniform — identical to every brain before this.
+        self.desk_tilt_idx = desk_tilt_idx
         self.eta = eta
         self.floor = weight_floor
         self.horizon = max(1, horizon_bars)
@@ -186,6 +192,23 @@ class TradingBrain:
         self.graded = 0
         self.last: dict = {}       # last decision snapshot
         self._sc: dict | None = None   # components of the most recent score()
+
+    # The archetype index and its weight vector are one thing, not two: a
+    # hot-swap that set the index and left stale weights behind would trade a
+    # different strategy than the one the tuner validated, and nothing else in
+    # the system would notice. Setting the index is the only way to change
+    # either, and it always refreshes both.
+    @property
+    def desk_tilt_idx(self) -> int:
+        return self._tilt_idx
+
+    @desk_tilt_idx.setter
+    def desk_tilt_idx(self, idx) -> None:
+        try:
+            self._tilt_idx = int(idx)
+        except (TypeError, ValueError):
+            self._tilt_idx = 0
+        self.desk_tilt = desk_tilt_weights(self._tilt_idx)
 
     # ------------------------------------------------------------- evaluate
 
@@ -247,7 +270,10 @@ class TradingBrain:
             # ("flat") and it stays in the average.
             if desk_active[desk] == 0:
                 continue
-            w = alloc[desk] * rmult.get(desk, 1.0)
+            # three layers, composed: WHAT this champion is (its archetype),
+            # what today's market rewards (the regime), and what is actually
+            # working right now (the online allocator).
+            w = alloc[desk] * rmult.get(desk, 1.0) * self.desk_tilt.get(desk, 1.0)
             num += w * desk_sig[desk]
             den += w
         edge = clamp(num / den if den > 0 else 0.0, -1, 1)
@@ -692,10 +718,16 @@ class TradingBrain:
                 "signal": round(last.get("desk_sig", {}).get(desk, 0.0), 3),
                 "conf": round(last.get("desk_conf", {}).get(desk, 0.0), 3),
                 "alloc": round(alloc.get(desk, 0.0), 4),
+                # what the ARCHETYPE says about this desk, separate from what
+                # the allocator has learned — so a champion's identity is
+                # visible rather than blended invisibly into one weight
+                "tilt": round(self.desk_tilt.get(desk, 1.0), 3),
                 "alphas": DESKS[desk],
                 **perf.get(desk, {}),
             }
         return {
+            "archetype": DESK_TILT_NAMES[self.desk_tilt_idx]
+            if 0 <= self.desk_tilt_idx < len(DESK_TILT_NAMES) else "balanced",
             "edge": round(last.get("edge", 0.0), 4),
             "p_win": round(last.get("p_win", 0.5), 4),
             "regime": last.get("regime", "RANGE"),

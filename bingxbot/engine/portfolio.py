@@ -168,6 +168,14 @@ class Portfolio:
         mean = sum(rets) / n if n else 0.0
         var = sum((r - mean) ** 2 for r in rets) / (n - 1) if n > 1 else 0.0
         sharpe_like = mean / math.sqrt(var) * math.sqrt(min(n, 252)) if var > 0 else 0.0
+        # R-multiple dispersion. avg_r on its own says nothing about how sure we
+        # are of it: +0.3R over 8 trades and +0.3R over 80 are different claims,
+        # and only the second is evidence. Carrying the spread lets a caller
+        # pool several windows into one properly-weighted estimate with an
+        # honest standard error instead of averaging point estimates.
+        rmults = [t.r_multiple for t in trades]
+        r_mean = sum(rmults) / n if n else 0.0
+        r_var = sum((r - r_mean) ** 2 for r in rmults) / (n - 1) if n > 1 else 0.0
         return {
             "trades": n,
             "win_rate": round(len(wins) / n, 4) if n else 0.0,
@@ -175,7 +183,10 @@ class Portfolio:
             "expectancy": round(mean, 6),
             "avg_win": round(gross_win / len(wins), 6) if wins else 0.0,
             "avg_loss": round(-gross_loss / len(losses), 6) if losses else 0.0,
-            "avg_r": round(sum(t.r_multiple for t in trades) / n, 3) if n else 0.0,
+            "avg_r": round(r_mean, 3) if n else 0.0,
+            "r_std": round(math.sqrt(r_var), 4),
+            "gross_win": round(gross_win, 6),
+            "gross_loss": round(gross_loss, 6),
             "total_pnl": round(sum(rets), 6),
             "fees_paid": round(sum(t.fees for t in trades), 6),
             "funding_paid": round(self.funding_paid, 6),

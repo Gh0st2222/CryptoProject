@@ -19,7 +19,9 @@ from dataclasses import asdict as dc_asdict
 
 from ..config import config_public_dict
 from ..data.feed import bars_overdue
+from ..engine.autotuner import MIN_OOS_TRADED_BARS
 from ..engine.tradability import symbol_economics
+from ..strategy.regime_profile import stands_down
 from ..util import interval_ms, now_ms
 
 TRADES_N = 60          # recent closed trades included
@@ -374,11 +376,12 @@ def build_report(orch) -> str:
         #    conservative or aiming at a bar it cannot reach — either way the
         #    operator should be told, not left to notice an empty vault
         at = orch.autotuner
+        lc: dict = {}
         if at is not None:
             snap = at.snapshot()
             cyc, imp = snap.get("cycles", 0), snap.get("improvements", 0)
+            lc = snap.get("last_cycle") or {}
             if cyc >= 10 and not imp:
-                lc = snap.get("last_cycle") or {}
                 findings.append({
                     "level": "INFO", "check": "tuner-never-promoted",
                     "detail": (f"{cyc} cycles, 0 promotions, vault holds "
@@ -386,6 +389,59 @@ def build_report(orch) -> str:
                                f"{lc.get('cands_judged')} candidates and "
                                f"{lc.get('pf_passed')} cleared the portfolio "
                                f"gate against a bar of {lc.get('bar')}."),
+                })
+
+        # 6) THE BAR ITSELF. "No promotion again" reads identically whether the
+        #    research desk is being appropriately strict or aiming at a number
+        #    its own judge cannot produce — and the second is what actually
+        #    happened here for 618 cycles. Two states are worth saying out loud:
+        #    judged folds too short to carry a verdict, and a best challenger
+        #    that is not merely below the bar but nowhere near it.
+        traded = lc.get("oos_traded_bars")
+        if isinstance(traded, (int, float)) and 0 < traded < MIN_OOS_TRADED_BARS:
+            findings.append({
+                "level": "WARN", "check": "judged-folds-too-short",
+                "detail": (f"each out-of-sample fold trades {int(traded)} bars, "
+                           f"under the {MIN_OOS_TRADED_BARS} where a fold's "
+                           f"verdict starts predicting the next window. Below "
+                           f"this the promotion score is noise and the bar is "
+                           f"effectively unreachable — widen the lookback or "
+                           f"expect no champions."),
+            })
+        bar, bf = lc.get("bar"), lc.get("best_fitness")
+        if (isinstance(bar, (int, float)) and isinstance(bf, (int, float))
+                and at is not None and at.cycles >= 25 and not at.improvements
+                and bf < bar - abs(bar) - 0.5):
+            findings.append({
+                "level": "WARN", "check": "promotion-bar-unreachable",
+                "detail": (f"the best challenger in {at.cycles} cycles scored "
+                           f"{bf:+.2f} against a bar of {bar:+.2f} — not close. "
+                           f"A bar nothing approaches is not selectivity, it is "
+                           f"a closed gate; check the judged-fold length and the "
+                           f"scale MIN_ABS_FITNESS is written on."),
+            })
+
+        # 7) the champion is deliberately flat. This is correct behaviour, but
+        #    it is indistinguishable from a broken engine unless it says so —
+        #    "nothing is trading" has cost this project weeks twice already.
+        prof = getattr(eng, "champion_regime_profile", None)
+        if prof:
+            grounded = {}
+            for sym, c in eng.ctx.items():
+                reg = (c.brain.last or {}).get("regime")
+                if reg and stands_down(prof, reg):
+                    grounded[sym] = (reg, prof.get(reg, {}))
+            if grounded:
+                syms = ", ".join(f"{s} ({r})" for s, (r, _) in sorted(grounded.items()))
+                one = next(iter(grounded.values()))[1]
+                findings.append({
+                    "level": "INFO", "check": "champion-standing-down",
+                    "detail": (f"the active champion is refusing new entries on "
+                               f"{syms}: it scored {one.get('fit', 0):+.1f} across "
+                               f"{one.get('eras', 0)} historical era(s) of this "
+                               f"market ({', '.join(one.get('names', []) or ['—'])}). "
+                               f"This is the regime gate working, not a stall — it "
+                               f"trades again when the tape changes character."),
                 })
 
         if not findings:

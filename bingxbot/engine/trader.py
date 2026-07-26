@@ -21,6 +21,7 @@ from ..risk.manager import RiskManager
 from ..strategy.brain import TradingBrain
 from ..strategy.exits import AdaptiveExitManager
 from ..strategy.features import FeatureFrame, mtf_from_row
+from ..strategy.regime_profile import stands_down
 from ..util import now_ms
 from .backtest import (ASSUMED_SPREAD_BPS, FILL_THROUGH_BPS, FUNDING_MS,
                        _entry_signal_ok, gate_ev, gate_funding, gate_mtf_veto,
@@ -111,6 +112,12 @@ class TraderEngine:
         self.record = record        # TrackRecord (daily performance snapshots)
         self.active_champion_id: str | None = None  # vault champion currently driving trades (journal tag)
         self.champion_gauntlet_weak = False  # weak regime-gauntlet stamp -> double probation
+        # Per-regime history for the ACTIVE champion: {regime: {fit, eras, losing}}.
+        # A champion that bled through the 2022 crash is not a bad champion — it
+        # is a champion that should be flat when the tape looks like 2022. This
+        # is what lets it say so, instead of being rejected at promotion for a
+        # market that may not come back.
+        self.champion_regime_profile: dict | None = None
         self.persist_path = persist_path     # None = the default paper snapshot; the
                                              # SHADOW engine gets its own file so the
                                              # two accounts can never overwrite each other
@@ -320,6 +327,7 @@ class TraderEngine:
             target_trades_per_hour=s.target_trades_per_hour,
             bars_per_hour=bars_per_hour, cost_multiple=s.cost_multiple,
             min_p_win=s.min_p_win, kelly_fraction=s.kelly_fraction,
+            desk_tilt_idx=getattr(s, "desk_tilt", 0),
         ))
 
     async def adopt_symbol(self, sym: str) -> bool:
@@ -589,6 +597,23 @@ class TraderEngine:
         if self.cfg.strategy.micro_confirm and not ctx.brain.micro_confirms(edge, st.micro_snapshot()):
             ctx.last_entry_block = "order-flow veto"
             return
+        # REGIME STAND-DOWN. The champion driving this account has been scored
+        # across five years of market personalities; if it lost real money in
+        # markets shaped like this one, it sits this one out. Existing positions
+        # still manage themselves to their exits — this refuses NEW risk only.
+        #
+        # This replaces treating a bad era as a mark against a champion. A
+        # trend-following set that bled through a crash is not worse than one
+        # that never traded it; it just should not be long a falling knife. The
+        # gate is silent unless history is specific: an era for THIS regime, and
+        # a loss in it big enough to be a verdict rather than a bad month.
+        if stands_down(self.champion_regime_profile, ev["regime"]):
+            prof = (self.champion_regime_profile or {}).get(ev["regime"], {})
+            ctx.last_entry_block = (
+                f"champion stands down in {ev['regime']} "
+                f"(scored {prof.get('fit', 0):+.1f} across "
+                f"{prof.get('eras', 0)} historical era(s) of this market)")
+            return
         ctx.set_stage("VALIDATE")
 
         side = LONG if edge > 0 else SHORT
@@ -836,6 +861,16 @@ class TraderEngine:
             lean = 0.6 * micro.get("flow", 0.0) + 0.4 * micro.get("obi", 0.0)
             gates.append({"n": "order-flow", "ok": ctx.brain.micro_confirms(edge, micro),
                           "d": f"lean {lean:+.2f} vs edge {edge:+.2f}"})
+        # the champion's own history with THIS market. Shown only when there is
+        # a verdict to show — an X-ray row that always reads "no data" teaches
+        # the eye to skip it.
+        prof = (self.champion_regime_profile or {}).get(ev["regime"])
+        if prof:
+            down = stands_down(self.champion_regime_profile, ev["regime"])
+            gates.append({"n": "champion history", "ok": not down,
+                          "d": (f"{ev['regime']}: scored {prof.get('fit', 0):+.1f} over "
+                                f"{prof.get('eras', 0)} era(s)"
+                                + (" — standing down" if down else ""))})
         ctx.gates = gates
 
     # ------------------------------------------------------------ tick logic
@@ -1118,6 +1153,10 @@ class TraderEngine:
         # (overlay key, brain attribute, config attribute, coerce)
         ("base_threshold", "base_threshold", "base_threshold", None),
         ("cost_multiple", "cost_multiple", "cost_multiple", None),
+        # the strategy ARCHETYPE travels the same road as every other brain
+        # scalar, so a promoted champion's identity reaches the live brains on
+        # the hot swap and param_divergence proves afterwards that it did
+        ("desk_tilt", "desk_tilt_idx", "desk_tilt", lambda v: int(v)),
         ("hedge_eta", "eta", "hedge_eta", None),
         ("horizon_bars", "horizon", "horizon_bars", lambda v: max(1, int(v))),
         ("kelly_fraction", "kelly_fraction", "kelly_fraction", None),
