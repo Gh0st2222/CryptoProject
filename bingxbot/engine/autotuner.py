@@ -84,11 +84,30 @@ OOS_FOLDS = 4               # purged sequential portfolio folds a champion must 
                             # median (undersized folds self-drop in portfolio_folds)
 VAULT_CANDIDATES = 4        # also re-validate this many top vault champions each cycle (candidate pool, not graveyard)
 STALL_REINJECT = 20         # cycles without a promotion before a diversity restart
-DEMOTE_FLOOR = -0.5         # incumbent scoring below this on the TRADED basket is
-                            # toxic... (recalibrated with MIN_ABS_FITNESS for the
-                            # compressed v3 scale — on the old bar the stand-down
-                            # would now trigger too late)
-DEMOTE_PATIENCE = 3         # ...for this many consecutive cycles -> stand down
+# The stand-down floor and the promotion bar between them define a DEAD ZONE: a
+# champion scoring above the floor can never be removed, and a challenger
+# scoring below the bar can never replace it. At -0.5 against a MIN_ABS_FITNESS
+# bar of 0.15 that zone was 0.65 wide, and an incumbent measured at -0.177 sat
+# in it for 450 consecutive cycles — losing by the system's own re-validation
+# every one of them, while the streak counter reset each time because -0.177 is
+# comfortably above -0.5.
+#
+# Zero is the only defensible floor. A champion whose re-validated fitness on
+# the symbols we actually trade is negative is, by our own measure, worse than
+# not trading — there is no reading of "slightly less toxic than -0.5" that
+# justifies leaving real money on it. The dead zone is now the promotion bar
+# alone, which is where an overfit-guard belongs.
+DEMOTE_FLOOR = 0.0          # incumbent scoring below this on the TRADED basket is
+                            # not earning its seat...
+DEMOTE_PATIENCE = 6         # ...for this many consecutive cycles -> stand down.
+                            # Raised with the floor: re-validation runs on the
+                            # same recent window each cycle, so consecutive
+                            # readings are highly correlated and a floor this
+                            # close to the noise needs more agreement than one
+                            # buried at -0.5 did.
+DEMOTE_PATIENCE_WEAK = 3    # a champion that also FAILED the regime gauntlet has
+                            # already been told it does not survive other eras;
+                            # it does not get the full benefit of the doubt
 LIVE_MIN_SAMPLE = 8         # real trades before live evidence can demote: 1 win in
                             # 8 when the validation promised ~70% WR is a ~0.1%
                             # coincidence — waiting longer just pays more tuition
@@ -764,11 +783,14 @@ class AutoTuner:
         # scoring clearly negative on the symbols we actually trade and nothing
         # beats the bar, stop trading it: fall back to the best still-positive
         # vault set, else to the code-default baseline.
+        act_now = self.orch.find_champion(self.orch.active_champion_id) or {}
+        weak_now = bool(act_now.get("gauntlet_weak"))
+        patience = DEMOTE_PATIENCE_WEAK if weak_now else DEMOTE_PATIENCE
         if promoted or champ_fit >= DEMOTE_FLOOR:
             self._champ_bad_streak = 0
         else:
             self._champ_bad_streak += 1
-            if self._champ_bad_streak >= DEMOTE_PATIENCE:
+            if self._champ_bad_streak >= patience:
                 self._champ_bad_streak = 0
                 alt = max((c for c in self.orch.champions
                            if c.get("fitness", 0.0) > 0 and not c.get("live_flag")
