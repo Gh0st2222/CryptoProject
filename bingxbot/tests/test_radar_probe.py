@@ -22,6 +22,7 @@ the rule that follows from it: an unmeasured incumbent keeps its seat, an
 unmeasured newcomer never gets one.
 """
 import numpy as np
+import pytest
 
 from bingxbot.engine.scanner import (ADOPT_ER, KEEP_ER, TREND_MIN_QVOL,
                                      plan_adoption, rank_universe,
@@ -151,3 +152,50 @@ def test_a_symbol_that_vanished_from_the_board_still_loses_its_seat():
     miss: dict = {}
     plan_adoption([], {"GONE-USDT"}, set(), lambda s: False, 3, miss)
     assert plan_adoption([], {"GONE-USDT"}, set(), lambda s: False, 3, miss)[0] == ["GONE-USDT"]
+
+
+# ------------------------------------------------- the 24h change, in percent
+
+def test_the_24h_change_is_derived_from_prices_not_taken_on_faith():
+    """The board rendered every major at "+0.0%" on a day CoinGecko showed BTC
+    +1.2%, ETH +3.8% and XMR -3.1%: the venue hands back a FRACTION while the
+    demo feed, the test fixtures and the dashboard formatter all speak percent,
+    so the number printed 100x too small.
+
+    Open and last are both in the payload, so the percentage is computable —
+    which is right under either convention and does not need to be re-guessed
+    the day the venue changes its mind."""
+    from bingxbot.exchange.rest import _change_pct
+    # a +3.8% session, with the venue reporting the fraction
+    row = {"openPrice": "1000", "priceChangePercent": "0.038", "priceChange": "38"}
+    assert _change_pct(row, 1038.0) == pytest.approx(3.8, abs=1e-9)
+    # ...and the same session with the venue reporting percent: same answer
+    row = {"openPrice": "1000", "priceChangePercent": "3.8", "priceChange": "38"}
+    assert _change_pct(row, 1038.0) == pytest.approx(3.8, abs=1e-9)
+
+
+def test_absolute_change_is_the_second_choice_when_open_is_absent():
+    from bingxbot.exchange.rest import _change_pct
+    assert _change_pct({"priceChange": "-31"}, 969.0) == pytest.approx(-3.1, abs=1e-9)
+
+
+def test_the_venue_field_is_a_last_resort_and_is_never_rescaled_on_a_guess():
+    """A 'looks small, must be a fraction' heuristic would turn a real -0.4%
+    session into -40%. With nothing to derive from, the field passes through
+    unchanged rather than being multiplied by a guess."""
+    from bingxbot.exchange.rest import _change_pct
+    assert _change_pct({"priceChangePercent": "-0.4"}, 100.0) == pytest.approx(-0.4)
+    assert _change_pct({}, 100.0) == 0.0
+
+
+def test_a_zero_or_missing_price_cannot_divide_by_zero():
+    from bingxbot.exchange.rest import _change_pct
+    for row, last in (({"openPrice": "0"}, 100.0), ({"openPrice": "100"}, 0.0),
+                      ({"priceChange": "5"}, 0.0), ({"priceChange": "100"}, 100.0)):
+        v = _change_pct(row, last)
+        assert isinstance(v, float) and v == v      # finite, no exception
+
+
+def test_a_flat_session_reads_as_flat():
+    from bingxbot.exchange.rest import _change_pct
+    assert _change_pct({"openPrice": "500"}, 500.0) == pytest.approx(0.0)

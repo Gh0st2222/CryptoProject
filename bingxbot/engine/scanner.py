@@ -412,6 +412,7 @@ class MarketScanner:
         # most confusing state this component can be in, and it used to carry no
         # explanation at all.
         self.seats: dict = {}
+        self.coverage: dict = {}   # listed -> eligible -> on the board
         self.scans = 0
         self.error = ""
 
@@ -505,6 +506,12 @@ class MarketScanner:
                     log.debug("radar 4h read %s: %s", sym, e)
         self.top_volume = top_volume_universe(tickers, 10, allowed)
         self.rows = rank_universe(premium, tickers, trend, allowed=allowed)[:24]
+        # WHY THE BOARD LOOKS LIKE THIS. Held up against a market-cap ranking the
+        # board reads as though names are missing, and there was no way to tell a
+        # symbol the venue does not list from one the eligibility list refused
+        # from one the volume floor dropped. Three counts and the actual names
+        # settle it without anyone having to guess.
+        self.coverage = self._coverage(premium, tickers, allowed)
         self.ts = time.time()
         self.scans += 1
         self.error = ""
@@ -518,12 +525,46 @@ class MarketScanner:
             await self.orch._notify("radar")
         return self.rows
 
+    def _coverage(self, premium: list[dict], tickers: list[dict],
+                  allowed: set[str]) -> dict:
+        """Where the venue's symbols went: listed -> eligible -> on the board.
+
+        Compared against a market-cap ranking the board reads as though large
+        names are absent, and nothing distinguished the three ways that happens:
+        the venue does not list the perp at all, the eligibility list refused it,
+        or it cleared eligibility and fell below the display volume floor. The
+        refused names are listed outright so "why is BNB not here" is a lookup
+        rather than an inference."""
+        vol = {t["symbol"]: t for t in tickers}
+        listed = [p["symbol"] for p in premium if p.get("symbol") in vol]
+        clean = [s for s in listed if clean_perp(s)]
+        eligible = [s for s in clean if _base(s) in allowed]
+        shown = {r["symbol"] for r in self.rows}
+        thin = sorted(s for s in eligible
+                      if s not in shown
+                      and vol[s].get("quote_volume", 0.0) < MIN_QVOL_USDT)
+        refused = sorted(_base(s) for s in clean if _base(s) not in allowed)
+        return {
+            "venue_symbols": len(listed),
+            "clean_format": len(clean),
+            "eligible": len(eligible),
+            "on_board": len(self.rows),
+            # eligible, liquid, and still not shown => the 24-row display cap
+            "cut_by_display_cap": max(0, len(eligible) - len(thin) - len(self.rows)),
+            "cut_by_volume_floor": len(thin),
+            "min_qvol_usdt": MIN_QVOL_USDT,
+            # the interesting one: listed on the venue, sane symbol, and the
+            # eligibility universe still said no
+            "refused_by_universe": refused[:40],
+            "refused_count": len(refused),
+        }
+
     def snapshot(self) -> dict:
         age = self.universe.age_s()
         return {"ts": int(self.ts * 1000), "demo": self.demo, "scans": self.scans,
                 "error": self.error, "rows": self.rows, "top_volume": self.top_volume,
                 "probed": sum(1 for r in self.rows if r.get("probed")),
-                "seats": self.seats,
+                "seats": self.seats, "coverage": self.coverage,
                 "universe": {"source": self.universe.source,
                              "count": len(self.universe.allowed()),
                              "age_min": int(age / 60) if age >= 0 else None}}

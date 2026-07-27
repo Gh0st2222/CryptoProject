@@ -25,6 +25,33 @@ from .models import BookTop, Candle, ContractSpec, DepthSnapshot
 log = logging.getLogger("bingx.rest")
 
 
+def _change_pct(row: dict, last: float) -> float:
+    """24h price change in PERCENT (1.2 means +1.2%).
+
+    DERIVED wherever the payload allows it, instead of trusting
+    `priceChangePercent`, whose unit is not the one the rest of this codebase
+    uses. The radar board rendered every major at "+0.0%" / "-0.0%" on a day
+    CoinGecko showed BTC +1.2%, ETH +3.8% and XMR -3.1% — the venue hands back a
+    FRACTION (-0.01 for -1%) while the demo feed, the test fixtures and the
+    dashboard formatter all speak percent, so the number was being printed 100x
+    too small.
+
+    Multiplying by 100 would fix today and break the day the venue changes its
+    mind, and a "looks small, must be a fraction" heuristic would turn a real
+    -0.4% session into -40%. Both open and absolute change are in the same
+    payload, so the percentage is computable exactly; the venue's own field is
+    the last resort, kept as-is rather than rescaled on a guess."""
+    op = safe_float(row.get("openPrice"))
+    if op > 0 and last > 0:
+        return (last / op - 1.0) * 100.0
+    chg = safe_float(row.get("priceChange"))
+    if chg and last > 0:
+        prev = last - chg
+        if prev > 0:
+            return (chg / prev) * 100.0
+    return safe_float(row.get("priceChangePercent"))
+
+
 class BingXRest:
     def __init__(
         self,
@@ -278,7 +305,7 @@ class BingXRest:
                 "symbol": sym,
                 "last": last,
                 "quote_volume": max(qv, base_vol * last),
-                "change_pct": safe_float(row.get("priceChangePercent")),
+                "change_pct": _change_pct(row, last),
             })
         return out
 
