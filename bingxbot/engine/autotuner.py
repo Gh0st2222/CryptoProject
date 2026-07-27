@@ -33,7 +33,7 @@ from ..strategy.regime_profile import build_profile, classify_era, dominant_regi
 from ..util import clamp, interval_ms
 from .backtest import TUNABLES, WARMUP_BARS as BACKTEST_WARMUP, _coerce
 from .search import (STATE_PATH, DEOptimizer, fold_composite, portfolio_folds,
-                     robust_aggregate, score_fold, validate_params_portfolio)
+                     score_fold, validate_params_portfolio)
 
 log = logging.getLogger("autotuner")
 
@@ -268,14 +268,20 @@ MAX_TRAIN_FOLDS = 8
 def _train_fold_count(train_bars: int, workers: int) -> int:
     """How many folds to carve the training window into.
 
-    Set by EVIDENCE first: every fold must clear MIN_TRAIN_TRADED_BARS after
-    paying its warmup. Workers only ever make folds LONGER (a small host gets
-    fewer, wider folds, which is strictly better evidence); they can no longer
-    shred the window to fill cores. Parallel width is recovered by sharding the
-    candidate list instead -- see _shard_candidates."""
+    Set by EVIDENCE: every fold must clear MIN_TRAIN_TRADED_BARS after paying
+    its warmup. Workers only ever make folds LONGER (a small host gets fewer,
+    wider folds, which is strictly better evidence); they can no longer shred
+    the window to fill cores. Parallel width is recovered by sharding the
+    candidate list instead -- see _shard_candidates.
+
+    There is deliberately no second floor at MIN_FOLD_BARS. That constant asks
+    whether a fold is long enough to BACKTEST (450 bars); this asks whether it
+    is long enough to MEAN anything (1700), and the second is always the binding
+    one. A `min` against an unreachable term reads like a safety net and is
+    dead weight -- an unreachable branch in the fold-count rule is how the
+    450-traded-bar geometry survived unnoticed in the first place."""
     by_len = max(1, train_bars // (MIN_TRAIN_TRADED_BARS + BACKTEST_WARMUP))
-    by_data = max(1, train_bars // MIN_FOLD_BARS)
-    return int(clamp(min(workers, by_len, by_data), 1, MAX_TRAIN_FOLDS))
+    return int(clamp(min(workers, by_len), 1, MAX_TRAIN_FOLDS))
 
 
 def _shard_candidates(n_units: int, workers: int, n_cands: int,
@@ -901,9 +907,9 @@ class AutoTuner:
         co_fits = [ff for ff in per_unit[len(folds):] if ff]
         if not fold_fits:
             return False
-        robust = [robust_aggregate(list(fc)) for fc in zip(*fold_fits)]
+        robust = [fold_composite(list(fc)) for fc in zip(*fold_fits)]
         if co_fits:   # equal say to each symbol, so neither can carry a set alone
-            robust_co = [robust_aggregate(list(fc)) for fc in zip(*co_fits)]
+            robust_co = [fold_composite(list(fc)) for fc in zip(*co_fits)]
             robust = [0.5 * (a + b) for a, b in zip(robust, robust_co)]
         p = len(self.de.pop)
         if need_members:
@@ -1548,7 +1554,7 @@ class AutoTuner:
                                    for i in range(len(folds))) if ff]
         if not fold_fits:
             return
-        robust = [robust_aggregate(list(fc)) for fc in zip(*fold_fits)]
+        robust = [fold_composite(list(fc)) for fc in zip(*fold_fits)]
         p = len(de.pop)
         if need_members:
             member_fit, trial_fit = robust[:p], robust[p:p + len(trials)]

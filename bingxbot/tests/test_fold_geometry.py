@@ -18,6 +18,26 @@ same window, same candidates, same OOS truth, so only fold length differs:
 
 Population median OOS return was +2.77%: at 8 folds the ten sets the search
 nominated were WORSE than a random draw.
+
+That measures ranking correlation, which is not what an owner receives. So the
+search was also run FOR REAL under the old and new configurations -- 8 paired
+seeds, 30 generations each, same window, same judged folds -- and the top 5 of
+every run were put through the actual judge:
+
+  measure (NEW - OLD)          wins    median delta
+  best of top-k, OOS return     8/8       +33.7pp
+  median of top-k               8/8       +16.5pp
+  worst of top-k                8/8       +10.6pp
+  top-k that made money         8/8         +3 of 5
+
+  OLD: 14 of 40 nominated sets profitable, median  -0.34%
+  NEW: 40 of 40 nominated sets profitable, median +16.11%
+
+Every pair on every measure, and the trade count moved DOWN (median 120-166 per
+judged window before, 71-119 after): better selection, not more activity. The
+magnitudes belong to synthetic_candles, a near-efficient generator, and are not
+a forecast of BingX returns -- but both arms saw identical data, so the
+comparison holds.
 """
 import pytest
 
@@ -98,6 +118,29 @@ def test_a_failed_shard_never_becomes_a_verdict():
     assert _stitch([None, [2.0, 4.0]], 4, 2) is None
     assert _stitch([[1.0], [2.0]], 4, 2) is None
     assert _stitch([[1.0, 3.0]], 4, 2) is None
+
+
+def _slow_square(x: float, delay: float) -> float:
+    """Module-level so the process pool can pickle it. The delay is reversed
+    across the inputs, so a pool that returned results as they COMPLETE would
+    give a different order than the one they were submitted in."""
+    import time
+    time.sleep(delay)
+    return x * x
+
+
+async def test_map_cpu_returns_results_in_argument_order():
+    """The sharding stitches by POSITION -- raw[i*sh:(i+1)*sh] must be unit i's
+    shards. If the pool ever returned completion-ordered results instead, every
+    candidate would silently inherit another candidate's fitness and the search
+    would keep running on scrambled scores."""
+    from bingxbot.config import BotConfig
+    from bingxbot.server.orchestrator import Orchestrator
+
+    orch = Orchestrator(BotConfig())
+    n = 6
+    args = [(float(i), 0.02 * (n - i)) for i in range(n)]   # slowest submitted first
+    assert await orch.map_cpu(_slow_square, args) == [float(i * i) for i in range(n)]
 
 
 @pytest.mark.parametrize("shards", [2, 3])

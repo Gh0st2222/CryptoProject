@@ -23,9 +23,10 @@ import json
 
 import pytest
 
+import bingxbot.engine.autotuner as autotuner
+import bingxbot.engine.search as search
 from bingxbot.engine.autotuner import _oos_composite
-from bingxbot.engine.search import (OBJECTIVE_VER, DEOptimizer, fold_composite,
-                                    robust_aggregate)
+from bingxbot.engine.search import OBJECTIVE_VER, DEOptimizer, fold_composite
 
 
 def test_the_judge_and_the_search_score_folds_identically():
@@ -33,7 +34,17 @@ def test_the_judge_and_the_search_score_folds_identically():
     re-implements either side, this fails."""
     for fits in ([1.0], [-2.0, 0.5, 3.0], [0.4, 0.4, 0.4, -9.0],
                  [-1.0, -1.0, -1.0], [5.0, -0.2, 1.1, 0.9, 2.2]):
-        assert _oos_composite(fits) == fold_composite(fits) == robust_aggregate(fits)
+        assert _oos_composite(fits) == fold_composite(fits)
+
+
+def test_there_is_only_one_aggregator_left():
+    """The divergence started as two NAMES for what should have been one
+    concept, each free to drift. robust_aggregate (a pass-through) and
+    recency_weights (a ramp nothing preferred) are gone; re-introducing a
+    second way to score folds is the bug, not a refactor."""
+    for dead in ("robust_aggregate", "recency_weights"):
+        assert not hasattr(search, dead), f"search.{dead} is back"
+        assert not hasattr(autotuner, dead), f"autotuner.{dead} is back"
 
 
 def test_the_blend_is_median_and_worst():
@@ -45,13 +56,14 @@ def test_the_blend_is_median_and_worst():
     assert fold_composite([2.0, 4.0, 6.0]) == pytest.approx(0.7 * 4.0 + 0.3 * 2.0)
 
 
-def test_weights_are_accepted_and_ignored():
-    """`robust_aggregate` kept its weights parameter so old call sites still
-    work, but recency weighting is no longer part of the objective. Passing
-    weights must not change the answer -- otherwise the two sides diverge
-    exactly where one of them happens to pass them."""
+def test_fold_order_does_not_change_the_score():
+    """Recency weighting used to make the objective depend on which fold came
+    last. It no longer does, and the judge's folds and the search's are built in
+    different orders -- so an order-sensitive score would silently mean two
+    different things on the two sides."""
     fits = [-1.0, 0.5, 2.0, 0.1]
-    assert robust_aggregate(fits, [1.0, 2.0, 3.0, 4.0]) == robust_aggregate(fits)
+    assert fold_composite(fits) == fold_composite(list(reversed(fits)))
+    assert fold_composite(fits) == fold_composite(sorted(fits))
 
 
 def test_empty_folds_score_worse_than_any_real_candidate():
