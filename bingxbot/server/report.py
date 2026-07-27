@@ -19,7 +19,7 @@ from dataclasses import asdict as dc_asdict
 
 from ..config import config_public_dict
 from ..data.feed import bars_overdue
-from ..engine.autotuner import MIN_OOS_TRADED_BARS
+from ..engine.autotuner import MIN_OOS_TRADED_BARS, MIN_TRAIN_TRADED_BARS
 from ..engine.tradability import symbol_economics
 from ..strategy.regime_profile import stands_down
 from ..util import interval_ms, now_ms
@@ -408,6 +408,23 @@ def build_report(orch) -> str:
                            f"effectively unreachable — widen the lookback or "
                            f"expect no champions."),
             })
+        # The judge's folds were widened once this was measured; the SEARCH's
+        # were still cut to fill cores, so it nominated the ten sets the judge
+        # would see from folds too short to produce five trades. A search that
+        # ranks noise and a gate that refuses everything look the same from
+        # outside — no champions — so both fold lengths are stated.
+        ttb = lc.get("train_traded_bars")
+        if isinstance(ttb, (int, float)) and 0 < ttb < MIN_TRAIN_TRADED_BARS:
+            findings.append({
+                "level": "WARN", "check": "training-folds-too-short",
+                "detail": (f"each search fold trades {int(ttb)} bars, under the "
+                           f"{MIN_TRAIN_TRADED_BARS} its objective needs. Measured "
+                           f"at 450: two thirds of evaluations never reach five "
+                           f"trades, so fitness returns its placeholder ramp and "
+                           f"the search ranks candidates against out-of-sample "
+                           f"return at rho +0.01 — the top-k it nominates is "
+                           f"worse than a random draw."),
+            })
         bar, bf = lc.get("bar"), lc.get("best_fitness")
         if (isinstance(bar, (int, float)) and isinstance(bf, (int, float))
                 and at is not None and at.cycles >= 25 and not at.improvements
@@ -417,8 +434,9 @@ def build_report(orch) -> str:
                 "detail": (f"the best challenger in {at.cycles} cycles scored "
                            f"{bf:+.2f} against a bar of {bar:+.2f} — not close. "
                            f"A bar nothing approaches is not selectivity, it is "
-                           f"a closed gate; check the judged-fold length and the "
-                           f"scale MIN_ABS_FITNESS is written on."),
+                           f"a closed gate; check both fold lengths above — the "
+                           f"judged folds and the search's — since a challenger "
+                           f"can only be as good as the folds that found it."),
             })
 
         # 6b) DEAD OR MERELY SLOW. "Nothing is trading" is the single most common

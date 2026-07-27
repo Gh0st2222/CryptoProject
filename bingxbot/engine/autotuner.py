@@ -1359,7 +1359,13 @@ class AutoTuner:
             # These are the numbers that tell the two apart, and the report's
             # self-check reads them.
             "oos_folds": nf_oos,
-            "oos_traded_bars": max(0, min(len(v) for v in folds_cbs[0].values()) - 300),
+            "oos_traded_bars": max(0, min(len(v) for v in folds_cbs[0].values())
+                                  - BACKTEST_WARMUP),
+            # ...and the same two numbers for the SEARCH's folds, which is where
+            # the evidence was actually missing: they were set by core count, not
+            # by length, and two thirds of evaluations never reached five trades.
+            "train_folds": nf,
+            "train_traded_bars": max(0, min(len(f) for f in folds) - BACKTEST_WARMUP),
             "champ_oos_trades": champ_trades,
             "champ_oos_return": round(champ_ret, 4),
             "best_oos_trades": int(best_pool.get("trades", 0) or 0) if best else None,

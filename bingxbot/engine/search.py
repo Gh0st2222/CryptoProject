@@ -262,7 +262,28 @@ class DEOptimizer:
         crossed with the member (at least one gene forced from the mutant).
         F is drawn fresh per trial from [0.4, 0.9] — standard dither, which
         keeps both large exploratory and small refining steps in play instead
-        of one fixed step size for the whole run."""
+        of one fixed step size for the whole run.
+
+        SELF-ADAPTATION WAS MEASURED AND IS NOT WORTH IT. jDE (Brest et al.
+        2006) — every member carrying its own F and CR, re-rolled with
+        probability tau and adopted only when the trial wins — was raced
+        against this over 12 paired seeds, same folds, same 40-generation
+        budget, judged on the out-of-sample return of what each run nominates:
+
+            best training score          7/12 wins   median delta +0.153
+            OOS of the single best       7/12 wins   median delta +0.017
+            OOS median of the top 3      6/12 wins   median delta -0.001
+            population diversity         6/12 wins   median delta -0.015
+
+        A coin flip on every measure. An earlier 4-seed run looked like a clear
+        jDE win (+6.12% vs +1.01% median OOS) and did not survive more seeds —
+        the seed dominates the variance, so anything less than a paired design
+        with double digits of them will just report noise.
+
+        The lesson generalizes: when the search underperformed it was never the
+        mutation operator, it was the objective being climbed (fold_composite)
+        and the folds it was measured on (_train_fold_count). Fix what the
+        search is aiming at before reaching for a cleverer way to aim."""
         n = len(self.pop)
         out = []
         for i in range(n):
