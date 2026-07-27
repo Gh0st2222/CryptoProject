@@ -32,7 +32,7 @@ from ..exchange.models import ContractSpec
 from ..strategy.regime_profile import build_profile, classify_era, dominant_regime
 from ..util import clamp, interval_ms
 from .backtest import TUNABLES, _coerce
-from .search import (STATE_PATH, DEOptimizer, portfolio_folds, recency_weights,
+from .search import (STATE_PATH, DEOptimizer, fold_composite, portfolio_folds,
                      robust_aggregate, score_fold, validate_params_portfolio)
 
 log = logging.getLogger("autotuner")
@@ -282,12 +282,13 @@ def _centroid(param_sets: list[dict]) -> dict:
 
 
 def _oos_composite(fits: list[float]) -> float:
-    """Blend of the TYPICAL fold (median) and the WORST fold. The old mean
-    blend let one parabolic window buy the seat: fold fits of [+21, +0.9,
-    -2.4] composited to 3.7 and promoted a set whose most recent window lost
-    money outright. The median demands profit in the typical window; the
-    worst-fold term keeps the tail priced in."""
-    return 0.7 * statistics.median(fits) + 0.3 * min(fits)
+    """The judge's per-candidate score — now literally the same function the
+    SEARCH maximizes (search.fold_composite), so the two cannot drift apart.
+
+    The old mean blend let one parabolic window buy the seat: fold fits of
+    [+21, +0.9, -2.4] composited to 3.7 and promoted a set whose most recent
+    window lost money outright."""
+    return fold_composite(fits)
 
 
 def _oos_fold_count(cbs: dict[str, list], tail_frac: float = OOS_TAIL_FRAC,
@@ -817,11 +818,9 @@ class AutoTuner:
         co_fits = [ff for ff in raw_fits[len(folds):] if ok(ff)]
         if not fold_fits:
             return False
-        robust = [robust_aggregate(list(fc), recency_weights(len(fold_fits)))
-                  for fc in zip(*fold_fits)]
+        robust = [robust_aggregate(list(fc)) for fc in zip(*fold_fits)]
         if co_fits:   # equal say to each symbol, so neither can carry a set alone
-            robust_co = [robust_aggregate(list(fc), recency_weights(len(co_fits)))
-                         for fc in zip(*co_fits)]
+            robust_co = [robust_aggregate(list(fc)) for fc in zip(*co_fits)]
             robust = [0.5 * (a + b) for a, b in zip(robust, robust_co)]
         p = len(self.de.pop)
         if need_members:
@@ -1454,8 +1453,7 @@ class AutoTuner:
         fold_fits = [ff for ff in fold_fits if ff and len(ff) == len(candidates)]
         if not fold_fits:
             return
-        w = recency_weights(len(fold_fits))
-        robust = [robust_aggregate(list(fc), w) for fc in zip(*fold_fits)]
+        robust = [robust_aggregate(list(fc)) for fc in zip(*fold_fits)]
         p = len(de.pop)
         if need_members:
             member_fit, trial_fit = robust[:p], robust[p:p + len(trials)]

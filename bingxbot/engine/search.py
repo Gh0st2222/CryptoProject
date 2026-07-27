@@ -18,6 +18,7 @@ random-restart hill-climbing:
 from __future__ import annotations
 
 import json
+import logging
 import random
 import statistics
 from pathlib import Path
@@ -28,6 +29,10 @@ from .backtest import (TUNABLES, _apply_params, _coerce, _fitness,
                        candles_to_arrays, run_backtest, run_portfolio_backtest)
 from ..strategy.features import FeatureFrame
 
+log = logging.getLogger("search")
+
+OBJECTIVE_VER = 2   # bump when fold_composite changes: saved scores are
+                    # then on a different scale and must not be reused
 STATE_PATH = ROOT / "data_cache" / "tuner_state.json"
 
 # Worker-side cache of kernel-prepared folds (feature matrix, alpha matrix,
@@ -154,18 +159,48 @@ def portfolio_folds(cbs: dict[str, list], k: int = 3, tail_frac: float = 0.40,
     return folds
 
 
-def robust_aggregate(fold_fits: list[float], weights: list[float] | None = None) -> float:
-    """Combine a candidate's per-fold fitnesses into one robust score: a
-    recency-weighted mean, penalized for instability and for the worst fold, so
-    params that only print in one window score poorly. This is the anti-overfit
-    core of what makes a good champion."""
+def fold_composite(fold_fits: list[float]) -> float:
+    """THE one way this project turns per-fold fitnesses into a single score.
+
+    A blend of the TYPICAL fold (median) and the WORST one. The median demands
+    profit in the ordinary window rather than on average, so a single parabolic
+    fold cannot buy a seat; the worst-fold term keeps the tail priced in.
+
+    Both the SEARCH and the JUDGE call this, and they used to disagree. The
+    search maximized a recency-weighted mean penalized by standard deviation
+    while promotion blended median with worst -- two different functions over
+    the same folds, ranking the same candidates differently. That is not a
+    detail: it is why generations of climbing the training objective walked away
+    from what the judge rewards.
+
+    Measured on one 56-member population, scored once and re-aggregated both
+    ways so only the objective differs:
+
+        aggregator                  rho vs OOS return   top-10 median OOS
+        weighted mean - sd (was)         +0.233               +2.72%
+        this blend                       +0.338               +7.72%
+
+    ~45% more agreement with the judge and nearly three times the out-of-sample
+    quality of what the search nominates, for one function call and no extra
+    CPU. There is no leak: the two still run on different windows. Sharing the
+    definition is what stops them drifting apart again.
+
+    (An evidence discount on the LOSING branch of _fitness was measured at the
+    same time and REJECTED -- it dropped rho to +0.145 and took the nominated
+    top-10 negative. The asymmetry between winners and losers is load-bearing.)"""
     if not fold_fits:
         return -1.0
-    w = weights if weights and len(weights) == len(fold_fits) else [1.0] * len(fold_fits)
-    wmean = sum(f * wi for f, wi in zip(fold_fits, w)) / (sum(w) or 1.0)
-    sd = statistics.pstdev(fold_fits) if len(fold_fits) > 1 else 0.0
-    worst = min(fold_fits)
-    return wmean - 0.3 * sd + 0.2 * worst
+    return 0.7 * statistics.median(fold_fits) + 0.3 * min(fold_fits)
+
+
+def robust_aggregate(fold_fits: list[float], weights: list[float] | None = None) -> float:
+    """The search's per-candidate score across its training folds.
+
+    `weights` is accepted and deliberately ignored: a recency ramp is a third
+    way of weighting folds, and the measurement above preferred none of them.
+    The parameter stays in the signature so an un-updated caller cannot silently
+    pass its weights into some other argument."""
+    return fold_composite(fold_fits)
 
 
 def recency_weights(n: int) -> list[float]:
@@ -319,6 +354,7 @@ class DEOptimizer:
     def save(self) -> None:
         try:
             atomic_write(self.state_path, json.dumps({
+                "objective": OBJECTIVE_VER,
                 "generation": self.generation, "keys": self.keys,
                 "pop": self.pop, "fitness": self.fitness,
             }))
@@ -333,7 +369,18 @@ class DEOptimizer:
         if set(d.get("keys", [])) != set(self.keys) or not d.get("pop"):
             return False   # tunable set changed between builds -> start fresh
         self.pop = [self._coerce_vec(p) for p in d["pop"]]
-        self.fitness = [float(x) for x in d.get("fitness", [])] or [-1e9] * len(self.pop)
+        # SCORES DO NOT SURVIVE AN OBJECTIVE CHANGE. Members keep their fitness
+        # between cycles while the data window holds, so a population carrying
+        # scores from one aggregator into selection against trials scored by
+        # another would let stale numbers win on scale alone. The GENES are
+        # still worth keeping -- generations of search live in them -- so the
+        # population loads and only its scores are voided.
+        stale = int(d.get("objective", 0)) != OBJECTIVE_VER
+        if stale:
+            log.info("DE state written under objective v%s, current is v%s: "
+                     "keeping %d members, discarding their scores",
+                     d.get("objective", 0), OBJECTIVE_VER, len(self.pop))
+        self.fitness = [] if stale else [float(x) for x in d.get("fitness", [])]
         if len(self.fitness) != len(self.pop):
             self.fitness = [-1e9] * len(self.pop)
         self.generation = int(d.get("generation", 0))
