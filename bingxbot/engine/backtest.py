@@ -49,6 +49,12 @@ EVIDENCE_K = 15.0   # trades at which a winning window keeps half its raw score.
                     # still out-ranks a 40-trade window with genuine growth,
                     # which is the exact pattern that produced the vault's
                     # weak, fast-decaying champions.
+WARMUP_BARS = 300   # bars a window spends building indicators before it can
+                    # decide anything. Named because it is the conversion factor
+                    # between a fold's LENGTH and its EVIDENCE, and having it as
+                    # a bare default in four signatures is how the search ended
+                    # up running 450-traded-bar folds while the judge, whose
+                    # folds carry warmup as a lead-in, was measured to need 900.
 ASSUMED_SPREAD_BPS = 1.0
 EV_MARGIN = 0.02            # P(win) must clear the cost-adjusted breakeven prob by this
 FILL_THROUGH_BPS = 1.0      # a resting limit fills only when price trades THROUGH it
@@ -451,7 +457,7 @@ def run_backtest(
     starting_balance: float = 10_000.0,
     taker_fee: float = 0.0005,
     slippage_bps: float = 1.5,
-    warmup: int = 300,
+    warmup: int = WARMUP_BARS,
     progress_cb=None,
     collect_series: bool = True,
     ff=None,
@@ -530,7 +536,7 @@ def run_portfolio_backtest(
     starting_balance: float = 10_000.0,
     taker_fee: float = 0.0005,
     slippage_bps: float = 1.5,
-    warmup: int = 300,
+    warmup: int = WARMUP_BARS,
     progress_cb=None,
     use_meta: bool = True,
 ) -> dict:

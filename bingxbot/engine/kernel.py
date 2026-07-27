@@ -40,6 +40,7 @@ except Exception:  # noqa: BLE001 — kernel is an optimization, never a depende
         return deco if not (len(a) == 1 and callable(a[0])) else a[0]
 
 from ..strategy.alphas import ALPHAS, ALPHA_META, DESK_ORDER
+from .backtest import WARMUP_BARS
 from ..strategy.regime import (DESK_TILTS, REGIME_DESK_MULT, REGIME_EXIT_MULT,
                                detect_regime)
 
@@ -1012,7 +1013,7 @@ P_MKEXIT = P["maker_exits"]; P_TILT = P["desk_tilt"]
 
 
 def kernel_fitness(ff, strat, risk, spec, taker: float, slip_bps: float,
-                   interval: str, warmup: int = 300,
+                   interval: str, warmup: int = WARMUP_BARS,
                    starting_balance: float = 10_000.0) -> dict:
     """Run the kernel over a prepared FeatureFrame and return _fitness-compatible
     stats. Raises if numba is unavailable — callers fall back to Python."""
@@ -1021,7 +1022,7 @@ def kernel_fitness(ff, strat, risk, spec, taker: float, slip_bps: float,
 
 
 def kernel_fitness_prepped(prep, strat, risk, spec, taker: float, slip_bps: float,
-                           interval: str, warmup: int = 300,
+                           interval: str, warmup: int = WARMUP_BARS,
                            starting_balance: float = 10_000.0) -> dict:
     """kernel_fitness for an already-PREPARED fold (feats, amat, regs). The
     matrices depend on price only, so the tuner's worker-side cache builds

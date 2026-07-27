@@ -31,7 +31,7 @@ from ..config import MODE_IDLE
 from ..exchange.models import ContractSpec
 from ..strategy.regime_profile import build_profile, classify_era, dominant_regime
 from ..util import clamp, interval_ms
-from .backtest import TUNABLES, _coerce
+from .backtest import TUNABLES, WARMUP_BARS as BACKTEST_WARMUP, _coerce
 from .search import (STATE_PATH, DEOptimizer, fold_composite, portfolio_folds,
                      robust_aggregate, score_fold, validate_params_portfolio)
 
@@ -227,6 +227,84 @@ SPECIALIST_EVERY = 5        # per-symbol specialist (overlay) pass every N cycle
 MIN_BARS = 3000
 MIN_FOLD_BARS = 450         # a training fold below this can't produce a meaningful
                             # backtest (warmup + a real trading tail)
+
+# THE SEARCH'S FOLDS ARE QUOTED IN THE SAME UNITS AS THE JUDGE'S.
+#
+# MIN_OOS_TRADED_BARS above widened the JUDGE's folds on measured evidence, and
+# the judge's folds carry their warmup as a lead-in (portfolio_folds slices
+# cs[lo-warmup:hi]), so 900 there means 900 bars that can actually trade. The
+# search's folds are a plain contiguous split of the training window with no
+# lead-in, so a 750-bar fold spends 300 bars on indicator warmup and trades 450.
+# The two sides quoted fold length in different units and nobody converted; the
+# search was running at half the evidence the judge was measured to need.
+#
+# Fold count used to be `however many research workers there are`, up to 8. On
+# an 8-worker host that is 6000/8 = 750 bars, 450 traded. Measured on 80
+# candidates over one training window, partitioned four ways -- same window,
+# same candidates, same OOS truth, so only fold length differs:
+#
+#   folds  bars   traded   evals under the t<5 ramp   rho vs OOS return   top-10 OOS
+#     8     750     450             68.3%                   +0.010            +0.87%
+#     4    1500    1200             36.7%                   +0.156            +5.69%
+#     3    2000    1700             24.4%                   +0.222            +5.49%
+#     2    3000    2700             15.6%                   +0.204            +7.89%
+#
+# The population's median OOS return was +2.77%, so at 8 folds the ten sets the
+# search nominated were WORSE than a random draw. Two thirds of the evaluations
+# never cleared five trades, which means _fitness returned its -2.0 + 0.2t
+# placeholder ramp instead of any economics -- and for EVERY candidate the
+# `min` term of fold_composite sat in that ramp, so 30% of the objective's
+# weight was a constant. The search was not ranking strategies at all.
+#
+# 2, 3 and 4 folds are within noise of each other (SE ~0.11 at n=80) and all
+# clearly beat 8, so the choice among them is on principle, not the point
+# estimate: at 2 folds the "median" of the composite is a mean and its
+# outlier-resistance is gone. 3 is the smallest count where median means what
+# the objective intends, and 1700 traded bars is what the judge itself runs.
+MIN_TRAIN_TRADED_BARS = 1400
+MAX_TRAIN_FOLDS = 8
+
+
+def _train_fold_count(train_bars: int, workers: int) -> int:
+    """How many folds to carve the training window into.
+
+    Set by EVIDENCE first: every fold must clear MIN_TRAIN_TRADED_BARS after
+    paying its warmup. Workers only ever make folds LONGER (a small host gets
+    fewer, wider folds, which is strictly better evidence); they can no longer
+    shred the window to fill cores. Parallel width is recovered by sharding the
+    candidate list instead -- see _shard_candidates."""
+    by_len = max(1, train_bars // (MIN_TRAIN_TRADED_BARS + BACKTEST_WARMUP))
+    by_data = max(1, train_bars // MIN_FOLD_BARS)
+    return int(clamp(min(workers, by_len, by_data), 1, MAX_TRAIN_FOLDS))
+
+
+def _shard_candidates(n_units: int, workers: int, n_cands: int,
+                      min_per_shard: int = 6) -> int:
+    """Split the CANDIDATE list into this many pieces so a small number of long
+    folds still fills the research pool.
+
+    Fold count answers an evidence question and worker count answers a hardware
+    one; tying them together is what made the folds too short. The total work is
+    candidate-bars either way -- the same 6000 bars per symbol scored by the same
+    population -- so sharding candidates costs nothing but recovers the parallel
+    width that fewer folds gave up. Each worker builds its own prepped fold once
+    and _PREP_CACHE keeps it for later cycles."""
+    if n_units >= workers or n_cands <= min_per_shard:
+        return 1
+    want = -(-workers // n_units)          # ceil: enough shards to fill the pool
+    return int(clamp(min(want, n_cands // min_per_shard), 1, 8))
+
+
+def _stitch(parts: list[list[float]], total: int, shards: int) -> list[float] | None:
+    """Reassemble strided candidate shards (`cands[i::shards]`) into one list in
+    the original order. Returns None if any shard failed, so a partial result can
+    never be silently read as a fold's verdict."""
+    out: list[float | None] = [None] * total
+    for i, part in enumerate(parts):
+        if part is None or len(part) != len(out[i::shards]):
+            return None
+        out[i::shards] = part
+    return None if any(v is None for v in out) else out  # type: ignore[return-value]
 
 
 def lookback_days(interval: str) -> float:
@@ -766,13 +844,11 @@ class AutoTuner:
                         self.de.inject(c["params"])
         self.de.inject(champ)
 
-        # folds scale with the research pool: more cores -> more (finer) folds,
-        # one fold per worker, indicators built once per fold — but never so
-        # many that a fold drops below what a backtest needs (score_fold
-        # returns -1 under 360 bars; on an 8-core host with minimal data that
-        # used to zero out EVERY fold and turn DE selection into pure noise).
-        max_folds_by_data = max(1, len(train) // MIN_FOLD_BARS)
-        nf = int(clamp(min(self.orch.research_workers, max_folds_by_data), 1, 8))
+        # Fold count is an EVIDENCE question, not a core-count question: see
+        # _train_fold_count. Filling the pool with ever-finer folds is what put
+        # two thirds of the search's evaluations under _fitness's placeholder
+        # ramp and dropped its agreement with the judge to rho +0.010.
+        nf = _train_fold_count(len(train), self.orch.research_workers)
         folds = _make_folds(train, nf)
         trials = self.de.trials()
         # Only re-score the whole population when the data window changed (every
@@ -785,7 +861,7 @@ class AutoTuner:
             self._val_cache.clear()  # ...and cached OOS validations expire with it
         self._scored_ts = self._data_ts
         candidates = (list(self.de.pop) + trials) if need_members else list(trials)
-        args = [(fold, symbol, interval, spec, taker, slip, strat, risk, candidates) for fold in folds]
+        units = [(fold, symbol, spec, taker) for fold in folds]
         # CO-TRAINING. The DE used to rank candidates on ONE rotating symbol
         # while promotion judged them on the traded PORTFOLIO — two different
         # objectives, so most of the search's progress never survived contact
@@ -810,12 +886,19 @@ class AutoTuner:
                 break
         if co_folds:
             co_spec = self.orch.specs.get(co_sym, ContractSpec(co_sym))
-            args += [(fold, co_sym, interval, co_spec, co_spec.taker_fee, slip,
-                      strat, risk, candidates) for fold in co_folds]
-        raw_fits = await self.orch.map_cpu(score_fold, args, research=True)
-        ok = lambda ff: bool(ff) and len(ff) == len(candidates)   # noqa: E731
-        fold_fits = [ff for ff in raw_fits[:len(folds)] if ok(ff)]
-        co_fits = [ff for ff in raw_fits[len(folds):] if ok(ff)]
+            units += [(fold, co_sym, co_spec, co_spec.taker_fee) for fold in co_folds]
+        # Fewer, longer folds mean fewer tasks, so the candidate list is sharded
+        # across the spare workers instead. Total work is candidate-bars either
+        # way; this just spreads it.
+        sh = _shard_candidates(len(units), self.orch.research_workers, len(candidates))
+        chunks = [candidates[i::sh] for i in range(sh)]
+        args = [(u_fold, u_sym, interval, u_spec, u_taker, slip, strat, risk, ch)
+                for (u_fold, u_sym, u_spec, u_taker) in units for ch in chunks]
+        raw = await self.orch.map_cpu(score_fold, args, research=True)
+        per_unit = [_stitch(raw[i * sh:(i + 1) * sh], len(candidates), sh)
+                    for i in range(len(units))]
+        fold_fits = [ff for ff in per_unit[:len(folds)] if ff]
+        co_fits = [ff for ff in per_unit[len(folds):] if ff]
         if not fold_fits:
             return False
         robust = [robust_aggregate(list(fc)) for fc in zip(*fold_fits)]
@@ -1438,8 +1521,10 @@ class AutoTuner:
         # tagged and kept in the vault for the day the user switches interval,
         # so the inflated numbers were not harmless.
         train = _train_split(candles)
-        max_folds_by_data = max(1, len(train) // MIN_FOLD_BARS)
-        nf = int(clamp(min(self.orch.research_workers, max_folds_by_data), 1, 8))
+        # ...and the same fold GEOMETRY, for the same reason: the trial clock
+        # answers "which bar size earns more out-of-sample", which it cannot do
+        # from folds too short to produce five trades.
+        nf = _train_fold_count(len(train), self.orch.research_workers)
         folds = _make_folds(train, nf)
         trials = de.trials()
         # same steady-state economy as the primary clock: members keep their
@@ -1448,9 +1533,13 @@ class AutoTuner:
         need_members = (self._trial_scored_ts != data_ts) or any(f <= -1e8 for f in de.fitness)
         self._trial_scored_ts = data_ts
         candidates = (list(de.pop) + trials) if need_members else list(trials)
-        args = [(fold, symbol, interval, spec, taker, slip, strat, risk, candidates) for fold in folds]
-        fold_fits = await self.orch.map_cpu(score_fold, args, research=True)
-        fold_fits = [ff for ff in fold_fits if ff and len(ff) == len(candidates)]
+        sh = _shard_candidates(len(folds), self.orch.research_workers, len(candidates))
+        chunks = [candidates[i::sh] for i in range(sh)]
+        args = [(fold, symbol, interval, spec, taker, slip, strat, risk, ch)
+                for fold in folds for ch in chunks]
+        raw = await self.orch.map_cpu(score_fold, args, research=True)
+        fold_fits = [ff for ff in (_stitch(raw[i * sh:(i + 1) * sh], len(candidates), sh)
+                                   for i in range(len(folds))) if ff]
         if not fold_fits:
             return
         robust = [robust_aggregate(list(fc)) for fc in zip(*fold_fits)]
