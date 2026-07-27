@@ -87,6 +87,11 @@ class Position:
     take_profit: float = 0.0
     entry_fee: float = 0.0
     entry_reason: str = ""
+    entry_regime: str = ""    # the market this trade was OPENED into. Carried as
+                              # a field rather than parsed back out of
+                              # entry_reason, so a champion's per-regime record
+                              # is built from its own trades instead of from a
+                              # median over a handful of era scores.
     entry_bar_ts: int = 0     # bar timestamp at entry (time stop)
     breakeven_moved: bool = False
     trail_price: float = 0.0  # high-water (LONG) / low-water (SHORT) for trailing
@@ -123,6 +128,7 @@ class TradeRecord:
     fees: float
     reason_open: str
     reason_close: str
+    entry_regime: str = ""   # the market this trade was opened into
     r_multiple: float = 0.0  # pnl / planned risk
     mode: str = "paper"
     mae_r: float = 0.0       # max adverse excursion, in R (how far it went against us)

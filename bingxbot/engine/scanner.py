@@ -126,10 +126,16 @@ def annualize_funding(rate_8h: float) -> float:
 
 def trend_read_4h(closes: np.ndarray) -> dict:
     """Compact 4h trend snapshot from raw closes: Kaufman ER (quality),
-    EMA-stack direction, and ATR-ish volatility for stop geometry."""
+    EMA-stack direction, and ATR-ish volatility for stop geometry.
+
+    `probed` says whether these numbers are a MEASUREMENT. Too few bars back is
+    not a flat market, and a symbol nobody spent a klines call on is not a
+    symbol with no trend — but both used to leave the same 0.0/0/0.0 behind,
+    published on the board as if measured and read by the seat planner as if
+    the trend had died."""
     n = len(closes)
     if n < 40:
-        return {"er": 0.0, "dir": 0, "atr_pct": 0.0}
+        return {"er": 0.0, "dir": 0, "atr_pct": 0.0, "probed": False}
     c = closes
     net = abs(float(c[-1] - c[-21]))
     path = float(np.sum(np.abs(np.diff(c[-21:])))) or 1e-12
@@ -142,7 +148,8 @@ def trend_read_4h(closes: np.ndarray) -> dict:
         e55 += a55 * (float(x) - e55)
     d = 1 if e21 > e55 * 1.0005 else (-1 if e21 < e55 * 0.9995 else 0)
     rets = np.abs(np.diff(c[-31:]) / np.maximum(c[-31:-1], 1e-12))
-    return {"er": round(er, 3), "dir": d, "atr_pct": round(float(np.mean(rets)) * 1.6, 5)}
+    return {"er": round(er, 3), "dir": d,
+            "atr_pct": round(float(np.mean(rets)) * 1.6, 5), "probed": True}
 
 
 def rank_universe(premium: list[dict], tickers: list[dict],
@@ -167,6 +174,7 @@ def rank_universe(premium: list[dict], tickers: list[dict],
             continue
         apr = annualize_funding(p.get("funding_rate", 0.0))
         tr = trend.get(sym, {})
+        probed = bool(tr.get("probed", False))
         er, tdir = tr.get("er", 0.0), tr.get("dir", 0)
         # receiving side of the funding payment (longs pay shorts when +)
         side = "SHORT" if apr > 0 else "LONG"
@@ -192,7 +200,13 @@ def rank_universe(premium: list[dict], tickers: list[dict],
             "next_funding_time": p.get("next_funding_time", 0),
             "quote_volume": qv,
             "change_24h": t.get("change_pct", 0.0),
-            "er_4h": er, "dir_4h": tdir, "atr_pct_4h": tr.get("atr_pct", 0.0),
+            # None, not 0.0, when nobody measured this symbol: the board showed
+            # LINK/LTC/AVAX at "ER 0.00, ATR 0.00" as though they were dead
+            # markets when in truth they had simply never been probed.
+            "er_4h": er if probed else None,
+            "dir_4h": tdir if probed else None,
+            "atr_pct_4h": tr.get("atr_pct", 0.0) if probed else None,
+            "probed": probed,
             "carry_side": side,
             "kind": kind,
             "score": round(0.65 * carry_score + 0.35 * trend_score, 4),
@@ -236,10 +250,24 @@ def plan_adoption(rows: list[dict], adopted: set[str], user: set[str],
 
     def keeps_seat(sym: str) -> bool:
         r = by_sym.get(sym)
-        return (sym not in blocked
-                and r is not None and r.get("dir_4h", 0) != 0
-                and r.get("er_4h", 0.0) >= KEEP_ER
-                and r.get("quote_volume", 0.0) >= TREND_MIN_QVOL)
+        if r is None or sym in blocked:
+            return False
+        # Liquidity is read off the ticker and is always known, so it is checked
+        # whether or not anyone probed the trend.
+        if r.get("quote_volume", 0.0) < TREND_MIN_QVOL:
+            return False
+        # AN UNMEASURED TREND KEEPS ITS SEAT. The 4h probe covers only the top
+        # names by funding and by volume; an adopted symbol that drifted out of
+        # both stopped being measured, and reading its absent trend as a dead
+        # trend evicted it two scans later — for a change in probe coverage, not
+        # a change in the market. Eviction is expensive: the symbol's brain
+        # (hedge weights, calibration, graded history) dies with its ctx, and
+        # re-adopting minutes later restarts it cold at the adopted-size
+        # haircut. Only a MEASURED degradation may take a seat.
+        if not r.get("probed", True):
+            return True
+        return (r.get("dir_4h") not in (0, None)
+                and (r.get("er_4h") or 0.0) >= KEEP_ER)
 
     drops: list[str] = []
     for sym in sorted(adopted):
@@ -256,11 +284,13 @@ def plan_adoption(rows: list[dict], adopted: set[str], user: set[str],
         drops += droppable[:len(keep) - cap]
         keep = [s for s in keep if s not in drops]
     free = max(0, cap - len(keep))
+    # ...but a seat is only ever GIVEN on measured evidence: "unknown" earns the
+    # benefit of the doubt for an incumbent and none at all for a newcomer.
     adds = [r["symbol"] for r in rows
             if r["symbol"] not in user and r["symbol"] not in adopted
-            and r["symbol"] not in cooled
-            and r.get("kind") == "trend" and r.get("dir_4h", 0) != 0
-            and r.get("er_4h", 0.0) >= ADOPT_ER and not has_pos(r["symbol"])][:free]
+            and r["symbol"] not in cooled and r.get("probed", True)
+            and r.get("kind") == "trend" and r.get("dir_4h") not in (0, None)
+            and (r.get("er_4h") or 0.0) >= ADOPT_ER and not has_pos(r["symbol"])][:free]
     return drops, adds
 
 
@@ -377,6 +407,11 @@ class MarketScanner:
         self.universe = DynamicUniverse()
         self.ts = 0.0
         self.demo = False
+        # why the seats look the way they do. An empty `adopted` list next to a
+        # board whose top row is a clean, liquid, adoptable trend is the single
+        # most confusing state this component can be in, and it used to carry no
+        # explanation at all.
+        self.seats: dict = {}
         self.scans = 0
         self.error = ""
 
@@ -411,6 +446,19 @@ class MarketScanner:
         raw = list(getattr(cfg, "symbols", []) or []) + list(getattr(cfg, "radar_extra", []) or [])
         return {str(s).strip().upper().removesuffix("-USDT") for s in raw if str(s).strip()}
 
+    def _extra_allowed_symbols(self) -> set[str]:
+        """The same deliberate choices, as full contract symbols."""
+        return {f"{b}-USDT" for b in self._extra_allowed()}
+
+    def _seated(self) -> list[str]:
+        """Symbols the engine currently holds a brain for — the user's own plus
+        whatever the radar has adopted. These are probed before anything else:
+        their trend read decides whether they keep their seat."""
+        eng = getattr(self.orch, "engine", None)
+        if eng is None:
+            return sorted(self._extra_allowed_symbols())
+        return sorted(set(eng.ctx) | self._extra_allowed_symbols())
+
     async def scan(self) -> list[dict]:
         rest = getattr(self.orch, "rest", None)
         if rest is not None:   # offline/synthetic runs stay fully offline
@@ -436,8 +484,17 @@ class MarketScanner:
             vol_ok = {t["symbol"] for t in tickers
                       if t.get("quote_volume", 0) >= CARRY_MIN_QVOL
                       and reasonable_perp(t["symbol"], allowed)}
-            focus = [p["symbol"] for p in by_f if p["symbol"] in vol_ok][:TOP_FUNDING]
-            focus += [s for s in top_volume_universe(tickers, TOP_VOLUME, allowed) if s not in focus]
+            # THE SEATS WE ALREADY HOLD ARE PROBED FIRST, unconditionally. The
+            # 4h read used to cover only the top names by funding and by volume,
+            # so an adopted symbol that drifted out of both stopped being
+            # measured — and the seat planner, reading its absent trend as a
+            # dead one, evicted it. A symbol we are actively trading is the LAST
+            # one whose trend should be a guess.
+            focus = list(self._seated())      # unconditionally, and first
+            focus += [p["symbol"] for p in by_f
+                      if p["symbol"] in vol_ok and p["symbol"] not in focus][:TOP_FUNDING]
+            focus += [s for s in top_volume_universe(tickers, TOP_VOLUME, allowed)
+                      if s not in focus]
             trend = {}
             for sym in focus:
                 try:
@@ -465,6 +522,8 @@ class MarketScanner:
         age = self.universe.age_s()
         return {"ts": int(self.ts * 1000), "demo": self.demo, "scans": self.scans,
                 "error": self.error, "rows": self.rows, "top_volume": self.top_volume,
+                "probed": sum(1 for r in self.rows if r.get("probed")),
+                "seats": self.seats,
                 "universe": {"source": self.universe.source,
                              "count": len(self.universe.allowed()),
                              "age_min": int(age / 60) if age >= 0 else None}}

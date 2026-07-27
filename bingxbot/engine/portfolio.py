@@ -95,6 +95,7 @@ class Portfolio:
             entry_ts=pos.opened_ts, exit_ts=exit_ts,
             pnl=round(net, 8), fees=round(fee_part + exit_fee, 8),
             reason_open=pos.entry_reason, reason_close=reason,
+            entry_regime=pos.entry_regime,
             r_multiple=round(net / risk_money, 3) if risk_money > 0 else 0.0,
             mode=self.mode,
             mae_r=round(max(0.0, (pos.entry_price - adv) * d / pos.init_risk), 3) if pos.init_risk > 0 else 0.0,
@@ -139,6 +140,7 @@ class Portfolio:
             entry_ts=pos.opened_ts, exit_ts=exit_ts,
             pnl=round(net, 8), fees=round(fees, 8),
             reason_open=pos.entry_reason, reason_close=reason,
+            entry_regime=pos.entry_regime,
             r_multiple=round(net / planned_risk, 3) if planned_risk > 0 else 0.0,
             mode=self.mode,
             mae_r=round(mae_r, 3), mfe_r=round(mfe_r, 3),
@@ -176,8 +178,31 @@ class Portfolio:
         rmults = [t.r_multiple for t in trades]
         r_mean = sum(rmults) / n if n else 0.0
         r_var = sum((r - r_mean) ** 2 for r in rmults) / (n - 1) if n > 1 else 0.0
+        # PER-REGIME LEDGER: what this set actually did in each kind of market,
+        # counted in its own trades. A champion's regime record used to be a
+        # median over a handful of whole-era scores, which meant a mixed era
+        # (chop, range) got no label at all and contributed nothing — and those
+        # are precisely the markets a set is most likely to bleed in. Trades
+        # carry the regime they were opened into, so the record is built from
+        # hundreds of them instead of from six numbers.
+        by_regime: dict[str, dict] = {}
+        for t in trades:
+            reg = t.entry_regime or "UNKNOWN"
+            b = by_regime.setdefault(reg, {"trades": 0, "pnl": 0.0,
+                                           "gross_win": 0.0, "gross_loss": 0.0})
+            b["trades"] += 1
+            b["pnl"] += t.pnl
+            if t.pnl > 0:
+                b["gross_win"] += t.pnl
+            else:
+                b["gross_loss"] -= t.pnl
+        for b in by_regime.values():
+            b["pnl"] = round(b["pnl"], 6)
+            b["gross_win"] = round(b["gross_win"], 6)
+            b["gross_loss"] = round(b["gross_loss"], 6)
         return {
             "trades": n,
+            "by_regime": by_regime,
             "win_rate": round(len(wins) / n, 4) if n else 0.0,
             "profit_factor": round(gross_win / gross_loss, 3) if gross_loss > 0 else (999.0 if gross_win > 0 else 0.0),
             "expectancy": round(mean, 6),

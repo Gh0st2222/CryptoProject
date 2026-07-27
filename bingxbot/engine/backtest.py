@@ -263,7 +263,8 @@ class _SymSim:
         pos = Position(symbol=self.symbol, side=side, qty=sized.qty, entry_price=eff,
                        opened_ts=int(self.ts[i]), leverage=sized.leverage, style=style,
                        stop_price=br.stop, take_profit=br.take_profit,
-                       entry_fee=fee, entry_reason=reason, entry_bar_ts=int(self.ts[i]))
+                       entry_fee=fee, entry_reason=reason, entry_regime=regime,
+                       entry_bar_ts=int(self.ts[i]))
         self.exits.attach(pos, atr, br.init_risk)
         pf.open_position(pos, fee)
         self.planned_risk = sized.risk_amount

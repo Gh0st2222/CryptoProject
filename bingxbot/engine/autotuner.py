@@ -33,8 +33,7 @@ from ..strategy.regime_profile import build_profile, classify_era, dominant_regi
 from ..util import clamp, interval_ms
 from .backtest import TUNABLES, _coerce
 from .search import (STATE_PATH, DEOptimizer, portfolio_folds, recency_weights,
-                     robust_aggregate, score_fold, validate_params,
-                     validate_params_portfolio)
+                     robust_aggregate, score_fold, validate_params_portfolio)
 
 log = logging.getLogger("autotuner")
 
@@ -51,12 +50,29 @@ MARGIN_FLOOR = 0.20         # the margin is a fraction of the incumbent's
                             # magnitude, so a champion sitting near zero would
                             # set a bar only microscopically above itself; this
                             # is the smallest magnitude the margin is charged on
-MIN_ABS_FITNESS = 0.15      # ...and be clearly profitable (positive risk-adjusted
-                            # score). Recalibrated for the honest-fills scale
-                            # (v3): trade-through limits + double stop slippage
-                            # compressed every fitness number, and a floor tuned
-                            # to the old flattering scale would have quietly
-                            # made promotion stricter than anyone decided.
+# THERE IS NO ABSOLUTE FITNESS FLOOR ANY MORE, and the reason is measured.
+#
+# At production geometry, of 121 parameter sets scored across the judged folds,
+# 32 genuinely made money over the whole out-of-sample stretch with 30+ trades
+# at a profit factor above one. Only 2 of those 32 — six percent — could clear a
+# composite floor of 0.15. The 30 it refused had a median of +2.10% over 56
+# trades at PF 1.23: ordinary good champions, blocked by a number rather than by
+# their results. The live board showed the same thing from the other side, a
+# champion earning +2.39% over 109 trades and scoring -0.367 against a bar of
+# 0.164, for 240 cycles without a promotion.
+#
+# The cause is structural, not a bad constant. _fitness penalises a losing
+# window roughly 1.5-2x harder than it rewards a winning one, and _oos_composite
+# gives 30% weight to the WORST fold — so a set with one losing fold out of four
+# is pushed negative however profitable it was overall. Raising or lowering the
+# number cannot fix a scale that profitable sets do not live on.
+#
+# So the absolute question — "is this set any good" — is answered where it can
+# be answered honestly: pooled economics over the judged stretch (made money,
+# MIN_POOLED_TRADES behind it, profit factor above one), which is scale-free and
+# cannot drift. The composite keeps the job it is genuinely good at, RANKING
+# inside that admitted pool: top-1 by composite returned +16.81% against +2.48%
+# for the pool median, monotone all the way down.
 TOP_K_VALIDATE = 10         # DE members sent to the REAL (full-python, portfolio,
                             # meta-aware) judge each cycle. Was 5 of a 56-member
                             # population: the funnel, not the search, was the
@@ -292,20 +308,34 @@ def _oos_fold_count(cbs: dict[str, list], tail_frac: float = OOS_TAIL_FRAC,
 
 
 def _promotion_bar(champ_fit: float, margin: float) -> float:
-    """The score a challenger must exceed: clear of the incumbent by `margin`,
-    and clear of the absolute floor by the same margin.
+    """The score a challenger must exceed: clear of the incumbent by `margin`.
+
+    A RELATIVE test only. The absolute question — "is this set any good" — is
+    answered on pooled economics (made money over the judged stretch, on enough
+    trades, at a profit factor above one), which is scale-free. An absolute floor
+    on the FITNESS scale was a second, broken answer to the same question, and it
+    overrode the good one.
+
+    Measured at production geometry on 121 parameter sets: 32 made money across
+    the judged stretch with 30+ trades and PF >= 1, and only 2 of those 32 (6%)
+    could clear a composite floor of 0.15. The 30 it refused had a median of
+    +2.10% over 56 trades at PF 1.23 — ordinary good champions, blocked by a
+    number rather than by their results. The cause is structural: _fitness
+    penalises a losing window ~1.5-2x harder than it rewards a winning one, and
+    the composite gives 30% weight to the WORST fold, so any set with one losing
+    fold out of four is pushed negative no matter how profitable it is overall.
+    The median admitted set scored -0.869.
+
+    The composite is still an excellent RANKER inside the admitted pool — top-1
+    by composite returned +16.81% against +2.48% for the pool median, monotone
+    down the ranking — so it keeps that job and loses the one it was bad at.
 
     Written additively because the multiplicative form ran BACKWARDS on a losing
-    incumbent. `champ_fit * 1.16` is -0.21 when champ_fit is -0.177: the worse
-    the champion did, the LOWER the bar it set, so a champion deep in the red was
-    easier to replace than one merely flat — and the multiple-testing inflation,
-    whose whole job is to make the bar rise as more candidates take a shot at the
-    same window, moved it the wrong way too. Adding the margin as a fraction of
-    the incumbent's MAGNITUDE keeps "beat it by 6%+" meaning the same thing above
-    and below zero, and the deflation now inflates the absolute floor as well —
-    where it actually binds while a champion is under water."""
-    step = (margin - 1.0) * max(abs(champ_fit), MARGIN_FLOOR)
-    return max(champ_fit + step, MIN_ABS_FITNESS * margin)
+    incumbent: `champ_fit * 1.16` is -0.21 when champ_fit is -0.177, so the worse
+    a champion did the lower the bar it set, and the multiple-testing inflation
+    moved it the wrong way too. As a fraction of the incumbent's MAGNITUDE,
+    "beat it by 6%+" means the same thing above and below zero."""
+    return champ_fit + (margin - 1.0) * max(abs(champ_fit), MARGIN_FLOOR)
 
 
 def _pool_stats(stats_list: list[dict]) -> dict:
@@ -346,8 +376,7 @@ def overlay_of(params: dict) -> dict:
     return {k: params[k] for k in BRAIN_PARAMS if k in params}
 
 
-def select_specialists(sym_results: dict, margin: float = IMPROVE_MARGIN,
-                       floor: float = MIN_ABS_FITNESS) -> dict:
+def select_specialists(sym_results: dict, margin: float = IMPROVE_MARGIN) -> dict:
     """Pick each symbol's specialist overlay from FOLD-VALIDATED evidence.
 
     sym_results: {sym: {"applied": (params, fit, pf), "overlay": (params, fit, pf) | None,
@@ -359,8 +388,12 @@ def select_specialists(sym_results: dict, margin: float = IMPROVE_MARGIN,
     Rules (the old single-window picker flapped SET/CLEARED every cycle and
     converged to zero overlays — a specialist bench needs statistics and
     hysteresis):
-      - a challenger must be profitable where it matters (pf >= 1), clearly
-        positive (>= floor) and clearly better than the applied global set;
+      - a challenger must be profitable where it matters (pooled pf >= 1 over
+        the judged folds, with real evidence behind it) and clearly better than
+        the applied global set. The absolute FITNESS floor is gone for the same
+        reason it left the global gate: measured at production geometry, only
+        6% of parameter sets that genuinely made money could reach it. Profit
+        is the absolute test; the composite is the ranking;
       - an INCUMBENT overlay keeps its seat while it still beats the global
         set — a challenger must beat the incumbent by the margin, not just
         the global;
@@ -371,7 +404,9 @@ def select_specialists(sym_results: dict, margin: float = IMPROVE_MARGIN,
     for sym, r in sym_results.items():
         applied_params, base_fit, _base_pf = r["applied"]
         base_ov = overlay_of(applied_params)
-        bar = max(float(base_fit) * margin, floor)
+        # sign-safe, exactly like the global bar: base_fit * margin runs
+        # backwards below zero and made a losing global set EASIER to overlay
+        bar = _promotion_bar(float(base_fit), margin)
         best = None
         for params, fit, pf in r.get("cands", []):
             if pf < 1.0 or fit <= bar:
@@ -384,8 +419,8 @@ def select_specialists(sym_results: dict, margin: float = IMPROVE_MARGIN,
         inc = r.get("overlay")
         if inc is not None:
             inc_params, inc_fit, inc_pf = inc
-            keeps_seat = inc_pf >= 1.0 and inc_fit > max(base_fit, floor)
-            if keeps_seat and (best is None or best[1] <= inc_fit * margin):
+            keeps_seat = inc_pf >= 1.0 and inc_fit > base_fit
+            if keeps_seat and (best is None or best[1] <= _promotion_bar(inc_fit, margin)):
                 out[sym] = {"params": overlay_of(inc_params), "fitness": round(inc_fit, 3),
                             "vs": round(base_fit, 3), "pf": round(inc_pf, 3)}
                 continue
@@ -393,6 +428,35 @@ def select_specialists(sym_results: dict, margin: float = IMPROVE_MARGIN,
             out[sym] = {"params": overlay_of(best[0]), "fitness": round(best[1], 3),
                         "vs": round(base_fit, 3), "pf": round(best[2], 3)}
     return out
+
+
+def _best_fallback(champions: list[dict], interval: str,
+                   exclude: str | None = None) -> dict | None:
+    """The best vault set to fall back to when the incumbent is stood down.
+
+    Ranked by `fitness`, which now means one thing everywhere — the same
+    portfolio composite the promotion gate uses. It used to be written by two
+    different judges (see _revalidate_vault) on different scales, so WHICH
+    champion the account fell back to depended on which of them had run last.
+
+    Admission is ECONOMIC, not by fitness: a set is worth falling back to when it
+    MADE MONEY over the judged stretch on enough trades — the same test a
+    promotion has to pass. Ranking among the admitted is by fitness, which is
+    what fitness is good at.
+
+    "Positive fitness" used to be the admission test, and on this scale that pool
+    is empty in exactly the situation it exists for, since most profitable sets
+    score negative. Returning None is correct and deliberate: when the whole
+    vault is under water there is nothing to fall back to but the code defaults,
+    and swapping one losing set for another is not a defence."""
+    pool = [c for c in champions
+            if c.get("params") and not c.get("live_flag")
+            and c.get("id") != exclude
+            and (c.get("clock") or interval) == interval
+            and float(c.get("oos_return", 0.0) or 0.0) > 0.0
+            and int(c.get("oos_trades", 0) or 0) >= MIN_POOLED_TRADES
+            and float(c.get("oos_pf", 0.0) or 0.0) >= 1.0]
+    return max(pool, key=lambda c: c.get("fitness", -1e18), default=None)
 
 
 def _default_params() -> dict:
@@ -623,7 +687,14 @@ class AutoTuner:
             i += nf
             fits = [r["fitness"] for r in rs]
             fit = _oos_composite(fits)
-            pf = float(rs[-1]["stats"].get("profit_factor", 0.0) or 0.0)
+            # POOLED, like the global gate. Reading the newest fold's profit
+            # factor alone made a specialist seat turn on the coin flip of
+            # whether one window happened to fire, and 999-on-three-trades sailed
+            # through a `>= 1.0` test here exactly as it once did upstairs.
+            pool = _pool_stats([r["stats"] for r in rs])
+            pf = (float(pool["profit_factor"])
+                  if int(pool["trades"]) >= MIN_POOLED_TRADES and pool["total_return"] > 0.0
+                  else 0.0)
             slot = out.setdefault(sym, {"applied": None, "overlay": None, "cands": []})
             if tag == "applied":
                 slot["applied"] = (params, fit, pf)
@@ -858,7 +929,8 @@ class AutoTuner:
             # veto and the deflated margin — all pure OOS.
             adj = oos
             if c["source"] == "vault" and c["cid"]:
-                self.orch.set_champion_current(c["cid"], oos, stats0)  # keep its CURRENT eval fresh
+                # keep its CURRENT eval fresh, pooled economics included
+                self.orch.set_champion_current(c["cid"], oos, stats0, pool)
             # ABSOLUTE-PROFIT VETO, on the POOLED judged stretch. Whatever the
             # fitness composite says, a set that did not actually make the
             # account money across the windows it was judged on cannot take the
@@ -993,10 +1065,7 @@ class AutoTuner:
             self._champ_bad_streak += 1
             if self._champ_bad_streak >= patience:
                 self._champ_bad_streak = 0
-                alt = max((c for c in self.orch.champions
-                           if c.get("fitness", 0.0) > 0 and not c.get("live_flag")
-                           and (c.get("clock") or interval) == interval),
-                          key=lambda c: c.get("fitness", 0.0), default=None)
+                alt = _best_fallback(self.orch.champions, interval)
                 fb_params = alt["params"] if alt else _default_params()
                 fb_name = "vault fallback" if alt else "baseline reset"
                 if any(abs(fb_params.get(k, 0) - champ.get(k, 0)) > 1e-9 for k in champ):
@@ -1052,11 +1121,7 @@ class AutoTuner:
                     and lv["pf"] < 0.5 * max(act.get("profit_factor", 1.0), 1.0)):
                 act["live_flag"] = {"pf": lv["pf"], "trades": lv["trades"],
                                     "ts": int(time.time() * 1000)}
-                alt = max((c for c in self.orch.champions
-                           if c.get("fitness", 0.0) > 0 and c["id"] != act["id"]
-                           and not c.get("live_flag")
-                           and (c.get("clock") or interval) == interval),
-                          key=lambda c: c.get("fitness", 0.0), default=None)
+                alt = _best_fallback(self.orch.champions, interval, exclude=act["id"])
                 fb = alt["params"] if alt else _default_params()
                 self.orch.apply_params(fb)
                 if alt is not None:
@@ -1086,7 +1151,8 @@ class AutoTuner:
             log.info("auto-tune: converged without a champion -> re-injected %d explorers", k)
 
         if self.cycles % VAULT_REVAL_EVERY == 0:
-            await self._revalidate_vault(basket, interval, slip, strat, risk)
+            await self._revalidate_vault(folds_cbs, specs_map, interval, taker,
+                                         slip, strat, risk)
 
         # meta-labeling research: retrain the P(win) model on the basket's full
         # history every so often (walk-forward credentialed; persists only if
@@ -1232,8 +1298,15 @@ class AutoTuner:
         if args:
             res = await self.orch.map_cpu(validate_params_portfolio, args, research=True)
             for (name, ck, cbs), r in zip(keys, res):
+                st = r.get("stats", {}) or {}
                 entry = {"fit": round(float(r.get("fitness", -1.0)), 3),
-                         "pf": round(float(r.get("stats", {}).get("profit_factor", 0.0) or 0.0), 3),
+                         "pf": round(float(st.get("profit_factor", 0.0) or 0.0), 3),
+                         "trades": int(st.get("trades", 0) or 0),
+                         # the era's own trades, bucketed by the market each was
+                         # opened into — this is what the profile is built from
+                         "by_regime": st.get("by_regime") or {},
+                         # ...and the era's overall character, kept as readable
+                         # context in the vault. It decides nothing.
                          "regime": await self._era_regime(name, interval, cbs)}
                 self._gauntlet_cache[ck] = entry
                 results[name] = entry
@@ -1242,11 +1315,12 @@ class AutoTuner:
         fits = [r["fit"] for r in results.values()]
         pf_ge1 = sum(1 for r in results.values() if r["pf"] >= 1.0)
         med = statistics.median(fits)
-        # PER-REGIME PROFILE — the part the live engine actually uses. An era's
-        # score filed under the era's CHARACTER turns "this set died in 2022"
-        # from a mark against it into an instruction: stand down when the tape
-        # looks like that again. Losing money in a crash is not a defect in a
-        # trend set, it is a description of when that set should be flat.
+        # PER-REGIME PROFILE — the part the live engine actually uses. This set's
+        # own trades, pooled across five years and bucketed by the market each
+        # was opened into, turn "it died in 2022" from a mark against it into an
+        # instruction: stand down when the tape looks like that again. Losing
+        # money in a crash is not a defect in a trend set, it is a description
+        # of when that set should be flat.
         by_regime = build_profile({n: {**r, "name": n} for n, r in results.items()})
         return {"n": len(results), "median": round(med, 3), "worst": round(min(fits), 3),
                 "pf_ge1": pf_ge1, "weak": med < 0.0, "windows": results,
@@ -1380,9 +1454,12 @@ class AutoTuner:
             if (best_fit is None or fit > best_fit) and admitted:
                 best_fit, best_params, best_stats = fit, prm, stats0
         recorded = None
-        if best_params is not None and best_fit is not None and best_fit > MIN_ABS_FITNESS:
-            # same promotion floor as the live clock — the vault only ever
-            # holds sets that cleared a real bar. Tagged with the trial clock,
+        if best_params is not None and best_fit is not None:
+            # Admitted on the same POOLED ECONOMICS as the live clock (checked
+            # above) — the vault only ever holds sets that made money on real
+            # evidence. There is no absolute fitness floor here either: only 6%
+            # of genuinely profitable sets could reach one. Tagged with the
+            # trial clock,
             # they become instant candidates the day the user switches
             # interval. Full newest-fold stats travel with the record: the old
             # pf-only dict made the vault show wr 0% / 0 trades / PF 999 —
@@ -1404,33 +1481,62 @@ class AutoTuner:
         if self.orch._notify:
             await self.orch._notify("autotune")
 
-    async def _revalidate_vault(self, basket, interval, slip, strat, risk) -> None:
-        """Re-score every saved champion on the TRADED basket's freshest windows
-        and refresh its CURRENT evaluation (shown next to what it was born at) —
-        so 'current fitness' always means 'on what we trade today'. We DON'T drop
-        the temporarily-cold — pruning ages out the never-used and protects the
-        most-used, so a proven champion having a bad week survives."""
-        # other-clock champions are skipped: scoring a 5m-born set on 15m
-        # basket bars would overwrite its honest evaluation with nonsense.
+    async def _revalidate_vault(self, folds_cbs, specs_map, interval, taker, slip,
+                                strat, risk) -> None:
+        """Re-score every saved champion with THE SAME JUDGE that promotes, and
+        refresh its CURRENT evaluation (shown next to what it was born at).
+
+        It used to run a different one. The promotion gate scores the shared-
+        account PORTFOLIO across purged OOS folds and blends median with worst;
+        this pass ran the SINGLE-SYMBOL validator over one continuous recent
+        window and took a plain mean across the basket. Both wrote the same
+        `fitness` field, so a champion's headline number meant whichever judge
+        had touched it last — on a live board, 0.159 from this path sitting
+        beside -0.367 from the gate, for the same parameter set in the same
+        cycle.
+
+        That is not only confusing to read. `prune_champions` ranks the vault by
+        `fitness`, and the stand-down picks its fallback from champions whose
+        `fitness` is positive — so which champions survived, and which one the
+        account fell back to, depended on which judge had last run. One judge,
+        one scale, one meaning.
+
+        Cheap now, too: the folds are memoized for the window, so any champion
+        already judged as a candidate this cycle costs nothing to re-read."""
         vault = [c for c in self.orch.champions
-                 if (c.get("clock") or interval) == interval]
-        if not vault or not basket:
+                 # other-clock champions are skipped: scoring a 5m-born set on
+                 # 15m folds would overwrite its honest evaluation with nonsense
+                 if (c.get("clock") or interval) == interval and c.get("params")]
+        if not vault or not folds_cbs:
             return
-        nb = len(basket)
-        args = []
+        nf = len(folds_cbs)
+
+        def _psig(params: dict) -> tuple:
+            return tuple(sorted((k, round(float(v), 10)) for k, v in params.items()))
+
+        keys, miss_args, miss_keys = [], [], []
         for c in vault:
-            for bsym, bvalid in basket:
-                bspec = self.orch.specs.get(bsym, ContractSpec(bsym))
-                args.append((c.get("params", {}), bvalid, bsym, interval, bspec,
-                             bspec.taker_fee, slip, strat, risk))
-        results = await self.orch.map_cpu(validate_params, args, research=True)
+            sig = _psig(c["params"])
+            for fi, fc in enumerate(folds_cbs):
+                key = (sig, fi)
+                keys.append(key)
+                if key not in self._val_cache and key not in miss_keys:
+                    miss_args.append((c["params"], fc, interval, specs_map,
+                                      taker, slip, strat, risk))
+                    miss_keys.append(key)
+        if miss_args:
+            res = await self.orch.map_cpu(validate_params_portfolio, miss_args, research=True)
+            for key, r in zip(miss_keys, res):
+                self._val_cache[key] = r
         for i, c in enumerate(vault):
-            rs = results[i * nb:(i + 1) * nb]
-            fit = sum(r.get("fitness", 0.0) for r in rs) / max(len(rs), 1)
-            self.orch.set_champion_current(c["id"], fit, rs[0].get("stats", {}))
+            rs = [self._val_cache[k] for k in keys[i * nf:(i + 1) * nf]]
+            fit = _oos_composite([r["fitness"] for r in rs])
+            self.orch.set_champion_current(
+                c["id"], fit, rs[-1].get("stats", {}),
+                _pool_stats([r.get("stats", {}) for r in rs]))
         self.orch.prune_champions()
-        log.info("vault revalidated on traded basket %s: %d champions",
-                 [s for s, _ in basket], len(self.orch.champions))
+        log.info("vault revalidated on %d purged OOS folds: %d champions",
+                 nf, len(self.orch.champions))
 
     def snapshot(self) -> dict:
         return {
