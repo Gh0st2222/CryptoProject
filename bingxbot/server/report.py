@@ -429,13 +429,19 @@ def build_report(orch) -> str:
         #     gate comes along because that is the next thing anyone asks.
         eng_bars = max((len(st.candles) for st in eng.feed.states.values()
                         if st is not None), default=0)
-        flat_since = None
+        # A row whose exit_ts is missing or zero is not "a trade that closed at
+        # the epoch" — it is a row that cannot date anything, and treating it as
+        # a timestamp reports the age of the machine in bars (1.98 million of
+        # them) with total confidence. Only a plausible timestamp counts.
+        elapsed_bars = (now_ms() - eng.started_ts) / max(iv, 1) if eng.started_ts else 0.0
+        flat_bars = elapsed_bars
         if eng.journal is not None:
-            mine = [r for r in eng.journal.rows if r.get("mode") == eng.portfolio.mode]
-            if mine:
-                flat_since = (now_ms() - int(mine[-1].get("exit_ts", 0) or 0)) / max(iv, 1)
-        elapsed_bars = (now_ms() - eng.started_ts) / max(iv, 1) if eng.started_ts else 0
-        flat_bars = flat_since if flat_since is not None else elapsed_bars
+            stamps = [int(r.get("exit_ts", 0) or 0) for r in eng.journal.rows
+                      if r.get("mode") == eng.portfolio.mode]
+            recent = [t for t in stamps if 0 < t <= now_ms()]
+            if recent:
+                # never claim a longer drought than the engine has been running
+                flat_bars = min(elapsed_bars, (now_ms() - max(recent)) / max(iv, 1))
         ctrades = lc.get("champ_oos_trades")
         judged = lc.get("oos_traded_bars")
         nfolds = lc.get("oos_folds") or 1
