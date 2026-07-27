@@ -149,6 +149,16 @@ MIN_OOS_TRADED_BARS = 900   # judged folds are widened (by using fewer of them)
                             # rather than slicing a short history into confetti
 VAULT_CANDIDATES = 4        # also re-validate this many top vault champions each cycle (candidate pool, not graveyard)
 STALL_REINJECT = 20         # cycles without a promotion before a diversity restart
+DROUGHT_SAMPLE_AFTER = 8    # ...and after this many, start showing the judge
+DROUGHT_SAMPLE_N = 4        # this many population members from OUTSIDE the
+                            # training top-k. Measured: training fitness ranks
+                            # candidates against out-of-sample return at rho
+                            # +0.07, so the top-k is close to an arbitrary
+                            # sample — and during a drought it provably holds
+                            # nothing admissible. Sooner than STALL_REINJECT on
+                            # purpose: looking harder is cheap and reversible,
+                            # while throwing away a quarter of the population is
+                            # neither.
 # THE STAND-DOWN, and why it is no longer a fitness threshold.
 #
 # A champion scoring above the removal floor can never be removed, and a
@@ -851,6 +861,24 @@ class AutoTuner:
             mid = _centroid([p for p, _ in topk[:5]])
             if mid and not any(self.orch._params_match(mid, c["params"]) for c in cands):
                 cands.append({"source": "consensus", "params": mid, "train_fit": None, "cid": None})
+        # LOTTERY TICKETS, but only during a drought. The top-k is chosen by
+        # training fitness, which ranks candidates against their out-of-sample
+        # return at rho +0.07 — so WHICH k the judge sees is close to arbitrary,
+        # and when the desk is stalled the top-k demonstrably holds nothing
+        # admissible (a live board judged 12 and exactly one passed, the
+        # incumbent itself). Sampling the population OUTSIDE that ranking is the
+        # only way to find a set the ranking has hidden, and it costs
+        # nf_oos memoized portfolio runs each.
+        #
+        # Deliberately off while champions are arriving: a healthy population
+        # already carries its best set inside the top-k (measured: at 45/56
+        # admissible the top-10 held the population's best, +24% OOS), so this
+        # would be pure cost. It is a drought remedy, not a default.
+        if self._since_improve >= DROUGHT_SAMPLE_AFTER and len(self.de.pop) > len(topk):
+            for p in self.de.sample_outside(TOP_K_VALIDATE, DROUGHT_SAMPLE_N):
+                if not any(self.orch._params_match(p, c["params"]) for c in cands):
+                    cands.append({"source": "explorer", "params": p,
+                                  "train_fit": None, "cid": None})
         # dedupe identical parameter sets (a converged population's top-k are
         # often clones, and a vault champion may equal a DE member): validating
         # duplicates wastes basket runs and double-counts the multiple-testing

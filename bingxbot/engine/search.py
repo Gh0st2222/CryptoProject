@@ -273,6 +273,23 @@ class DEOptimizer:
         order = sorted(range(len(self.pop)), key=lambda j: self.fitness[j], reverse=True)
         return [(dict(self.pop[j]), self.fitness[j]) for j in order[:max(1, k)]]
 
+    def sample_outside(self, k: int, n: int) -> list[dict]:
+        """`n` members drawn from BELOW the training top-k — the part of the
+        population the judge never sees.
+
+        Training fitness ranks candidates against their out-of-sample return at
+        rho +0.07, so the top-k is close to an arbitrary slice of the population
+        rather than its best part. When the desk is in a drought that slice
+        provably contains nothing promotable, and the only place left to look is
+        the rest. Spread evenly down the ranking instead of taking the next k+1..
+        k+n, which would just be more of the same neighbourhood."""
+        order = sorted(range(len(self.pop)), key=lambda j: self.fitness[j], reverse=True)
+        rest = order[max(1, k):]
+        if not rest or n <= 0:
+            return []
+        step = max(1, len(rest) // n)
+        return [dict(self.pop[j]) for j in rest[::step][:n]]
+
     def reinject(self, frac: float = 0.4) -> int:
         """Replace the worst `frac` of the population with fresh random vectors to
         escape a converged (overfit) basin — a diversity restart. Returns how many
