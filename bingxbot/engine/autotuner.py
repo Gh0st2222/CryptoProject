@@ -1141,14 +1141,36 @@ class AutoTuner:
                 log.warning("LIVE-EVIDENCE DEMOTION: champion %s real PF %.2f over %d trades",
                             act["id"], lv["pf"], lv["trades"])
 
-        # diversity restart: if the population has converged without finding a
-        # champion for a long time, it's stuck in an overfit basin — re-inject
-        # fresh explorers so it keeps searching instead of grinding the same region.
+        # STALL RESTART: a long drought without a champion means the search is
+        # grinding a region that does not produce promotable sets — re-inject
+        # fresh explorers so it looks somewhere else.
+        #
+        # The drought ALONE is the trigger now. This used to require the
+        # population to be collapsed as well (`diversity < 0.25 AND stalled`),
+        # and a live board sat at 240 cycles with zero promotions and diversity
+        # 0.71: stalled without collapsing, so the one mechanism built to break
+        # a stall never fired once. Convergence is not the only way to get
+        # stuck, and it is not even the common one.
+        #
+        # What makes the drought the right signal is that the training objective
+        # and the judge are different functions: measured on a 56-member
+        # population, DE training fitness ranks candidates at rho +0.07 against
+        # their out-of-sample return, and the population's genuinely best set
+        # (+23% OOS) sat 51st of 56 by training fitness. Generations of climbing
+        # that gradient walk AWAY from what the judge rewards — a freshly seeded
+        # population had 73% of its members profitable out of sample, against
+        # 1 of 12 nominees on the converged live board. Fresh blood is not a
+        # tie-breaker here, it is the supply.
         self._since_improve = 0 if promoted else self._since_improve + 1
-        if self.de.diversity() < 0.25 and self._since_improve >= STALL_REINJECT:
-            k = self.de.reinject(0.4)
+        if self._since_improve >= STALL_REINJECT:
+            # a collapsed population needs the bigger transfusion; a spread-out
+            # one is searching the wrong place rather than nowhere, so it keeps
+            # more of what it has
+            div = self.de.diversity()
+            k = self.de.reinject(0.4 if div < 0.25 else 0.25)
             self._since_improve = 0
-            log.info("auto-tune: converged without a champion -> re-injected %d explorers", k)
+            log.info("auto-tune: %d cycles without a champion (diversity %.2f) "
+                     "-> re-injected %d explorers", STALL_REINJECT, div, k)
 
         if self.cycles % VAULT_REVAL_EVERY == 0:
             await self._revalidate_vault(folds_cbs, specs_map, interval, taker,

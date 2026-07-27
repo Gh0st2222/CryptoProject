@@ -421,6 +421,57 @@ def build_report(orch) -> str:
                            f"scale MIN_ABS_FITNESS is written on."),
             })
 
+        # 6b) DEAD OR MERELY SLOW. "Nothing is trading" is the single most common
+        #     way this machine worries its owner, and answering it has taken a
+        #     session of analysis every time. The champion's OWN validation says
+        #     how often it should fire; put that next to how long it has actually
+        #     been flat, and the question answers itself. The dominant refusal
+        #     gate comes along because that is the next thing anyone asks.
+        eng_bars = max((len(st.candles) for st in eng.feed.states.values()
+                        if st is not None), default=0)
+        # A row whose exit_ts is missing or zero is not "a trade that closed at
+        # the epoch" — it is a row that cannot date anything, and treating it as
+        # a timestamp reports the age of the machine in bars (1.98 million of
+        # them) with total confidence. Only a plausible timestamp counts.
+        elapsed_bars = (now_ms() - eng.started_ts) / max(iv, 1) if eng.started_ts else 0.0
+        flat_bars = elapsed_bars
+        if eng.journal is not None:
+            stamps = [int(r.get("exit_ts", 0) or 0) for r in eng.journal.rows
+                      if r.get("mode") == eng.portfolio.mode]
+            recent = [t for t in stamps if 0 < t <= now_ms()]
+            if recent:
+                # never claim a longer drought than the engine has been running
+                flat_bars = min(elapsed_bars, (now_ms() - max(recent)) / max(iv, 1))
+        ctrades = lc.get("champ_oos_trades")
+        judged = lc.get("oos_traded_bars")
+        nfolds = lc.get("oos_folds") or 1
+        nsyms = max(1, len(lc.get("basket") or eng.ctx))
+        if (isinstance(ctrades, int) and ctrades > 0 and isinstance(judged, (int, float))
+                and judged > 0 and flat_bars > 0):
+            # bars of ONE symbol between trades, as the validation measured it
+            per_trade = (judged * nfolds * nsyms) / ctrades
+            expected = flat_bars * nsyms / per_trade
+            ref = (eng.refusals.snapshot() or {}).get("gates") or []
+            top = max(ref, key=lambda g: g.get("refused", 0), default=None)
+            worst = (f"; most refusals came from the {top['gate']} gate "
+                     f"({top['refused']}, and those signals went "
+                     f"{top.get('mean_move_atr', 0):+.2f} ATR — "
+                     f"{'the gate saved money' if top.get('mean_move_atr', 0) < 0 else 'the gate cost money'})"
+                     if top else "")
+            verdict = ("consistent with its validated rate — slow, not stuck"
+                       if expected < 3.0 else
+                       "well past what its validation predicts: something is "
+                       "blocking that the backtest did not model")
+            findings.append({
+                "level": "INFO" if expected < 3.0 else "WARN",
+                "check": "engine-flat",
+                "detail": (f"no fill for {flat_bars:.0f} bars across {nsyms} symbol(s). "
+                           f"The active champion took {ctrades} trades over "
+                           f"{int(judged)}x{nfolds} judged bars, i.e. one per "
+                           f"{per_trade:.0f} bars per symbol, so ~{expected:.1f} were "
+                           f"expected by now — {verdict}{worst}."),
+            })
+
         # 7) the champion is deliberately flat. This is correct behaviour, but
         #    it is indistinguishable from a broken engine unless it says so —
         #    "nothing is trading" has cost this project weeks twice already.
