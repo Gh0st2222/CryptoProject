@@ -19,8 +19,6 @@ and in the next ten minutes. Nothing here is a new model.
 """
 from __future__ import annotations
 
-import statistics
-
 from .features import FeatureFrame
 from .regime import REGIMES, detect_regime
 

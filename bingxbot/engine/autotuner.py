@@ -33,8 +33,7 @@ from ..strategy.regime_profile import build_profile, classify_era, dominant_regi
 from ..util import clamp, interval_ms
 from .backtest import TUNABLES, _coerce
 from .search import (STATE_PATH, DEOptimizer, portfolio_folds, recency_weights,
-                     robust_aggregate, score_fold, validate_params,
-                     validate_params_portfolio)
+                     robust_aggregate, score_fold, validate_params_portfolio)
 
 log = logging.getLogger("autotuner")
 
@@ -429,6 +428,35 @@ def select_specialists(sym_results: dict, margin: float = IMPROVE_MARGIN) -> dic
             out[sym] = {"params": overlay_of(best[0]), "fitness": round(best[1], 3),
                         "vs": round(base_fit, 3), "pf": round(best[2], 3)}
     return out
+
+
+def _best_fallback(champions: list[dict], interval: str,
+                   exclude: str | None = None) -> dict | None:
+    """The best vault set to fall back to when the incumbent is stood down.
+
+    Ranked by `fitness`, which now means one thing everywhere — the same
+    portfolio composite the promotion gate uses. It used to be written by two
+    different judges (see _revalidate_vault) on different scales, so WHICH
+    champion the account fell back to depended on which of them had run last.
+
+    Admission is ECONOMIC, not by fitness: a set is worth falling back to when it
+    MADE MONEY over the judged stretch on enough trades — the same test a
+    promotion has to pass. Ranking among the admitted is by fitness, which is
+    what fitness is good at.
+
+    "Positive fitness" used to be the admission test, and on this scale that pool
+    is empty in exactly the situation it exists for, since most profitable sets
+    score negative. Returning None is correct and deliberate: when the whole
+    vault is under water there is nothing to fall back to but the code defaults,
+    and swapping one losing set for another is not a defence."""
+    pool = [c for c in champions
+            if c.get("params") and not c.get("live_flag")
+            and c.get("id") != exclude
+            and (c.get("clock") or interval) == interval
+            and float(c.get("oos_return", 0.0) or 0.0) > 0.0
+            and int(c.get("oos_trades", 0) or 0) >= MIN_POOLED_TRADES
+            and float(c.get("oos_pf", 0.0) or 0.0) >= 1.0]
+    return max(pool, key=lambda c: c.get("fitness", -1e18), default=None)
 
 
 def _default_params() -> dict:
@@ -901,7 +929,8 @@ class AutoTuner:
             # veto and the deflated margin — all pure OOS.
             adj = oos
             if c["source"] == "vault" and c["cid"]:
-                self.orch.set_champion_current(c["cid"], oos, stats0)  # keep its CURRENT eval fresh
+                # keep its CURRENT eval fresh, pooled economics included
+                self.orch.set_champion_current(c["cid"], oos, stats0, pool)
             # ABSOLUTE-PROFIT VETO, on the POOLED judged stretch. Whatever the
             # fitness composite says, a set that did not actually make the
             # account money across the windows it was judged on cannot take the
@@ -1036,10 +1065,7 @@ class AutoTuner:
             self._champ_bad_streak += 1
             if self._champ_bad_streak >= patience:
                 self._champ_bad_streak = 0
-                alt = max((c for c in self.orch.champions
-                           if c.get("fitness", 0.0) > 0 and not c.get("live_flag")
-                           and (c.get("clock") or interval) == interval),
-                          key=lambda c: c.get("fitness", 0.0), default=None)
+                alt = _best_fallback(self.orch.champions, interval)
                 fb_params = alt["params"] if alt else _default_params()
                 fb_name = "vault fallback" if alt else "baseline reset"
                 if any(abs(fb_params.get(k, 0) - champ.get(k, 0)) > 1e-9 for k in champ):
@@ -1095,11 +1121,7 @@ class AutoTuner:
                     and lv["pf"] < 0.5 * max(act.get("profit_factor", 1.0), 1.0)):
                 act["live_flag"] = {"pf": lv["pf"], "trades": lv["trades"],
                                     "ts": int(time.time() * 1000)}
-                alt = max((c for c in self.orch.champions
-                           if c.get("fitness", 0.0) > 0 and c["id"] != act["id"]
-                           and not c.get("live_flag")
-                           and (c.get("clock") or interval) == interval),
-                          key=lambda c: c.get("fitness", 0.0), default=None)
+                alt = _best_fallback(self.orch.champions, interval, exclude=act["id"])
                 fb = alt["params"] if alt else _default_params()
                 self.orch.apply_params(fb)
                 if alt is not None:
@@ -1129,7 +1151,8 @@ class AutoTuner:
             log.info("auto-tune: converged without a champion -> re-injected %d explorers", k)
 
         if self.cycles % VAULT_REVAL_EVERY == 0:
-            await self._revalidate_vault(basket, interval, slip, strat, risk)
+            await self._revalidate_vault(folds_cbs, specs_map, interval, taker,
+                                         slip, strat, risk)
 
         # meta-labeling research: retrain the P(win) model on the basket's full
         # history every so often (walk-forward credentialed; persists only if
@@ -1458,33 +1481,62 @@ class AutoTuner:
         if self.orch._notify:
             await self.orch._notify("autotune")
 
-    async def _revalidate_vault(self, basket, interval, slip, strat, risk) -> None:
-        """Re-score every saved champion on the TRADED basket's freshest windows
-        and refresh its CURRENT evaluation (shown next to what it was born at) —
-        so 'current fitness' always means 'on what we trade today'. We DON'T drop
-        the temporarily-cold — pruning ages out the never-used and protects the
-        most-used, so a proven champion having a bad week survives."""
-        # other-clock champions are skipped: scoring a 5m-born set on 15m
-        # basket bars would overwrite its honest evaluation with nonsense.
+    async def _revalidate_vault(self, folds_cbs, specs_map, interval, taker, slip,
+                                strat, risk) -> None:
+        """Re-score every saved champion with THE SAME JUDGE that promotes, and
+        refresh its CURRENT evaluation (shown next to what it was born at).
+
+        It used to run a different one. The promotion gate scores the shared-
+        account PORTFOLIO across purged OOS folds and blends median with worst;
+        this pass ran the SINGLE-SYMBOL validator over one continuous recent
+        window and took a plain mean across the basket. Both wrote the same
+        `fitness` field, so a champion's headline number meant whichever judge
+        had touched it last — on a live board, 0.159 from this path sitting
+        beside -0.367 from the gate, for the same parameter set in the same
+        cycle.
+
+        That is not only confusing to read. `prune_champions` ranks the vault by
+        `fitness`, and the stand-down picks its fallback from champions whose
+        `fitness` is positive — so which champions survived, and which one the
+        account fell back to, depended on which judge had last run. One judge,
+        one scale, one meaning.
+
+        Cheap now, too: the folds are memoized for the window, so any champion
+        already judged as a candidate this cycle costs nothing to re-read."""
         vault = [c for c in self.orch.champions
-                 if (c.get("clock") or interval) == interval]
-        if not vault or not basket:
+                 # other-clock champions are skipped: scoring a 5m-born set on
+                 # 15m folds would overwrite its honest evaluation with nonsense
+                 if (c.get("clock") or interval) == interval and c.get("params")]
+        if not vault or not folds_cbs:
             return
-        nb = len(basket)
-        args = []
+        nf = len(folds_cbs)
+
+        def _psig(params: dict) -> tuple:
+            return tuple(sorted((k, round(float(v), 10)) for k, v in params.items()))
+
+        keys, miss_args, miss_keys = [], [], []
         for c in vault:
-            for bsym, bvalid in basket:
-                bspec = self.orch.specs.get(bsym, ContractSpec(bsym))
-                args.append((c.get("params", {}), bvalid, bsym, interval, bspec,
-                             bspec.taker_fee, slip, strat, risk))
-        results = await self.orch.map_cpu(validate_params, args, research=True)
+            sig = _psig(c["params"])
+            for fi, fc in enumerate(folds_cbs):
+                key = (sig, fi)
+                keys.append(key)
+                if key not in self._val_cache and key not in miss_keys:
+                    miss_args.append((c["params"], fc, interval, specs_map,
+                                      taker, slip, strat, risk))
+                    miss_keys.append(key)
+        if miss_args:
+            res = await self.orch.map_cpu(validate_params_portfolio, miss_args, research=True)
+            for key, r in zip(miss_keys, res):
+                self._val_cache[key] = r
         for i, c in enumerate(vault):
-            rs = results[i * nb:(i + 1) * nb]
-            fit = sum(r.get("fitness", 0.0) for r in rs) / max(len(rs), 1)
-            self.orch.set_champion_current(c["id"], fit, rs[0].get("stats", {}))
+            rs = [self._val_cache[k] for k in keys[i * nf:(i + 1) * nf]]
+            fit = _oos_composite([r["fitness"] for r in rs])
+            self.orch.set_champion_current(
+                c["id"], fit, rs[-1].get("stats", {}),
+                _pool_stats([r.get("stats", {}) for r in rs]))
         self.orch.prune_champions()
-        log.info("vault revalidated on traded basket %s: %d champions",
-                 [s for s, _ in basket], len(self.orch.champions))
+        log.info("vault revalidated on %d purged OOS folds: %d champions",
+                 nf, len(self.orch.champions))
 
     def snapshot(self) -> dict:
         return {

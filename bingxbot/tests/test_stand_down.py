@@ -225,3 +225,60 @@ def test_find_champion_tolerates_an_unknown_active_id():
     orch = _Champs([{"id": "a", "fitness": 0.1}], active="gone")
     act = orch.find_champion(orch.active_champion_id) or {}
     assert bool(act.get("gauntlet_weak")) is False
+
+
+# ------------------------------------------- one judge, one scale, one meaning
+
+def _champ(cid, fitness, ret=None, trades=None, pf=None, **kw):
+    c = {"id": cid, "params": {"x": 1}, "fitness": fitness, "clock": "15m"}
+    if ret is not None:
+        c.update({"oos_return": ret, "oos_trades": trades, "oos_pf": pf})
+    c.update(kw)
+    return c
+
+
+def test_the_fallback_admits_on_money_and_ranks_on_fitness():
+    """Two different jobs, two different numbers. Which set the account falls
+    back to must not depend on a scale that profitable sets rarely reach."""
+    from bingxbot.engine.autotuner import _best_fallback
+    champs = [
+        _champ("poor", 0.9, ret=-0.02, trades=80, pf=0.8),    # best fitness, lost money
+        _champ("good", -1.2, ret=0.04, trades=80, pf=1.3),    # negative fitness, earned
+        _champ("better", -0.4, ret=0.02, trades=80, pf=1.1),  # ...and ranks higher
+    ]
+    alt = _best_fallback(champs, "15m")
+    assert alt is not None and alt["id"] == "better", (
+        "admitted on economics, ranked on fitness")
+
+
+def test_the_fallback_refuses_a_vault_that_is_entirely_under_water():
+    """When every champion lost money there is nothing to fall back to but the
+    code defaults. Swapping one losing set for another is not a defence."""
+    from bingxbot.engine.autotuner import _best_fallback
+    champs = [_champ("a", 0.5, ret=-0.01, trades=90, pf=0.7),
+              _champ("b", 0.3, ret=-0.05, trades=90, pf=0.5)]
+    assert _best_fallback(champs, "15m") is None
+
+
+def test_the_fallback_refuses_a_champion_with_no_evidence():
+    """A set that made money on four trades has not made a case."""
+    from bingxbot.engine.autotuner import _best_fallback
+    thin = MIN_POOLED_TRADES - 1
+    assert _best_fallback([_champ("a", 2.0, ret=0.5, trades=thin, pf=3.0)], "15m") is None
+
+
+def test_the_fallback_skips_the_flagged_the_excluded_and_the_other_clock():
+    from bingxbot.engine.autotuner import _best_fallback
+    ok = dict(ret=0.03, trades=60, pf=1.2)
+    assert _best_fallback([_champ("a", 1.0, live_flag={"pf": 0.2}, **ok)], "15m") is None
+    assert _best_fallback([_champ("a", 1.0, **ok)], "15m", exclude="a") is None
+    other = _champ("a", 1.0, **ok)
+    other["clock"] = "5m"
+    assert _best_fallback([other], "15m") is None
+
+
+def test_a_champion_predating_the_pooled_columns_is_not_a_fallback():
+    """Records written before this existed carry no oos_* fields. Absent
+    evidence must read as 'no case', never as 'passed'."""
+    from bingxbot.engine.autotuner import _best_fallback
+    assert _best_fallback([_champ("old", 3.0)], "15m") is None

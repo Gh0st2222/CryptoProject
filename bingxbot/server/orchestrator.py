@@ -339,10 +339,18 @@ class Orchestrator:
         self.prune_champions()
         return cid
 
-    def set_champion_current(self, cid: str, fitness: float, stats: dict) -> None:
+    def set_champion_current(self, cid: str, fitness: float, stats: dict,
+                             pooled: dict | None = None) -> None:
         """Update a champion's CURRENT (re-validated-against-today) evaluation,
         leaving the birth evaluation untouched — the vault shows both side by side.
-        Does not persist; callers batch a save after updating many."""
+        Does not persist; callers batch a save after updating many.
+
+        `pooled` is the economics over the WHOLE judged stretch — what this set
+        would have earned trading every judged fold, and on how many trades.
+        `stats` is the newest fold alone, kept for display continuity. Anything
+        that has to DECIDE reads the pooled column: a champion's headline fitness
+        lives on a scale most profitable sets never reach, so "is this one worth
+        falling back to" cannot be answered with it."""
         c = self.find_champion(cid)
         if c is None:
             return
@@ -350,6 +358,10 @@ class Orchestrator:
         c["win_rate"] = round(stats.get("win_rate", c.get("win_rate", 0.0)), 4)
         c["profit_factor"] = round(stats.get("profit_factor", c.get("profit_factor", 0.0)), 3)
         c["cur_trades"] = int(stats.get("trades", c.get("cur_trades", 0)))
+        if pooled:
+            c["oos_return"] = round(float(pooled.get("total_return", 0.0) or 0.0), 5)
+            c["oos_trades"] = int(pooled.get("trades", 0) or 0)
+            c["oos_pf"] = round(float(pooled.get("profit_factor", 0.0) or 0.0), 3)
         c["cur_ts"] = now_ms()
 
     def mark_champion_used(self, cid: str) -> None:
