@@ -145,21 +145,29 @@ def test_weak_history_raises_the_promotion_bar():
     clear a higher bar — it is far likelier to be fitting the recent window
     than to have found something. Never an outright veto, and no verdict
     (offline) must change nothing."""
-    from bingxbot.engine.autotuner import (MIN_ABS_FITNESS, WEAK_BAR_MULT)
+    from bingxbot.engine.autotuner import WEAK_BAR_MULT, _promotion_bar
 
-    def applied_bar(base_bar, gaunt):
+    # the bar as the tuner builds it: relative to the incumbent, with the
+    # weak-history raise applied to the MARGIN rather than to the bar itself,
+    # so it runs the same direction above and below zero
+    def applied_bar(champ_fit, margin, gaunt):
         if gaunt is not None and gaunt.get("weak"):
-            return max(base_bar * WEAK_BAR_MULT, MIN_ABS_FITNESS)
-        return base_bar
+            margin = 1.0 + (margin - 1.0) * WEAK_BAR_MULT
+        return _promotion_bar(champ_fit, margin)
 
-    base = 1.00
-    assert applied_bar(base, None) == base, "offline: no verdict, no change"
-    assert applied_bar(base, {"weak": False}) == base, "history passed: no change"
-    raised = applied_bar(base, {"weak": True})
-    assert raised > base and raised == pytest.approx(1.25)
+    champ, margin = 1.00, 1.06
+    base = _promotion_bar(champ, margin)
+    assert applied_bar(champ, margin, None) == base, "offline: no verdict, no change"
+    assert applied_bar(champ, margin, {"weak": False}) == base, "history passed: no change"
+    raised = applied_bar(champ, margin, {"weak": True})
+    assert raised > base, "a set that loses across history must clear more"
     # a marginal challenger is held; a decisively better one still gets through
-    assert not (1.10 > raised), "a hair-thin beat must not promote against history"
-    assert 1.40 > raised, "a decisive challenger is never vetoed outright"
+    assert not (base + 1e-6 > raised), "a hair-thin beat must not promote against history"
+    assert champ * 1.20 > raised, "a decisive challenger is never vetoed outright"
+    # ...and the raise still runs the RIGHT WAY for a losing incumbent, which a
+    # multiplicative bar did not: it made a bad champion easier to replace
+    for c in (-3.0, -0.177, 0.0, 2.0):
+        assert applied_bar(c, margin, {"weak": True}) > applied_bar(c, margin, None), c
 
 
 def test_specialist_pool_does_not_scale_with_the_judging_funnel():

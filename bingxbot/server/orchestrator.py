@@ -1092,14 +1092,34 @@ class Orchestrator:
                 if sym in blocked:
                     log.info("seat vacated: %s spread stayed above %.1fbp — cooled %d min",
                              sym, self.cfg.risk.max_spread_bps, SEAT_COOLDOWN_S // 60)
+        failed: list[str] = []
         for sym in adds:
             if len(eng.adopted) >= cap:
                 break
             if sym not in eng.ctx:
                 try:
-                    await eng.adopt_symbol(sym)
+                    if not await eng.adopt_symbol(sym):
+                        failed.append(sym)
                 except Exception as e:  # noqa: BLE001 — adoption is best-effort
+                    failed.append(sym)
                     log.warning("adopt %s failed: %s", sym, e)
+        # WHY THE SEATS LOOK LIKE THIS. A board whose top row is a clean, liquid,
+        # adoptable trend sitting next to an empty `adopted` list is the most
+        # confusing state this component reaches, and it used to carry no
+        # explanation: adopt_symbol returning False (history seed failed,
+        # symbol not on the venue) was swallowed silently, and a candidate held
+        # back by the seat cooldown or the cap looked identical to one the radar
+        # had simply not noticed.
+        self.scanner.seats = {
+            "cap": cap,
+            "held": sorted(eng.adopted),
+            "user": sorted(self.cfg.symbols),
+            "planned_adds": adds,
+            "failed_to_attach": failed,
+            "cooling": sorted(self._adopt_cooldown),
+            "spread_blocked": sorted(blocked),
+            "dropped_this_scan": drops,
+        }
 
     def reset_paper(self) -> dict:
         """Fresh paper account: wipe the persisted snapshot and, if a paper

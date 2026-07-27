@@ -50,14 +50,20 @@ def test_select_specialists_only_where_clearly_better():
 
 
 def test_select_specialists_gates_and_hysteresis():
-    # a challenger with a losing recent fold (PF < 1) can NEVER take the seat
+    # a challenger that did not make money (pf is 0 unless the POOLED judged
+    # folds cleared the evidence floor and finished positive) can NEVER take
+    # the seat, however brilliant its fitness composite looks
     ov = select_specialists({"ETH-USDT": {"applied": (_params(0.3), 0.5, 1.2), "overlay": None,
-                                          "cands": [(_params(0.2), 9.0, 0.8)]}})
+                                          "cands": [(_params(0.2), 9.0, 0.0)]}})
     assert ov == {}
-    # clearly-negative fitness never wins either
-    ov = select_specialists({"ETH-USDT": {"applied": (_params(0.3), -3.0, 0.5), "overlay": None,
+    # ...but a PROFITABLE challenger does take the seat from a global set that
+    # is losing badly on this symbol, even though both composites are negative.
+    # There is no absolute fitness floor any more: measured at production
+    # geometry only 6% of sets that genuinely made money could clear one, so
+    # profit is the absolute test and the composite is only the ranking.
+    ov = select_specialists({"ETH-USDT": {"applied": (_params(0.3), -3.0, 0.0), "overlay": None,
                                           "cands": [(_params(0.2), -0.5, 1.3)]}})
-    assert ov == {}
+    assert ov["ETH-USDT"]["params"]["base_threshold"] == 0.2
     # identical brain scalars to the applied set -> pointless, skipped
     ov = select_specialists({"ETH-USDT": {"applied": (_params(0.3), 1.0, 1.2), "overlay": None,
                                           "cands": [(_params(0.3), 5.0, 1.5)]}})

@@ -23,8 +23,8 @@ import math
 
 from bingxbot.engine.autotuner import (DEAD_CHAMPION_TRADES, DEMOTE_PATIENCE,
                                        DEMOTE_PATIENCE_WEAK, MARGIN_FLOOR,
-                                       MIN_ABS_FITNESS, MIN_POOLED_TRADES,
-                                       _pool_stats, _promotion_bar)
+                                       MIN_POOLED_TRADES, _pool_stats,
+                                       _promotion_bar)
 
 
 def _losing(pool: dict) -> bool:
@@ -164,9 +164,17 @@ def test_the_margin_runs_the_right_way_below_zero():
         assert loose >= champ, f"the bar must sit above the incumbent ({champ})"
 
 
-def test_the_bar_is_never_below_the_absolute_floor():
-    for champ in (-5.0, -0.177, 0.0, 0.1):
-        assert _promotion_bar(champ, 1.06) >= MIN_ABS_FITNESS
+def test_the_bar_is_purely_relative_now():
+    """There is no absolute fitness floor. Measured at production geometry, only
+    6% of parameter sets that genuinely made money could clear one — the median
+    profitable set scored -0.869 against a floor of 0.15. The absolute test
+    moved onto pooled economics, which profitable sets can actually reach; the
+    composite keeps the ranking job it is good at."""
+    for champ in (-5.0, -0.177, 0.0, 0.1, 3.0):
+        bar = _promotion_bar(champ, 1.06)
+        assert bar > champ, "a challenger must still beat the incumbent"
+        # ...and the bar tracks the incumbent rather than an outside constant
+        assert bar < champ + 1.0
 
 
 def test_a_champion_near_zero_still_has_to_be_beaten_by_something():

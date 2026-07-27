@@ -51,12 +51,29 @@ MARGIN_FLOOR = 0.20         # the margin is a fraction of the incumbent's
                             # magnitude, so a champion sitting near zero would
                             # set a bar only microscopically above itself; this
                             # is the smallest magnitude the margin is charged on
-MIN_ABS_FITNESS = 0.15      # ...and be clearly profitable (positive risk-adjusted
-                            # score). Recalibrated for the honest-fills scale
-                            # (v3): trade-through limits + double stop slippage
-                            # compressed every fitness number, and a floor tuned
-                            # to the old flattering scale would have quietly
-                            # made promotion stricter than anyone decided.
+# THERE IS NO ABSOLUTE FITNESS FLOOR ANY MORE, and the reason is measured.
+#
+# At production geometry, of 121 parameter sets scored across the judged folds,
+# 32 genuinely made money over the whole out-of-sample stretch with 30+ trades
+# at a profit factor above one. Only 2 of those 32 — six percent — could clear a
+# composite floor of 0.15. The 30 it refused had a median of +2.10% over 56
+# trades at PF 1.23: ordinary good champions, blocked by a number rather than by
+# their results. The live board showed the same thing from the other side, a
+# champion earning +2.39% over 109 trades and scoring -0.367 against a bar of
+# 0.164, for 240 cycles without a promotion.
+#
+# The cause is structural, not a bad constant. _fitness penalises a losing
+# window roughly 1.5-2x harder than it rewards a winning one, and _oos_composite
+# gives 30% weight to the WORST fold — so a set with one losing fold out of four
+# is pushed negative however profitable it was overall. Raising or lowering the
+# number cannot fix a scale that profitable sets do not live on.
+#
+# So the absolute question — "is this set any good" — is answered where it can
+# be answered honestly: pooled economics over the judged stretch (made money,
+# MIN_POOLED_TRADES behind it, profit factor above one), which is scale-free and
+# cannot drift. The composite keeps the job it is genuinely good at, RANKING
+# inside that admitted pool: top-1 by composite returned +16.81% against +2.48%
+# for the pool median, monotone all the way down.
 TOP_K_VALIDATE = 10         # DE members sent to the REAL (full-python, portfolio,
                             # meta-aware) judge each cycle. Was 5 of a 56-member
                             # population: the funnel, not the search, was the
@@ -292,20 +309,34 @@ def _oos_fold_count(cbs: dict[str, list], tail_frac: float = OOS_TAIL_FRAC,
 
 
 def _promotion_bar(champ_fit: float, margin: float) -> float:
-    """The score a challenger must exceed: clear of the incumbent by `margin`,
-    and clear of the absolute floor by the same margin.
+    """The score a challenger must exceed: clear of the incumbent by `margin`.
+
+    A RELATIVE test only. The absolute question — "is this set any good" — is
+    answered on pooled economics (made money over the judged stretch, on enough
+    trades, at a profit factor above one), which is scale-free. An absolute floor
+    on the FITNESS scale was a second, broken answer to the same question, and it
+    overrode the good one.
+
+    Measured at production geometry on 121 parameter sets: 32 made money across
+    the judged stretch with 30+ trades and PF >= 1, and only 2 of those 32 (6%)
+    could clear a composite floor of 0.15. The 30 it refused had a median of
+    +2.10% over 56 trades at PF 1.23 — ordinary good champions, blocked by a
+    number rather than by their results. The cause is structural: _fitness
+    penalises a losing window ~1.5-2x harder than it rewards a winning one, and
+    the composite gives 30% weight to the WORST fold, so any set with one losing
+    fold out of four is pushed negative no matter how profitable it is overall.
+    The median admitted set scored -0.869.
+
+    The composite is still an excellent RANKER inside the admitted pool — top-1
+    by composite returned +16.81% against +2.48% for the pool median, monotone
+    down the ranking — so it keeps that job and loses the one it was bad at.
 
     Written additively because the multiplicative form ran BACKWARDS on a losing
-    incumbent. `champ_fit * 1.16` is -0.21 when champ_fit is -0.177: the worse
-    the champion did, the LOWER the bar it set, so a champion deep in the red was
-    easier to replace than one merely flat — and the multiple-testing inflation,
-    whose whole job is to make the bar rise as more candidates take a shot at the
-    same window, moved it the wrong way too. Adding the margin as a fraction of
-    the incumbent's MAGNITUDE keeps "beat it by 6%+" meaning the same thing above
-    and below zero, and the deflation now inflates the absolute floor as well —
-    where it actually binds while a champion is under water."""
-    step = (margin - 1.0) * max(abs(champ_fit), MARGIN_FLOOR)
-    return max(champ_fit + step, MIN_ABS_FITNESS * margin)
+    incumbent: `champ_fit * 1.16` is -0.21 when champ_fit is -0.177, so the worse
+    a champion did the lower the bar it set, and the multiple-testing inflation
+    moved it the wrong way too. As a fraction of the incumbent's MAGNITUDE,
+    "beat it by 6%+" means the same thing above and below zero."""
+    return champ_fit + (margin - 1.0) * max(abs(champ_fit), MARGIN_FLOOR)
 
 
 def _pool_stats(stats_list: list[dict]) -> dict:
@@ -346,8 +377,7 @@ def overlay_of(params: dict) -> dict:
     return {k: params[k] for k in BRAIN_PARAMS if k in params}
 
 
-def select_specialists(sym_results: dict, margin: float = IMPROVE_MARGIN,
-                       floor: float = MIN_ABS_FITNESS) -> dict:
+def select_specialists(sym_results: dict, margin: float = IMPROVE_MARGIN) -> dict:
     """Pick each symbol's specialist overlay from FOLD-VALIDATED evidence.
 
     sym_results: {sym: {"applied": (params, fit, pf), "overlay": (params, fit, pf) | None,
@@ -359,8 +389,12 @@ def select_specialists(sym_results: dict, margin: float = IMPROVE_MARGIN,
     Rules (the old single-window picker flapped SET/CLEARED every cycle and
     converged to zero overlays — a specialist bench needs statistics and
     hysteresis):
-      - a challenger must be profitable where it matters (pf >= 1), clearly
-        positive (>= floor) and clearly better than the applied global set;
+      - a challenger must be profitable where it matters (pooled pf >= 1 over
+        the judged folds, with real evidence behind it) and clearly better than
+        the applied global set. The absolute FITNESS floor is gone for the same
+        reason it left the global gate: measured at production geometry, only
+        6% of parameter sets that genuinely made money could reach it. Profit
+        is the absolute test; the composite is the ranking;
       - an INCUMBENT overlay keeps its seat while it still beats the global
         set — a challenger must beat the incumbent by the margin, not just
         the global;
@@ -371,7 +405,9 @@ def select_specialists(sym_results: dict, margin: float = IMPROVE_MARGIN,
     for sym, r in sym_results.items():
         applied_params, base_fit, _base_pf = r["applied"]
         base_ov = overlay_of(applied_params)
-        bar = max(float(base_fit) * margin, floor)
+        # sign-safe, exactly like the global bar: base_fit * margin runs
+        # backwards below zero and made a losing global set EASIER to overlay
+        bar = _promotion_bar(float(base_fit), margin)
         best = None
         for params, fit, pf in r.get("cands", []):
             if pf < 1.0 or fit <= bar:
@@ -384,8 +420,8 @@ def select_specialists(sym_results: dict, margin: float = IMPROVE_MARGIN,
         inc = r.get("overlay")
         if inc is not None:
             inc_params, inc_fit, inc_pf = inc
-            keeps_seat = inc_pf >= 1.0 and inc_fit > max(base_fit, floor)
-            if keeps_seat and (best is None or best[1] <= inc_fit * margin):
+            keeps_seat = inc_pf >= 1.0 and inc_fit > base_fit
+            if keeps_seat and (best is None or best[1] <= _promotion_bar(inc_fit, margin)):
                 out[sym] = {"params": overlay_of(inc_params), "fitness": round(inc_fit, 3),
                             "vs": round(base_fit, 3), "pf": round(inc_pf, 3)}
                 continue
@@ -623,7 +659,14 @@ class AutoTuner:
             i += nf
             fits = [r["fitness"] for r in rs]
             fit = _oos_composite(fits)
-            pf = float(rs[-1]["stats"].get("profit_factor", 0.0) or 0.0)
+            # POOLED, like the global gate. Reading the newest fold's profit
+            # factor alone made a specialist seat turn on the coin flip of
+            # whether one window happened to fire, and 999-on-three-trades sailed
+            # through a `>= 1.0` test here exactly as it once did upstairs.
+            pool = _pool_stats([r["stats"] for r in rs])
+            pf = (float(pool["profit_factor"])
+                  if int(pool["trades"]) >= MIN_POOLED_TRADES and pool["total_return"] > 0.0
+                  else 0.0)
             slot = out.setdefault(sym, {"applied": None, "overlay": None, "cands": []})
             if tag == "applied":
                 slot["applied"] = (params, fit, pf)
@@ -1232,8 +1275,15 @@ class AutoTuner:
         if args:
             res = await self.orch.map_cpu(validate_params_portfolio, args, research=True)
             for (name, ck, cbs), r in zip(keys, res):
+                st = r.get("stats", {}) or {}
                 entry = {"fit": round(float(r.get("fitness", -1.0)), 3),
-                         "pf": round(float(r.get("stats", {}).get("profit_factor", 0.0) or 0.0), 3),
+                         "pf": round(float(st.get("profit_factor", 0.0) or 0.0), 3),
+                         "trades": int(st.get("trades", 0) or 0),
+                         # the era's own trades, bucketed by the market each was
+                         # opened into — this is what the profile is built from
+                         "by_regime": st.get("by_regime") or {},
+                         # ...and the era's overall character, kept as readable
+                         # context in the vault. It decides nothing.
                          "regime": await self._era_regime(name, interval, cbs)}
                 self._gauntlet_cache[ck] = entry
                 results[name] = entry
@@ -1242,11 +1292,12 @@ class AutoTuner:
         fits = [r["fit"] for r in results.values()]
         pf_ge1 = sum(1 for r in results.values() if r["pf"] >= 1.0)
         med = statistics.median(fits)
-        # PER-REGIME PROFILE — the part the live engine actually uses. An era's
-        # score filed under the era's CHARACTER turns "this set died in 2022"
-        # from a mark against it into an instruction: stand down when the tape
-        # looks like that again. Losing money in a crash is not a defect in a
-        # trend set, it is a description of when that set should be flat.
+        # PER-REGIME PROFILE — the part the live engine actually uses. This set's
+        # own trades, pooled across five years and bucketed by the market each
+        # was opened into, turn "it died in 2022" from a mark against it into an
+        # instruction: stand down when the tape looks like that again. Losing
+        # money in a crash is not a defect in a trend set, it is a description
+        # of when that set should be flat.
         by_regime = build_profile({n: {**r, "name": n} for n, r in results.items()})
         return {"n": len(results), "median": round(med, 3), "worst": round(min(fits), 3),
                 "pf_ge1": pf_ge1, "weak": med < 0.0, "windows": results,
@@ -1380,9 +1431,12 @@ class AutoTuner:
             if (best_fit is None or fit > best_fit) and admitted:
                 best_fit, best_params, best_stats = fit, prm, stats0
         recorded = None
-        if best_params is not None and best_fit is not None and best_fit > MIN_ABS_FITNESS:
-            # same promotion floor as the live clock — the vault only ever
-            # holds sets that cleared a real bar. Tagged with the trial clock,
+        if best_params is not None and best_fit is not None:
+            # Admitted on the same POOLED ECONOMICS as the live clock (checked
+            # above) — the vault only ever holds sets that made money on real
+            # evidence. There is no absolute fitness floor here either: only 6%
+            # of genuinely profitable sets could reach one. Tagged with the
+            # trial clock,
             # they become instant candidates the day the user switches
             # interval. Full newest-fold stats travel with the record: the old
             # pf-only dict made the vault show wr 0% / 0 trades / PF 999 —

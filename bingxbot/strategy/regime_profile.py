@@ -84,26 +84,55 @@ def dominant_regime(shares: dict[str, float]) -> str | None:
     return best if shares[best] >= DOMINANT_SHARE else None
 
 
-def build_profile(era_results: dict[str, dict]) -> dict[str, dict]:
-    """Fold per-era gauntlet results into a per-regime verdict.
+MIN_REGIME_TRADES = 25   # below this there is no verdict, only an anecdote
+LOSING_PF = 0.85         # ...and a verdict is only a CONVICTION when the set
+                         # gave back real money: a profit factor this far under
+                         # one, not merely under-performance.
 
-    `era_results` maps era name -> {"fit": float, "pf": float, "regime": str}.
-    Returns regime -> {"fit": median fitness, "eras": n, "losing": bool}.
+
+def build_profile(era_results: dict[str, dict]) -> dict[str, dict]:
+    """Fold the gauntlet's eras into a per-regime verdict, from the champion's
+    OWN TRADES rather than from a handful of era scores.
+
+    `era_results` maps era name -> {"fit", "pf", "regime", "by_regime"} where
+    `by_regime` is the era's per-regime trade ledger. Trades pool across every
+    era, so a regime's record is built from hundreds of fills spanning five
+    years instead of a median over six numbers.
+
+    This replaces labelling each era with one dominant regime. On live data that
+    dropped four of six eras — "2023 chop" and "2025 range" named no regime at
+    all, because a mixed market has no majority — and the two that survived were
+    medians of two eras that cancelled each other out. The markets a champion is
+    most likely to bleed in were precisely the ones producing no verdict.
+
+    Returns regime -> {"pf", "trades", "eras", "names", "losing"}.
     """
-    by: dict[str, list[dict]] = {}
+    agg: dict[str, dict] = {}
     for name, r in era_results.items():
-        reg = r.get("regime")
-        if reg in REGIMES:
-            by.setdefault(reg, []).append(r)
+        for reg, b in (r.get("by_regime") or {}).items():
+            if reg not in REGIMES:
+                continue          # "UNKNOWN" and anything a future build adds
+            a = agg.setdefault(reg, {"trades": 0, "gw": 0.0, "gl": 0.0,
+                                     "pnl": 0.0, "names": set()})
+            a["trades"] += int(b.get("trades", 0) or 0)
+            a["gw"] += float(b.get("gross_win", 0.0) or 0.0)
+            a["gl"] += float(b.get("gross_loss", 0.0) or 0.0)
+            a["pnl"] += float(b.get("pnl", 0.0) or 0.0)
+            if b.get("trades"):
+                a["names"].add(name)
     out: dict[str, dict] = {}
-    for reg, rs in by.items():
-        fits = [float(r.get("fit", 0.0) or 0.0) for r in rs]
-        med = statistics.median(fits)
+    for reg, a in agg.items():
+        pf = (a["gw"] / a["gl"]) if a["gl"] > 0 else (999.0 if a["gw"] > 0 else 0.0)
+        enough = a["trades"] >= MIN_REGIME_TRADES
         out[reg] = {
-            "fit": round(med, 3),
-            "eras": len(rs),
-            "names": sorted(r.get("name", "") for r in rs if r.get("name")),
-            "losing": bool(med <= LOSING_ERA_FIT and len(rs) >= MIN_ERAS_PER_REGIME),
+            "pf": round(pf, 3),
+            "pnl": round(a["pnl"], 4),
+            "trades": a["trades"],
+            "eras": len(a["names"]),
+            "names": sorted(a["names"]),
+            # a conviction needs BOTH: enough trades to mean something, and a
+            # loss big enough to be a loss rather than a flat patch
+            "losing": bool(enough and pf <= LOSING_PF and a["pnl"] < 0.0),
         }
     return out
 
