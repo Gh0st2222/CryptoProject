@@ -81,6 +81,15 @@ class SymbolCtx:
         self.mtf: dict = {}           # per-timeframe view (1m/5m/15m/1h)
         self.bars_held = 0
         self.last_entry_block = ""
+        # THE BAR-CLOSE VERDICT, kept apart from the live status line.
+        # `last_entry_block` is whatever was written most recently, and the
+        # reactive scanner rewrites it every ~850ms with "signal live — decides
+        # at bar close". Entries are decided ONCE per bar, so the real reason a
+        # trade did not open survived for well under a second and was almost
+        # never what a snapshot or a resume showed: every diagnostic asking "why
+        # is nothing trading" was reading a placeholder.
+        self.bar_block = ""
+        self.bar_block_ts = 0
         self.stage = "SCAN"
         self.stage_ts = 0
         self.eval_ms = 0.0
@@ -504,6 +513,12 @@ class TraderEngine:
             else:
                 ctx.bars_held = 0
                 await self._try_enter(ctx, st, row, ev)
+                # ...and latch the BAR-CLOSE verdict before the reactive scanner
+                # can overwrite it a second later. This is the field that answers
+                # "why did nothing open", and it is the only one that does.
+                if self.portfolio.positions.get(symbol) is None and ctx.pending_task is None:
+                    ctx.bar_block = ctx.last_entry_block or "no signal"
+                    ctx.bar_block_ts = now_ms()
                 # the brain wanted this direction and something said no: record
                 # it so the gate can eventually be judged on what it discarded
                 if (self.portfolio.positions.get(symbol) is None
@@ -1044,6 +1059,10 @@ class TraderEngine:
                     "brain": c.brain.snapshot(),
                     "bars_held": c.bars_held,
                     "entry_block": c.last_entry_block,
+                    # the LAST BAR-CLOSE verdict — the one that actually decides
+                    "bar_block": c.bar_block,
+                    "bar_block_age_s": (round((now_ms() - c.bar_block_ts) / 1000)
+                                        if c.bar_block_ts else None),
                     "stage": c.stage,
                     "eval_ms": round(c.eval_ms, 2),
                     "mtf": c.mtf,
@@ -1115,6 +1134,10 @@ class TraderEngine:
                     "stage": c.stage,
                     "eval_ms": round(c.eval_ms, 2),
                     "entry_block": c.last_entry_block,
+                    # the LAST BAR-CLOSE verdict — the one that actually decides
+                    "bar_block": c.bar_block,
+                    "bar_block_age_s": (round((now_ms() - c.bar_block_ts) / 1000)
+                                        if c.bar_block_ts else None),
                     "edge": round(c.last_eval.get("edge", 0.0), 4),
                     "p_win": round(c.last_eval.get("p_win", 0.0), 4),
                     "regime": c.last_eval.get("regime", ""),
