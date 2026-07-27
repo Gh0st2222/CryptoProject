@@ -759,7 +759,25 @@ TUNABLES: dict[str, tuple] = {
     # a positive expectancy needs trades to compound through.
     "base_threshold":         (0.06, 0.55, "strategy", "float"),
     "target_trades_per_hour": (0.2, 6.0, "strategy", "float"),
-    "cost_multiple":          (1.2, 3.2, "strategy", "float"),
+    # CEILING LOWERED from 3.2, and this is the one box change measurement
+    # actually supports. `cost_multiple` gates on a beta-scaled predicted MOVE
+    # against the round-trip cost, which duplicates the EV floor's job with a
+    # much noisier statistic — and the EV floor is the better-founded one,
+    # pricing the real stop distance and the measured payoff ratio.
+    #
+    # Measured on the live champion's own parameters: at 3.2 the gate refuses
+    # 15.3% of BTC bars against 2.0% at the default 1.4, which conditionally is
+    # the second most selective gate in the whole chain. The training objective
+    # scores the ceiling WORSE than the floor (-1.25 at 3.2 against -0.88 at
+    # 1.2), and sweeping it across the box out-of-sample is pure noise: 1.2 gives
+    # -0.59%, 1.6 gives -1.63%, 2.0 gives -0.77%, 2.8 gives -1.33%,
+    # non-monotonic with no signal. Nothing measured pays for the top of this
+    # box, and a third of the trade opportunities are spent there.
+    #
+    # This is not the box overruling the optimizer: it is removing a region that
+    # scores worse on the search's own objective, costs a third of the entries,
+    # and duplicates a gate that does the same job properly.
+    "cost_multiple":          (1.2, 2.4, "strategy", "float"),
     "hedge_eta":              (0.15, 0.60, "strategy", "float"),
     "horizon_bars":           (5, 16, "strategy", "int"),
     "min_efficiency":         (0.06, 0.50, "strategy", "float"),
